@@ -89,6 +89,28 @@ pub fn visual_column(line: &str, char_col: usize, tab_width: usize) -> usize {
     column
 }
 
+/// Columnas visuales de varios offsets **byte** de `line` en UN solo recorrido
+/// de grafemas. Equivalente a llamar [`visual_column`] con cada offset (los
+/// offsets deben estar ordenados y ser límites de char), pero O(línea) en
+/// total: indispensable al resaltar, donde cada token pide su columna.
+pub fn visual_columns_at(line: &str, targets: &[usize], tab_width: usize) -> Vec<usize> {
+    let mut columns = Vec::with_capacity(targets.len());
+    let mut pending = 0;
+    let mut column = 0;
+    for (i, grapheme) in line.grapheme_indices(true) {
+        while pending < targets.len() && targets[pending] <= i {
+            columns.push(column);
+            pending += 1;
+        }
+        column += grapheme_cells(grapheme, column, tab_width);
+    }
+    while pending < targets.len() {
+        columns.push(column);
+        pending += 1;
+    }
+    columns
+}
+
 /// Char (unidad de char, no byte) para una celda visual; regla de media celda.
 pub fn char_col_at_visual(line: &str, visual_col: usize, tab_width: usize) -> usize {
     let mut column = 0;
@@ -262,5 +284,31 @@ mod tests {
         assert_eq!(line_range(&buffer, 0), 0..4);
         assert_eq!(line_range(&buffer, 1), 4..8);
         assert_eq!(line_range(&buffer, 2), 8..8); // línea vacía final
+    }
+
+    #[test]
+    fn visual_columns_at_matches_visual_column_at_each_boundary() {
+        // Tabs + CJK + cluster emoji (fronteras de char dentro del grafo).
+        let line = "a\tbb\tc東家ñ\t👍🏽z";
+        let tab = 4;
+        let mut targets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
+        targets.push(line.len());
+
+        let batch = visual_columns_at(line, &targets, tab);
+        assert_eq!(batch.len(), targets.len());
+        for (i, &target) in targets.iter().enumerate() {
+            let char_col = line[..target].chars().count();
+            assert_eq!(
+                batch[i],
+                visual_column(line, char_col, tab),
+                "distinto en byte {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_columns_at_handles_empty_line_and_no_targets() {
+        assert_eq!(visual_columns_at("", &[0, 3], 4), vec![0, 0]);
+        assert!(visual_columns_at("hola", &[], 4).is_empty());
     }
 }

@@ -148,6 +148,7 @@ impl GpuContext {
 
         let scale = self.window.scale_factor();
         let resolution = (self.config.width, self.config.height);
+        let phase = std::time::Instant::now();
         self.text
             .prepare(&self.device, &self.queue, scale, resolution, &scene.texts);
         if !scene.top_texts.is_empty() {
@@ -166,6 +167,7 @@ impl GpuContext {
             scale,
             resolution,
         );
+        let prepared = phase.elapsed();
 
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self
@@ -202,6 +204,14 @@ impl GpuContext {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         self.text.trim();
+        // Diagnóstico de rendimiento (CPU por fase; ver también main.rs).
+        let total = phase.elapsed();
+        if total > std::time::Duration::from_millis(16) {
+            log::warn!(
+                "gpu frame lenta: prepare={prepared:?} encode+submit={:?}",
+                total - prepared
+            );
+        }
     }
 }
 

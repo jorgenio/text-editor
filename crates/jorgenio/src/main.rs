@@ -195,9 +195,11 @@ impl winit::application::ApplicationHandler for Application {
             }
         };
 
+        let boot = Instant::now();
         let gpu = pollster::block_on(GpuContext::new(window, event_loop));
         gpu.set_ime_allowed(true);
         gpu.request_redraw();
+        log::info!("ventana + GPU listos en {:?}", boot.elapsed());
         self.last_title = self.editor.title();
         self.gpu = Some(gpu);
     }
@@ -209,11 +211,16 @@ impl winit::application::ApplicationHandler for Application {
         if self.editor.focused() {
             let now = Instant::now();
             if now >= self.caret_blink_deadline {
-                self.editor.toggle_caret();
-                self.caret_blink_deadline = now + editor::CARET_BLINK;
-                if let Some(gpu) = &self.gpu {
-                    gpu.request_redraw();
+                // Si el caret está fuera de pantalla no hay nada que
+                // parpadear: se conserva el estado y se ahorra el repintar
+                // completo (escena + glifos + quads) cada 530 ms.
+                if self.editor.caret_in_view() {
+                    self.editor.toggle_caret();
+                    if let Some(gpu) = &self.gpu {
+                        gpu.request_redraw();
+                    }
                 }
+                self.caret_blink_deadline = now + editor::CARET_BLINK;
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.caret_blink_deadline));
         } else {
@@ -242,13 +249,21 @@ impl winit::application::ApplicationHandler for Application {
                 gpu.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                let frame = Instant::now();
                 let viewport = gpu.logical_size();
                 self.editor.set_viewport(viewport.0, viewport.1);
                 let advance = gpu.advance_ratio();
                 let mut scene = self.editor.build_scene(viewport, advance);
                 self.palette
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
+                let built = frame.elapsed();
                 gpu.render(&scene);
+                // Diagnóstico de rendimiento: el primer frame incluye la
+                // carga de syntect; el resto debe ser <16 ms de CPU.
+                let cpu = frame.elapsed();
+                if cpu > Duration::from_millis(16) {
+                    log::warn!("frame lenta (CPU): build={built:?} total={cpu:?}");
+                }
                 let title = self.editor.title();
                 if title != self.last_title {
                     gpu.set_title(&title);

@@ -745,7 +745,6 @@ impl Editor {
 
         self.syntax.set_extension(&self.lang);
         self.syntax.prepare(&mut self.buffer, visible_last);
-
         for cursor in &self.cursors {
             let range = cursor.range();
             if range.is_empty() {
@@ -753,10 +752,9 @@ impl Editor {
             }
             let first = self.buffer.char_to_line(range.start);
             let last = self.buffer.char_to_line(range.end.saturating_sub(1));
-            for line in first..=last {
-                if line < visible_first || line > visible_last {
-                    continue;
-                }
+            // Solo la intersección con lo visible: O(viewport), no O(selección)
+            // (seleccionar todo en un archivo enorme no itera todas las líneas).
+            for line in visible_line_range(first, last, visible_first, visible_last) {
                 let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
                 let text = self.buffer.line_text(line);
                 let line_start = self.buffer.line_to_char(line);
@@ -812,15 +810,17 @@ impl Editor {
                     .push(TextSpan::new(text, CODE_X, y, FONT_SIZE, FG));
                 continue;
             }
-            for token in tokens {
+            // Columnas de TODOS los tokens en un solo recorrido de la línea
+            // (antes: visual_column por token = O(tokens × columna) por frame).
+            let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
+            let columns = movement::visual_columns_at(&text, &starts, TAB_WIDTH);
+            for (token, &cells) in tokens.iter().zip(&columns) {
                 let piece = text
                     .get(token.start..token.end.min(text.len()))
                     .unwrap_or("");
                 if piece.is_empty() || piece.chars().all(|c| c == '\n') {
                     continue;
                 }
-                let char_col = text[..token.start.min(text.len())].chars().count();
-                let cells = movement::visual_column(&text, char_col, TAB_WIDTH);
                 scene.texts.push(TextSpan::new(
                     piece,
                     CODE_X + cells as f32 * advance,
@@ -994,12 +994,33 @@ impl Editor {
         self.clamp_scroll();
     }
 
+    /// ¿El caret primario está a la vista? Si no lo está, el parpadeo puede
+    /// saltarse el repintar (el estado de blink se conserva).
+    pub fn caret_in_view(&self) -> bool {
+        let line = self.buffer.char_to_line(self.primary().caret);
+        let top = PADDING_TOP + line as f32 * LINE_HEIGHT;
+        let bottom = top + LINE_HEIGHT;
+        bottom > self.scroll_y && top < self.scroll_y + self.viewport.1
+    }
+
     fn clamp_scroll(&mut self) {
         let content_h = PADDING_TOP + self.buffer.line_count() as f32 * LINE_HEIGHT + PADDING_TOP;
         self.scroll_y = self
             .scroll_y
             .clamp(0.0, (content_h - self.viewport.1).max(0.0));
     }
+}
+
+/// Intersección de las líneas `first..=last` con el rango visible
+/// `visible_first..=visible_last`. Si no se solapan, el rango devuelto queda
+/// invertido (empieza tras su fin) y por tanto vacío al iterarlo.
+fn visible_line_range(
+    first: usize,
+    last: usize,
+    visible_first: usize,
+    visible_last: usize,
+) -> std::ops::RangeInclusive<usize> {
+    first.max(visible_first)..=last.min(visible_last)
 }
 
 /// Mapeo de una posición tras borrar `start..end` e insertar `inserted` chars
@@ -1341,5 +1362,88 @@ mod tests {
         // Ctrl solo: el shell de la app maneja el atajo (aquí se ignora).
         assert!(!editor.handle_key(&Key::Character("s".into()), ModifiersState::CONTROL));
         assert_eq!(text_of(&editor), "@");
+    }
+
+    #[test]
+    fn visible_line_range_intersects_or_goes_empty() {
+        assert_eq!(
+            visible_line_range(0, 10, 5, 15).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8, 9, 10],
+            "solape por la izquierda"
+        );
+        assert_eq!(
+            visible_line_range(12, 20, 5, 15).collect::<Vec<_>>(),
+            vec![12, 13, 14, 15],
+            "solape por la derecha"
+        );
+        assert!(
+            visible_line_range(100, 200, 5, 15).next().is_none(),
+            "entera por debajo del viewport"
+        );
+        assert!(
+            visible_line_range(0, 3, 5, 15).next().is_none(),
+            "entera por encima del viewport"
+        );
+        assert!(
+            visible_line_range(30, 10, 5, 15).next().is_none(),
+            "rango invertido sigue vacío"
+        );
+    }
+
+    #[test]
+    fn caret_in_view_tracks_scroll() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres");
+        editor.set_viewport(400.0, 100.0); // ~5 líneas visibles
+        editor.cursors = vec![Cursor::new(0)];
+        assert!(editor.caret_in_view());
+
+        editor.scroll_y = 10_000.0;
+        assert!(!editor.caret_in_view(), "scroll lejos: no hay que repintar");
+    }
+
+    #[test]
+    fn select_all_scene_renders_only_visible_selection() {
+        let mut editor = Editor::default();
+        // 100k líneas: con la intersección visible el bucle es O(viewport).
+        editor.insert_text(&"pub fn f() {}\n".repeat(100_000));
+        editor.set_viewport(600.0, 200.0);
+        editor.select_all();
+        editor.scroll_y = 0.0; // arriba del todo: filas 0..=10 exactas
+
+        let scene = editor.build_scene((600.0, 200.0), 1.0);
+        // PADDING_TOP=8 y LINE_HEIGHT=20 con viewport 200 → líneas 0..=10.
+        assert_eq!(
+            scene.quads.len(),
+            11,
+            "un quad de selección por línea visible, no por línea del archivo"
+        );
+    }
+
+    /// Bench manual: `cargo test bench_build_scene -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "bench manual de rendimiento"]
+    fn bench_build_scene() {
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text(&"pub fn f(x: u32) -> u32 { x.wrapping_add(1) } // com\n".repeat(5000));
+        editor.set_viewport(1200.0, 800.0);
+        let _ = editor.build_scene((1200.0, 800.0), 1.0); // primer frame: carga syntect
+
+        let iters = 50u32;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = editor.build_scene((1200.0, 800.0), 1.0);
+        }
+        eprintln!("build_scene media (40 líneas): {:?}", t.elapsed() / iters);
+
+        editor.set_viewport(1200.0, 40.0); // 2 líneas visibles
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = editor.build_scene((1200.0, 40.0), 1.0);
+        }
+        eprintln!("build_scene media (2 líneas): {:?}", t.elapsed() / iters);
     }
 }

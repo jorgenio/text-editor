@@ -1,13 +1,15 @@
-//! Barra de pestañas y conjunto de editores (M9): una pestaña por archivo,
-//! conmutación con Ctrl+Tab y cierre con Ctrl+W. La barra se dibuja en la
-//! capa superior y el editor activo reserva su alto con
-//! [`Editor::set_top_inset`] para que ni el texto ni los clicks queden debajo.
+//! Pestañas y paneles (M9/M10): hasta DOS grupos (columnas) de pestañas,
+//! conmutación con Ctrl+Tab dentro del grupo activo y cierre con Ctrl+W.
+//! Cada grupo dibuja su propia barra sobre su franja horizontal y el editor
+//! activo reserva la barra con [`Editor::set_top_inset`] y su columna con
+//! [`Editor::set_left_inset`], para que ni el texto ni los clicks queden
+//! debajo ni encima de otro panel.
 
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 
 use crate::editor::{Editor, FONT_SIZE};
 
-/// Alto de la barra de pestañas (px lógicos). El área del editor es la
+/// Alto de la barra de pestañas (px lógicos). El área de cada editor es la
 /// ventana menos este valor.
 pub const TAB_BAR_H: f32 = 32.0;
 /// Ancho mínimo/máximo de una pestaña (px lógicos).
@@ -24,166 +26,296 @@ const TAB_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
 const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
 const DIM: (u8, u8, u8) = (0x75, 0x71, 0x5E);
 
-pub struct Tabs {
+/// Un grupo (columna del split) con sus pestañas y su activa.
+struct Group {
     list: Vec<Editor>,
     active: usize,
-    /// (x, ancho) de cada pestaña dibujada en el último render (para click).
-    layout: Vec<(f32, f32)>,
+}
+
+/// Franja horizontal de un grupo en el último render (para [`Tabs::click`]).
+struct GroupLayout {
+    x: f32,
+    w: f32,
+    /// (x, ancho) de cada pestaña dibujada del grupo.
+    tabs: Vec<(f32, f32)>,
+}
+
+pub struct Tabs {
+    groups: Vec<Group>,
+    active_group: usize,
+    layout: Vec<GroupLayout>,
 }
 
 impl Tabs {
-    /// Una sola pestaña con `first`.
+    /// Un solo grupo con una pestaña.
     pub fn new(first: Editor) -> Self {
         Self {
-            list: vec![first],
-            active: 0,
+            groups: vec![Group {
+                list: vec![first],
+                active: 0,
+            }],
+            active_group: 0,
             layout: Vec::new(),
         }
     }
 
     /// Pestañas desde los paths de la CLI (ninguno → un editor en blanco);
-    /// la activa es la primera.
+    /// la activa es la primera. Todas van al primer grupo.
     pub fn from_paths(paths: Vec<std::path::PathBuf>) -> Self {
         if paths.is_empty() {
             return Self::new(Editor::default());
         }
         let list = paths.into_iter().map(Editor::from_cli).collect();
         Self {
-            list,
-            active: 0,
+            groups: vec![Group { list, active: 0 }],
+            active_group: 0,
             layout: Vec::new(),
         }
     }
 
+    /// Editor activo del grupo activo (al que van teclado, IME y comandos).
     pub fn active(&self) -> &Editor {
-        &self.list[self.active]
+        let group = &self.groups[self.active_group];
+        &group.list[group.active]
     }
 
     pub fn active_mut(&mut self) -> &mut Editor {
-        &mut self.list[self.active]
+        let group = &mut self.groups[self.active_group];
+        &mut group.list[group.active]
     }
 
+    /// Editor activo del grupo `index` (para dibujar un split o la rueda).
+    pub fn group_active_mut(&mut self, index: usize) -> &mut Editor {
+        let group = &mut self.groups[index];
+        &mut group.list[group.active]
+    }
+
+    /// Índice de la pestaña activa dentro de su grupo.
     pub fn active_index(&self) -> usize {
-        self.active
+        self.groups[self.active_group].active
     }
 
+    pub fn active_group_index(&self) -> usize {
+        self.active_group
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Pestañas del grupo activo.
     pub fn len(&self) -> usize {
-        self.list.len()
+        self.groups[self.active_group].list.len()
     }
 
-    /// Añade una pestaña al final y la activa; devuelve su índice.
+    /// Añade una pestaña al grupo activo y la activa; devuelve su índice.
     pub fn add(&mut self, editor: Editor) -> usize {
-        self.list.push(editor);
-        self.active = self.list.len() - 1;
-        self.active
+        let group = &mut self.groups[self.active_group];
+        group.list.push(editor);
+        group.active = group.list.len() - 1;
+        group.active
     }
 
-    /// Activa la pestaña `index` (ignora índices fuera de rango).
+    /// Activa la pestaña `index` del grupo activo (ignora fuera de rango).
     pub fn set_active(&mut self, index: usize) {
-        if index < self.list.len() {
-            self.active = index;
+        let group = &mut self.groups[self.active_group];
+        if index < group.list.len() {
+            group.active = index;
         }
     }
 
-    /// Siguiente/anterior pestaña, con vuelta al otro extremo.
+    /// Siguiente/anterior pestaña del grupo activo, con vuelta al extremo.
     pub fn cycle(&mut self, backwards: bool) {
-        let len = self.list.len();
-        self.active = if backwards {
-            (self.active + len - 1) % len
+        let group = &mut self.groups[self.active_group];
+        let len = group.list.len();
+        group.active = if backwards {
+            (group.active + len - 1) % len
         } else {
-            (self.active + 1) % len
+            (group.active + 1) % len
         };
     }
 
-    /// Cierra la pestaña `index` (la activa si es `None`) y reajusta la
-    /// activa. La ÚLTIMA pestaña no se cierra: siempre debe quedar dónde
-    /// escribir. `true` = se cerró.
+    /// Cambia el foco de grupo sin tocar la pestaña activa de cada uno
+    /// (índice fuera de rango → no hace nada).
+    pub fn set_active_group(&mut self, group: usize) {
+        if group < self.groups.len() {
+            self.active_group = group;
+        }
+    }
+
+    /// Divide en dos columnas; el nuevo grupo empieza con un archivo en
+    /// blanco y toma el foco (máximo 2 paneles). El flag de `focused` de la
+    /// ventana se transfiere: el grupo que pierde el foco se apaga.
+    pub fn split(&mut self) {
+        if self.groups.len() >= 2 {
+            return;
+        }
+        let focused = self.active().focused();
+        self.active_mut().set_focused(false);
+        self.groups.push(Group {
+            list: vec![Editor::default()],
+            active: 0,
+        });
+        self.active_group = self.groups.len() - 1;
+        self.active_mut().set_focused(focused);
+    }
+
+    /// Quita el split: las pestañas del grupo derecho se mueven al grupo
+    /// izquierdo (nunca se pierde trabajo) y el foco sigue en el archivo que
+    /// estaba activo.
+    pub fn unsplit(&mut self) {
+        if self.groups.len() < 2 {
+            return;
+        }
+        let focused = self.active().focused();
+        let right = self.groups.remove(1);
+        if self.active_group == 1 {
+            let new_active = self.groups[0].list.len() + right.active;
+            self.groups[0].list.extend(right.list);
+            self.groups[0].active = new_active;
+        } else {
+            self.groups[0].list.extend(right.list);
+        }
+        self.active_group = 0;
+        self.active_mut().set_focused(focused);
+    }
+
+    /// Fija insets y viewport del editor activo del grupo `index` para este
+    /// frame (`x` = origen horizontal de la columna).
+    pub fn set_group_geometry(&mut self, index: usize, x: f32, w: f32, editor_h: f32) {
+        let editor = self.group_active_mut(index);
+        editor.set_left_inset(x);
+        editor.set_top_inset(TAB_BAR_H);
+        editor.set_viewport(w, editor_h);
+    }
+
+    /// Cierra la pestaña `index` (la activa si es `None`) del grupo activo y
+    /// reajusta la activa. Si era la ÚLTIMA de su grupo y hay más de un
+    /// grupo, se cierra el grupo entero. La última pestaña del último grupo
+    /// no se cierra: siempre debe quedar dónde escribir. `true` = cerró algo.
     pub fn close(&mut self, index: Option<usize>) -> bool {
-        let index = index.unwrap_or(self.active);
-        if index >= self.list.len() || self.list.len() == 1 {
+        let gi = self.active_group;
+        let index = index.unwrap_or(self.groups[gi].active);
+        if index >= self.groups[gi].list.len() {
             return false;
         }
-        self.list.remove(index);
-        if self.active >= self.list.len() {
-            self.active = self.list.len() - 1;
-        } else if index < self.active {
-            self.active -= 1;
+        if self.groups[gi].list.len() == 1 {
+            if self.groups.len() == 1 {
+                return false;
+            }
+            self.groups.remove(gi);
+            if self.active_group >= self.groups.len() {
+                self.active_group = self.groups.len() - 1;
+            }
+            return true;
+        }
+        self.groups[gi].list.remove(index);
+        let group = &mut self.groups[gi];
+        if group.active >= group.list.len() {
+            group.active = group.list.len() - 1;
+        } else if index < group.active {
+            group.active -= 1;
         }
         true
     }
 
-    /// Barra de pestañas en la capa superior; guarda el layout para
+    /// Barras de pestañas (una por grupo) en la capa superior, más la
+    /// separación vertical entre paneles; guarda el layout para
     /// [`Tabs::click`]. Las que no caben no se dibujan ni se clican.
     pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32) {
-        scene
-            .top_quads
-            .push(Quad::new(0.0, 0.0, viewport.0, TAB_BAR_H, BAR_BG));
-        scene
-            .top_quads
-            .push(Quad::new(0.0, TAB_BAR_H - 1.0, viewport.0, 1.0, TAB_EDGE));
-
+        let group_count = self.groups.len();
+        let gw = viewport.0 / group_count as f32;
         self.layout.clear();
-        let mut x = 0.0;
-        for (index, tab) in self.list.iter().enumerate() {
-            if x >= viewport.0 {
-                break;
-            }
-            let dirty = tab.dirty();
-            let mut label = tab.tab_label();
-            if dirty {
-                label = format!("\u{25cf} {label}");
-            }
-            let w = (label.chars().count() as f32 * advance + 2.0 * TAB_PAD)
-                .clamp(TAB_MIN_W, TAB_MAX_W)
-                .min(viewport.0 - x);
-            let is_active = index == self.active;
-            scene.top_quads.push(Quad::new(
-                x,
-                0.0,
-                w,
-                TAB_BAR_H,
-                if is_active { TAB_ACTIVE_BG } else { TAB_BG },
-            ));
-            // Sin borde inferior en la activa: se funde con el editor.
-            if !is_active {
+
+        for (gi, group) in self.groups.iter().enumerate() {
+            let gx = gi as f32 * gw;
+            let bar_right = gx + gw;
+            scene
+                .top_quads
+                .push(Quad::new(gx, 0.0, gw, TAB_BAR_H, BAR_BG));
+            scene
+                .top_quads
+                .push(Quad::new(gx, TAB_BAR_H - 1.0, gw, 1.0, TAB_EDGE));
+            // Separación vertical con el panel vecino (altura entera).
+            if gi > 0 {
                 scene
                     .top_quads
-                    .push(Quad::new(x, TAB_BAR_H - 1.0, w, 1.0, TAB_EDGE));
-            }
-            if index > 0 {
-                scene
-                    .top_quads
-                    .push(Quad::new(x, 4.0, 1.0, TAB_BAR_H - 8.0, TAB_EDGE));
+                    .push(Quad::new(gx - 1.0, 0.0, 1.0, viewport.1, TAB_EDGE));
             }
 
-            // Etiqueta: se trunca por la cola si no cabe ("muy_lar…").
-            let capacity = ((w - 2.0 * TAB_PAD) / advance).floor().max(1.0) as usize;
-            if label.chars().count() > capacity {
-                let head: String = label.chars().take(capacity.saturating_sub(1)).collect();
-                label = format!("{head}\u{2026}");
-            }
-            scene.top_texts.push(TextSpan::new(
-                label,
-                x + TAB_PAD,
-                (TAB_BAR_H - FONT_SIZE) / 2.0,
-                FONT_SIZE,
-                if is_active { FG } else { DIM },
-            ));
+            let mut gl = GroupLayout {
+                x: gx,
+                w: gw,
+                tabs: Vec::new(),
+            };
+            let mut x = gx;
+            for (index, tab) in group.list.iter().enumerate() {
+                if x >= bar_right {
+                    break;
+                }
+                let mut label = tab.tab_label();
+                if tab.dirty() {
+                    label = format!("\u{25cf} {label}");
+                }
+                let w = (label.chars().count() as f32 * advance + 2.0 * TAB_PAD)
+                    .clamp(TAB_MIN_W, TAB_MAX_W)
+                    .min(bar_right - x);
+                let is_active = index == group.active;
+                scene.top_quads.push(Quad::new(
+                    x,
+                    0.0,
+                    w,
+                    TAB_BAR_H,
+                    if is_active { TAB_ACTIVE_BG } else { TAB_BG },
+                ));
+                // Sin borde inferior en la activa: se funde con su editor.
+                if !is_active {
+                    scene
+                        .top_quads
+                        .push(Quad::new(x, TAB_BAR_H - 1.0, w, 1.0, TAB_EDGE));
+                }
+                if index > 0 {
+                    scene
+                        .top_quads
+                        .push(Quad::new(x, 4.0, 1.0, TAB_BAR_H - 8.0, TAB_EDGE));
+                }
 
-            self.layout.push((x, w));
-            x += w;
+                // Etiqueta: se trunca por la cola si no cabe ("muy_lar…").
+                let capacity = ((w - 2.0 * TAB_PAD) / advance).floor().max(1.0) as usize;
+                if label.chars().count() > capacity {
+                    let head: String = label.chars().take(capacity.saturating_sub(1)).collect();
+                    label = format!("{head}\u{2026}");
+                }
+                scene.top_texts.push(TextSpan::new(
+                    label,
+                    x + TAB_PAD,
+                    (TAB_BAR_H - FONT_SIZE) / 2.0,
+                    FONT_SIZE,
+                    if is_active { FG } else { DIM },
+                ));
+
+                gl.tabs.push((x, w));
+                x += w;
+            }
+            self.layout.push(gl);
         }
     }
 
-    /// Click en la barra: índice de la pestaña tocada, o `None` si no fue
+    /// Click en alguna barra: grupo y pestaña tocadas, o `None` si no fue
     /// dentro de la barra o de una pestaña dibujada.
-    pub fn click(&self, x: f32, y: f32) -> Option<usize> {
+    pub fn click(&self, x: f32, y: f32) -> Option<(usize, usize)> {
         if y < 0.0 || y >= TAB_BAR_H {
             return None;
         }
-        self.layout
+        let group = self
+            .layout
             .iter()
-            .position(|&(tx, w)| x >= tx && x < tx + w)
+            .position(|gl| x >= gl.x && x < gl.x + gl.w)?;
+        let tab = self.layout[group]
+            .tabs
+            .iter()
+            .position(|&(tx, w)| x >= tx && x < tx + w)?;
+        Some((group, tab))
     }
 }
 
@@ -195,6 +327,11 @@ mod tests {
         let mut editor = Editor::default();
         editor.insert_text(label);
         editor
+    }
+
+    /// Editor CON ruta (sin tocar disco): `tab_label` es el nombre del archivo.
+    fn tab_named(name: &str) -> Editor {
+        Editor::from_cli(std::path::PathBuf::from(name))
     }
 
     #[test]
@@ -258,10 +395,16 @@ mod tests {
         );
         assert_eq!(scene.top_texts.len(), 2, "una etiqueta por pestaña");
 
-        let (x0, w0) = tabs.layout[0];
-        let (x1, w1) = tabs.layout[1];
-        assert_eq!(tabs.click(x0 + w0 / 2.0, TAB_BAR_H / 2.0), Some(0));
-        assert_eq!(tabs.click(x1 + w1 / 2.0, TAB_BAR_H / 2.0), Some(1));
+        let tab0 = tabs.layout[0].tabs[0];
+        let tab1 = tabs.layout[0].tabs[1];
+        assert_eq!(
+            tabs.click(tab0.0 + tab0.1 / 2.0, TAB_BAR_H / 2.0),
+            Some((0, 0))
+        );
+        assert_eq!(
+            tabs.click(tab1.0 + tab1.1 / 2.0, TAB_BAR_H / 2.0),
+            Some((0, 1))
+        );
         assert_eq!(tabs.click(0.0, TAB_BAR_H + 1.0), None, "bajo la barra");
         assert_eq!(tabs.click(799.0, 5.0), None, "pestaña que no cabe dibujada");
 
@@ -271,7 +414,71 @@ mod tests {
         }
         let mut scene = Scene::new(wgpu::Color::BLACK);
         tabs.render(&mut scene, (300.0, 600.0), 8.0);
-        assert!(tabs.layout.len() < 40, "solo caben unas pocas");
-        assert!(tabs.layout.iter().all(|&(x, w)| x + w <= 300.0));
+        assert!(tabs.layout[0].tabs.len() < 40, "solo caben unas pocas");
+        assert!(tabs.layout[0].tabs.iter().all(|&(x, w)| x + w <= 300.0));
+    }
+
+    #[test]
+    fn split_creates_second_group_and_unsplit_preserves_tabs() {
+        let mut tabs = Tabs::new(tab_with("uno"));
+        tabs.add(tab_with("dos"));
+        tabs.split();
+        assert_eq!(tabs.group_count(), 2);
+        assert_eq!(tabs.active_group_index(), 1, "el foco pasa al nuevo");
+        assert_eq!(tabs.active().tab_label(), "sin título", "en blanco");
+        tabs.add(tab_named("tres.rs"));
+
+        tabs.unsplit();
+        assert_eq!(tabs.group_count(), 1);
+        assert_eq!(tabs.len(), 4, "las pestañas del grupo derecho se conservan");
+        assert_eq!(tabs.active().tab_label(), "tres.rs", "sigue el foco");
+        // unsplit sin split no rompe nada.
+        tabs.unsplit();
+        assert_eq!(tabs.group_count(), 1);
+    }
+
+    #[test]
+    fn closing_last_tab_of_a_group_closes_the_group() {
+        let mut tabs = Tabs::new(tab_named("uno.rs"));
+        tabs.split();
+        assert_eq!(tabs.group_count(), 2);
+        assert!(tabs.close(None), "cierra la única pestaña del grupo");
+        assert_eq!(tabs.group_count(), 1, "el grupo derecho desaparece");
+        assert_eq!(tabs.active_group_index(), 0);
+        assert_eq!(tabs.active().tab_label(), "uno.rs");
+    }
+
+    #[test]
+    fn split_geometry_and_click_cover_both_panels() {
+        let mut tabs = Tabs::new(tab_named("uno.rs"));
+        tabs.split();
+
+        tabs.set_group_geometry(1, 500.0, 500.0, 568.0);
+        assert_eq!(tabs.group_active_mut(1).left_inset(), 500.0);
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (1000.0, 600.0), 8.0);
+        assert_eq!(tabs.layout.len(), 2, "una franja por grupo");
+        assert_eq!(tabs.layout[0].x, 0.0);
+        assert_eq!(tabs.layout[1].x, 500.0, "la segunda columna empieza a 500");
+        assert_eq!(scene.top_texts.len(), 2, "una pestaña por grupo");
+        assert!(
+            scene.top_quads.iter().any(|q| q.h == 600.0 && q.w == 1.0),
+            "separador vertical a altura completa"
+        );
+
+        // El click resuelve (grupo, pestaña) por la x dentro de cada barra;
+        // el hueco vacío de la barra no es clicable.
+        assert_eq!(tabs.click(50.0, TAB_BAR_H / 2.0), Some((0, 0)));
+        assert_eq!(tabs.click(550.0, TAB_BAR_H / 2.0), Some((1, 0)));
+        assert_eq!(tabs.click(700.0, TAB_BAR_H / 2.0), None, "hueco vacío");
+        assert_eq!(tabs.click(700.0, TAB_BAR_H + 1.0), None, "bajo la barra");
+
+        // El cambio cruzado de grupo lo resuelve el shell (focus_tab) con
+        // set_active_group + set_active.
+        tabs.set_active_group(0);
+        tabs.set_active(0);
+        assert_eq!(tabs.active_group_index(), 0);
+        assert_eq!(tabs.active().tab_label(), "uno.rs");
     }
 }

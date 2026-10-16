@@ -51,6 +51,8 @@ pub static KEYMAP: &[Binding] = &[
     bind("d", true, true, false, "edit.duplicate_line"),
     bind("f", true, false, false, "find.show"),
     bind("h", true, false, false, "replace.show"),
+    bind("\\", true, false, false, "view.split"),
+    bind("\\", true, true, false, "view.unsplit"),
 ];
 
 /// Un comando ejecutable desde la paleta.
@@ -145,6 +147,16 @@ pub static COMMANDS: &[Command] = &[
         id: "replace.show",
         name: "Reemplazar",
         category: "Buscar",
+    },
+    Command {
+        id: "view.split",
+        name: "Dividir panel en dos columnas",
+        category: "Ver",
+    },
+    Command {
+        id: "view.unsplit",
+        name: "Unir paneles",
+        category: "Ver",
     },
 ];
 
@@ -250,6 +262,8 @@ mod tests {
         assert_eq!(keys_for("file.save").as_deref(), Some("Ctrl+S"));
         assert_eq!(keys_for("palette.show").as_deref(), Some("Ctrl+Shift+P"));
         assert_eq!(keys_for("edit.redo").as_deref(), Some("Ctrl+Shift+Z"));
+        assert_eq!(keys_for("view.split").as_deref(), Some("Ctrl+\\"));
+        assert_eq!(keys_for("view.unsplit").as_deref(), Some("Ctrl+Shift+\\"));
         assert_eq!(keys_for("missing.command"), None);
     }
 

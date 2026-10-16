@@ -90,6 +90,9 @@ pub struct Editor {
     /// Hueco superior (px) reservado a la barra de pestañas: todo el dibujo
     /// y toda la geometría (clicks, scroll, visibles) se desplaza con él.
     top_inset: f32,
+    /// Hueco izquierdo (px): desplaza el gutter y el código para que el panel
+    /// derecho de un split no pinte encima del izquierdo.
+    left_inset: f32,
     /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
     find: Vec<Range<usize>>,
     find_current: usize,
@@ -112,6 +115,7 @@ impl Default for Editor {
             focused: true,
             caret_on: true,
             top_inset: 0.0,
+            left_inset: 0.0,
             find: Vec::new(),
             find_current: 0,
             find_query: String::new(),
@@ -193,6 +197,17 @@ impl Editor {
     /// Reserva los `px` superiores para la barra de pestañas (0 = sin barra).
     pub fn set_top_inset(&mut self, px: f32) {
         self.top_inset = px;
+    }
+
+    /// Desplaza horizontalmente todo el panel (0 = pegado al borde izquierdo).
+    pub fn set_left_inset(&mut self, px: f32) {
+        self.left_inset = px;
+    }
+
+    /// Solo para tests (comprobar la geometría de un split).
+    #[cfg(test)]
+    pub fn left_inset(&self) -> f32 {
+        self.left_inset
     }
 
     pub fn focused(&self) -> bool {
@@ -936,6 +951,7 @@ impl Editor {
         let advance = FONT_SIZE * advance_ratio;
         let line_count = self.buffer.line_count();
         let inset = self.top_inset;
+        let xin = self.left_inset;
 
         let visible_first = (((self.scroll_y - inset - PADDING_TOP) / LINE_HEIGHT)
             .floor()
@@ -949,7 +965,14 @@ impl Editor {
         self.syntax.prepare(&mut self.buffer, visible_last);
         // La búsqueda se resincroniza si el buffer cambió (undo, edición…).
         self.find_sync();
-        let ctx = (inset, visible_first, visible_last, self.scroll_y, advance);
+        let ctx = (
+            xin,
+            inset,
+            visible_first,
+            visible_last,
+            self.scroll_y,
+            advance,
+        );
         for cursor in &self.cursors {
             let range = cursor.range();
             push_range_quad(&mut scene, &range, &self.buffer, ctx, SELECTION);
@@ -974,7 +997,7 @@ impl Editor {
                 GUTTER_FG
             };
             let number = format!("{}", line + 1);
-            let number_x = GUTTER_RIGHT_X - number.len() as f32 * advance;
+            let number_x = xin + GUTTER_RIGHT_X - number.len() as f32 * advance;
             scene
                 .texts
                 .push(TextSpan::new(number, number_x, y, FONT_SIZE, color));
@@ -987,7 +1010,7 @@ impl Editor {
             if tokens.is_empty() {
                 scene
                     .texts
-                    .push(TextSpan::new(text, CODE_X, y, FONT_SIZE, FG));
+                    .push(TextSpan::new(text, xin + CODE_X, y, FONT_SIZE, FG));
                 continue;
             }
             // Columnas de TODOS los tokens en un solo recorrido de la línea
@@ -1003,7 +1026,7 @@ impl Editor {
                 }
                 scene.texts.push(TextSpan::new(
                     piece,
-                    CODE_X + cells as f32 * advance,
+                    xin + CODE_X + cells as f32 * advance,
                     y,
                     FONT_SIZE,
                     token.color,
@@ -1021,7 +1044,7 @@ impl Editor {
                 let col = cursor.caret - self.buffer.line_to_char(line);
                 let cells = movement::visual_column(&self.buffer.line_text(line), col, TAB_WIDTH);
                 scene.overlays.push(Quad::new(
-                    CODE_X + cells as f32 * advance,
+                    xin + CODE_X + cells as f32 * advance,
                     y,
                     CARET_WIDTH,
                     LINE_HEIGHT - 2.0,
@@ -1150,7 +1173,7 @@ impl Editor {
 
     /// Coordenadas lógicas → offset de char (columna visual, media celda).
     fn caret_at(&self, x: f32, y: f32, advance: f32) -> usize {
-        let visual = ((x - CODE_X) / advance).floor().max(0.0) as usize;
+        let visual = ((x - self.left_inset - CODE_X) / advance).floor().max(0.0) as usize;
         let line_f = ((y - self.top_inset - PADDING_TOP + self.scroll_y) / LINE_HEIGHT).floor();
         let line = (line_f.max(0.0) as usize).min(self.buffer.line_count() - 1);
         let text = self.buffer.line_text(line);
@@ -1212,9 +1235,10 @@ fn visible_line_range(
     first.max(visible_first)..=last.min(visible_last)
 }
 
-/// Contexto de dibujo de un rango: (top_inset, visible_first, visible_last,
-/// scroll_y, advance). En tupla como `quads3` para no pasar 9 argumentos.
-type RangeCtx = (f32, usize, usize, f32, f32);
+/// Contexto de dibujo de un rango: (left_inset, top_inset, visible_first,
+/// visible_last, scroll_y, advance). En tupla como `quads3` para no pasar
+/// demasiados argumentos.
+type RangeCtx = (f32, f32, usize, usize, f32, f32);
 
 /// Quad de selección/coincidencia para `range`, recortado a las líneas
 /// visibles: una sola implementación para selecciones y para la búsqueda.
@@ -1228,7 +1252,7 @@ fn push_range_quad(
     if range.is_empty() {
         return;
     }
-    let (inset, visible_first, visible_last, scroll_y, advance) = ctx;
+    let (x_inset, inset, visible_first, visible_last, scroll_y, advance) = ctx;
     let first = buffer.char_to_line(range.start);
     let last = buffer.char_to_line(range.end.saturating_sub(1));
     // Solo la intersección con lo visible: O(viewport), no O(rango).
@@ -1255,7 +1279,7 @@ fn push_range_quad(
             movement::visual_column(&text, text.chars().count(), TAB_WIDTH)
         };
 
-        let x = CODE_X + start_cells as f32 * advance;
+        let x = x_inset + CODE_X + start_cells as f32 * advance;
         let w = (end_cells.saturating_sub(start_cells)) as f32 * advance;
         if w > 0.0 {
             scene.quads.push(Quad::new(x, y, w, LINE_HEIGHT, color));
@@ -1906,6 +1930,36 @@ mod tests {
             editor.buffer.line_to_char(2),
             "caret_at compensa el inset"
         );
+    }
+
+    #[test]
+    fn left_inset_shifts_horizontal_geometry() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola");
+        editor.cursors = vec![Cursor {
+            caret: 4,
+            anchor: 0,
+        }];
+        editor.scroll_y = 0.0;
+
+        let plain = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(
+            plain.quads[0].x, CODE_X,
+            "sin inset la selección va al gutter"
+        );
+
+        editor.set_left_inset(500.0);
+        let scene = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(
+            scene.quads[0].x,
+            500.0 + CODE_X,
+            "la selección se desplaza con el panel"
+        );
+        // caret_at invierte el inset: el click a la 3ª celda del panel derecho
+        // cae en la columna 2; sin inset, ese mismo x iría más allá del texto.
+        assert_eq!(editor.caret_at(500.0 + CODE_X + 2.0 * 10.0, 0.0, 10.0), 2);
+        editor.set_left_inset(0.0);
+        assert_eq!(editor.caret_at(500.0 + CODE_X + 2.0 * 10.0, 0.0, 10.0), 4);
     }
 
     #[test]

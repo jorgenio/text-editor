@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
+use jorgenio_ui::scene::Scene;
 use palette::Palette;
 use search::SearchBar;
 use tabs::{TAB_BAR_H, Tabs};
@@ -164,6 +165,33 @@ fn save_dialog(default_name: &str) -> Option<std::path::PathBuf> {
     .map(|file| file.path().to_path_buf())
 }
 
+/// Mueve el foco a otro grupo (panel), conservando el estado de `focused`
+/// de la ventana: el editor que lo pierde queda apagado para que su caret no
+/// se pinte ni parpadee.
+fn focus_group(tabs: &mut Tabs, group: usize) {
+    if group == tabs.active_group_index() {
+        return;
+    }
+    let focused = tabs.active().focused();
+    tabs.active_mut().set_focused(false);
+    tabs.set_active_group(group);
+    tabs.active_mut().set_focused(focused);
+}
+
+/// Como [`focus_group`] pero también cambia de pestaña (click en la barra).
+fn focus_tab(tabs: &mut Tabs, group: usize, tab: usize) {
+    if (group, tab) == (tabs.active_group_index(), tabs.active_index()) {
+        return;
+    }
+    let focused = tabs.active().focused();
+    if group != tabs.active_group_index() {
+        tabs.active_mut().set_focused(false);
+        tabs.set_active_group(group);
+    }
+    tabs.set_active(tab);
+    tabs.active_mut().set_focused(focused);
+}
+
 /// Ejecuta un comando por id (keymap o paleta de comandos).
 /// `true` = pide redraw.
 fn run_command(
@@ -273,6 +301,14 @@ fn run_command(
             tabs.active_mut().duplicate_current_line();
             true
         }
+        "view.split" => {
+            tabs.split();
+            true
+        }
+        "view.unsplit" => {
+            tabs.unsplit();
+            true
+        }
         other => {
             log::warn!("comando desconocido: {other}");
             false
@@ -355,13 +391,29 @@ impl winit::application::ApplicationHandler for Application {
                 let frame = Instant::now();
                 let viewport = gpu.logical_size();
                 let advance = gpu.advance_ratio();
-                // El editor vive debajo de la barra de pestañas: su área es
-                // la ventana menos TAB_BAR_H y reserva ese hueco (inset).
-                let editor_size = (viewport.0, (viewport.1 - TAB_BAR_H).max(50.0));
-                let active = self.tabs.active_mut();
-                active.set_viewport(editor_size.0, editor_size.1);
-                active.set_top_inset(TAB_BAR_H);
-                let mut scene = active.build_scene(editor_size, advance);
+                // Cada grupo ocupa una columna de ancho igual; su editor vive
+                // debajo de la barra (inset superior) y a la derecha de su
+                // origen horizontal (inset izquierdo).
+                let group_count = self.tabs.group_count();
+                let gw = viewport.0 / group_count as f32;
+                let editor_h = (viewport.1 - TAB_BAR_H).max(50.0);
+                for g in 0..group_count {
+                    self.tabs.set_group_geometry(g, g as f32 * gw, gw, editor_h);
+                }
+                // Une las escenas de todos los grupos: sus franjas en x son
+                // disjuntas, así que el orden entre paneles es indiferente.
+                let mut scene: Option<Scene> = None;
+                for g in 0..group_count {
+                    let part = self
+                        .tabs
+                        .group_active_mut(g)
+                        .build_scene((gw, editor_h), advance);
+                    match &mut scene {
+                        Some(all) => all.append(part),
+                        None => scene = Some(part),
+                    }
+                }
+                let mut scene = scene.expect("siempre hay al menos un grupo");
                 self.tabs
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
                 self.search.render(
@@ -535,17 +587,19 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
-                // Barra de pestañas: cambiar de pestaña. Sin arrastre ni
-                // caret: el click termina aquí.
-                if let Some(index) = self.tabs.click(self.cursor.x, self.cursor.y) {
-                    if index != self.tabs.active_index() {
-                        let focused = self.tabs.active().focused();
-                        self.tabs.set_active(index);
-                        self.tabs.active_mut().set_focused(focused);
-                    }
+                // Barra de pestañas: cambiar de pestaña o de grupo (el click
+                // resuelve grupo+tab). Sin arrastre ni caret: termina aquí.
+                if let Some((group, tab)) = self.tabs.click(self.cursor.x, self.cursor.y) {
+                    focus_tab(&mut self.tabs, group, tab);
                     gpu.request_redraw();
                     return;
                 }
+                // Click en otro panel: ese grupo toma el foco (como Sublime)
+                // y su editor activo coloca el caret.
+                let group_count = self.tabs.group_count();
+                let gw = gpu.logical_size().0 / group_count as f32;
+                let group = ((self.cursor.x / gw).floor().max(0.0) as usize).min(group_count - 1);
+                focus_group(&mut self.tabs, group);
                 // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
                 let mut count = 1;
                 if let Some((at, point)) = self.last_click {
@@ -585,7 +639,12 @@ impl winit::application::ApplicationHandler for Application {
                     MouseScrollDelta::LineDelta(_, y) => y * editor::LINE_HEIGHT * 3.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                self.tabs.active_mut().on_wheel(dy);
+                // Rueda sobre el panel bajo el cursor (sin robar el foco, como
+                // Sublime); si el cursor aún no se movió → grupo 0.
+                let group_count = self.tabs.group_count();
+                let gw = gpu.logical_size().0 / group_count as f32;
+                let group = ((self.cursor.x / gw).floor().max(0.0) as usize).min(group_count - 1);
+                self.tabs.group_active_mut(group).on_wheel(dy);
                 gpu.request_redraw();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
@@ -605,11 +664,41 @@ impl winit::application::ApplicationHandler for Application {
 
 #[cfg(test)]
 mod tests {
-    use super::default_save_name;
+    use super::{default_save_name, focus_group, focus_tab};
+    use crate::editor::Editor;
+    use crate::tabs::Tabs;
 
     #[test]
     fn default_save_name_keeps_or_adds_extension() {
         assert_eq!(default_save_name("foo.rs"), "foo.rs");
         assert_eq!(default_save_name("sin título"), "sin título.txt");
+    }
+
+    #[test]
+    fn focus_group_and_focus_tab_move_the_focused_flag() {
+        let mut tabs = Tabs::new(Editor::default());
+        assert!(tabs.active().focused());
+
+        // split transfiere el flag: el grupo nuevo queda con el foco.
+        tabs.split();
+        assert!(!tabs.group_active_mut(0).focused(), "izq. apagado");
+        assert!(tabs.group_active_mut(1).focused(), "der. con foco");
+
+        focus_group(&mut tabs, 0);
+        assert_eq!(tabs.active_group_index(), 0);
+        assert!(tabs.group_active_mut(0).focused());
+        assert!(!tabs.group_active_mut(1).focused(), "el que sale se apaga");
+
+        // Click en la barra del otro grupo: grupo + pestaña.
+        focus_tab(&mut tabs, 1, 0);
+        assert_eq!(tabs.active_group_index(), 1);
+        assert!(tabs.group_active_mut(1).focused());
+        assert!(!tabs.group_active_mut(0).focused());
+
+        // Sin cambios no toca nada.
+        focus_tab(&mut tabs, 1, 0);
+        assert_eq!(tabs.active_group_index(), 1);
+        focus_group(&mut tabs, 1);
+        assert_eq!(tabs.active_group_index(), 1);
     }
 }

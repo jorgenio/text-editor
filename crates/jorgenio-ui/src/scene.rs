@@ -67,4 +67,15 @@ impl Scene {
             top_texts: Vec::new(),
         }
     }
+
+    /// Añade el contenido de otra escena (une los paneles de un split; el
+    /// `clear` se mantiene). Los paneles no se solapan, así que el orden
+    /// entre escenas es indiferente.
+    pub fn append(&mut self, other: Scene) {
+        self.quads.extend(other.quads);
+        self.texts.extend(other.texts);
+        self.overlays.extend(other.overlays);
+        self.top_quads.extend(other.top_quads);
+        self.top_texts.extend(other.top_texts);
+    }
 }

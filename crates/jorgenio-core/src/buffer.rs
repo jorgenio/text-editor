@@ -28,12 +28,46 @@ impl LineEnding {
     }
 }
 
+/// Edición atómica con su inversa (el material del undo/redo).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    /// Inserta `text` en el offset `at`.
+    Insert { at: usize, text: String },
+    /// Borra `text.chars().count()` chars a partir de `at`.
+    Delete { at: usize, text: String },
+}
+
+impl Edit {
+    pub fn inverse(&self) -> Edit {
+        match self {
+            Edit::Insert { at, text } => Edit::Delete {
+                at: *at,
+                text: text.clone(),
+            },
+            Edit::Delete { at, text } => Edit::Insert {
+                at: *at,
+                text: text.clone(),
+            },
+        }
+    }
+
+    /// Aplica el edit (sin grabar: solo graba lo hecho entre `begin`/`take_edits`).
+    pub fn apply(&self, buffer: &mut Buffer) {
+        match self {
+            Edit::Insert { at, text } => buffer.insert(*at, text),
+            Edit::Delete { at, text } => buffer.delete(*at..*at + text.chars().count()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Buffer {
     rope: Rope,
     revision: u64,
     line_ending: LineEnding,
     dirty: bool,
+    /// Edits grabados entre `begin` y `take_edits` (para armar la transacción).
+    journal: Option<Vec<Edit>>,
 }
 
 impl Default for Buffer {
@@ -49,6 +83,7 @@ impl Buffer {
             revision: 0,
             line_ending: LineEnding::default(),
             dirty: false,
+            journal: None,
         }
     }
 
@@ -60,6 +95,7 @@ impl Buffer {
             revision: 0,
             line_ending,
             dirty: false,
+            journal: None,
         }
     }
 
@@ -85,9 +121,28 @@ impl Buffer {
         }
     }
 
+    /// Empieza a grabar los edits (una acción de usuario = una transacción).
+    pub fn begin(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+
+    /// Termina la grabación y devuelve los edits del bloque.
+    pub fn take_edits(&mut self) -> Vec<Edit> {
+        self.journal.take().unwrap_or_default()
+    }
+
     pub fn insert(&mut self, char_offset: usize, text: &str) {
-        self.rope
-            .insert(char_offset.min(self.rope.len_chars()), text);
+        if text.is_empty() {
+            return;
+        }
+        let at = char_offset.min(self.rope.len_chars());
+        self.rope.insert(at, text);
+        if let Some(journal) = &mut self.journal {
+            journal.push(Edit::Insert {
+                at,
+                text: text.to_owned(),
+            });
+        }
         self.bump();
     }
 
@@ -97,7 +152,11 @@ impl Buffer {
         if start >= end {
             return;
         }
+        let text = self.rope.slice(start..end).to_string();
         self.rope.remove(start..end);
+        if let Some(journal) = &mut self.journal {
+            journal.push(Edit::Delete { at: start, text });
+        }
         self.bump();
     }
 
@@ -241,5 +300,39 @@ mod tests {
         assert_eq!(buffer.char_to_line(3), 1);
         assert_eq!(buffer.char_to_line(buffer.len_chars()), 1); // caret al final
         assert_eq!(buffer.line_text(1), "ño");
+    }
+
+    #[test]
+    fn journal_records_edits_for_undo() {
+        let mut buffer = Buffer::from_text("hola");
+        buffer.begin();
+        buffer.delete(1..3); // borra "ol" → "ha"
+        buffer.insert(1, "XX");
+        let edits = buffer.take_edits();
+        assert_eq!(
+            edits,
+            vec![
+                Edit::Delete {
+                    at: 1,
+                    text: "ol".to_owned()
+                },
+                Edit::Insert {
+                    at: 1,
+                    text: "XX".to_owned()
+                },
+            ]
+        );
+        assert_eq!(buffer.text_range(0..buffer.len_chars()), "hXXa");
+
+        // Sin grabación activa no se registran edits.
+        buffer.insert(0, "!");
+        assert!(buffer.take_edits().is_empty());
+
+        // El inverse restaura el texto original.
+        let mut restored = Buffer::from_text("hola");
+        for edit in edits.iter().rev().map(Edit::inverse) {
+            edit.apply(&mut restored);
+        }
+        assert_eq!(restored.text_range(0..restored.len_chars()), "hola");
     }
 }

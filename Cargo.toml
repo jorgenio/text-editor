@@ -32,6 +32,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 bytemuck = "1"
 tempfile = "3"
+# Portapapeles (solo texto: sin image-data para no arrastrar el crate `image`)
+arboard = { version = "3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -3,7 +3,7 @@
 mod editor;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
@@ -12,6 +12,13 @@ use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::Key;
 use winit::window::Window;
+
+/// Ventana de doble/triple click (misma "tanda" de clicks).
+const CLICK_WINDOW: Duration = Duration::from_millis(450);
+/// Tolerancia en px para considerar "el mismo punto" entre clicks.
+const CLICK_SLOP2: f32 = 16.0; // (4 px)^2
+/// Umbral de movimiento para que un click se convierta en arrastre.
+const DRAG_SLOP2: f32 = 16.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -23,10 +30,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct Application {
     editor: Editor,
     gpu: Option<GpuContext>,
+    /// Portapapeles del SO, creado en la primera uso (lazy).
+    clipboard: Option<arboard::Clipboard>,
     modifiers: winit::keyboard::ModifiersState,
     last_title: String,
     cursor: LogicalPosition<f32>,
     caret_blink_deadline: Instant,
+    /// Clicks para doble/triple click.
+    last_click: Option<(Instant, LogicalPosition<f32>)>,
+    click_count: u32,
+    mouse_down: bool,
+    drag_origin: Option<LogicalPosition<f32>>,
+    drag_active: bool,
 }
 
 impl Application {
@@ -34,12 +49,63 @@ impl Application {
         Self {
             editor: Editor::from_cli(path),
             gpu: None,
+            clipboard: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_title: String::new(),
             cursor: LogicalPosition::new(0.0, 0.0),
             caret_blink_deadline: Instant::now() + editor::CARET_BLINK,
+            last_click: None,
+            click_count: 0,
+            mouse_down: false,
+            drag_origin: None,
+            drag_active: false,
         }
     }
+}
+
+/// Portapapeles lazy (se crea en el primer uso).
+fn clipboard_slot(slot: &mut Option<arboard::Clipboard>) -> Option<&mut arboard::Clipboard> {
+    if slot.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(clipboard) => *slot = Some(clipboard),
+            Err(err) => {
+                log::warn!("portapapeles no disponible: {err}");
+                return None;
+            }
+        }
+    }
+    slot.as_mut()
+}
+
+fn copy_selection(editor: &Editor, slot: &mut Option<arboard::Clipboard>) {
+    let Some(text) = editor.copy() else {
+        return;
+    };
+    if let Some(clipboard) = clipboard_slot(slot) {
+        match clipboard.set_text(text) {
+            Ok(()) => log::info!("copiado al portapapeles"),
+            Err(err) => log::warn!("no se pudo copiar: {err}"),
+        }
+    }
+}
+
+fn cut_selection(editor: &mut Editor, slot: &mut Option<arboard::Clipboard>) {
+    let Some(text) = editor.cut() else {
+        return;
+    };
+    if let Some(clipboard) = clipboard_slot(slot) {
+        match clipboard.set_text(text) {
+            Ok(()) => log::info!("cortado al portapapeles"),
+            Err(err) => log::warn!("no se pudo cortar: {err}"),
+        }
+    }
+}
+
+fn paste_clipboard(editor: &mut Editor, slot: &mut Option<arboard::Clipboard>) {
+    let Some(text) = clipboard_slot(slot).and_then(|clipboard| clipboard.get_text().ok()) else {
+        return;
+    };
+    editor.insert_text(&text);
 }
 
 impl winit::application::ApplicationHandler for Application {
@@ -127,14 +193,47 @@ impl winit::application::ApplicationHandler for Application {
                 if (self.modifiers.control_key() || self.modifiers.super_key())
                     && key_event.state == ElementState::Pressed
                     && let Key::Character(text) = &key_event.logical_key
-                    && text.as_str() == "s"
                 {
-                    match self.editor.save() {
-                        Ok(()) => log::info!("guardado"),
-                        Err(err) => log::error!("error al guardar: {err}"),
+                    let shift = self.modifiers.shift_key();
+                    let shortcut = match text.to_lowercase().as_str() {
+                        "s" if !shift => {
+                            match self.editor.save() {
+                                Ok(()) => log::info!("guardado"),
+                                Err(err) => log::error!("error al guardar: {err}"),
+                            }
+                            true
+                        }
+                        "c" => {
+                            copy_selection(&self.editor, &mut self.clipboard);
+                            true
+                        }
+                        "x" => {
+                            cut_selection(&mut self.editor, &mut self.clipboard);
+                            true
+                        }
+                        "v" => {
+                            paste_clipboard(&mut self.editor, &mut self.clipboard);
+                            true
+                        }
+                        "a" => {
+                            self.editor.select_all();
+                            true
+                        }
+                        "z" => {
+                            if shift {
+                                self.editor.redo();
+                            } else {
+                                self.editor.undo();
+                            }
+                            true
+                        }
+                        "y" => self.editor.redo(),
+                        _ => false,
+                    };
+                    if shortcut {
+                        gpu.request_redraw();
+                        return;
                     }
-                    gpu.request_redraw();
-                    return;
                 }
                 if self.editor.on_key(&key_event, self.modifiers) {
                     gpu.request_redraw();
@@ -143,16 +242,57 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = gpu.scale_factor();
                 self.cursor = position.to_logical::<f32>(scale);
+                if self.mouse_down {
+                    if !self.drag_active
+                        && let Some(origin) = self.drag_origin
+                    {
+                        let dx = self.cursor.x - origin.x;
+                        let dy = self.cursor.y - origin.y;
+                        if dx * dx + dy * dy > DRAG_SLOP2 {
+                            self.drag_active = true;
+                        }
+                    }
+                    if self.drag_active {
+                        let advance = editor::FONT_SIZE * gpu.advance_ratio();
+                        self.editor.select_to(self.cursor.x, self.cursor.y, advance);
+                        gpu.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
+                // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
+                let mut count = 1;
+                if let Some((at, point)) = self.last_click {
+                    let dx = self.cursor.x - point.x;
+                    let dy = self.cursor.y - point.y;
+                    if at.elapsed() < CLICK_WINDOW && dx * dx + dy * dy <= CLICK_SLOP2 {
+                        count = self.click_count + 1;
+                    }
+                }
+                self.click_count = count;
+                self.last_click = Some((Instant::now(), self.cursor));
+                self.mouse_down = true;
+                self.drag_origin = Some(self.cursor);
+                self.drag_active = false;
+
                 let advance = editor::FONT_SIZE * gpu.advance_ratio();
-                let cursor: (f32, f32) = (self.cursor.x, self.cursor.y);
-                self.editor.on_click(cursor.0, cursor.1, advance);
+                let shift = self.modifiers.shift_key();
+                self.editor
+                    .on_click(self.cursor.x, self.cursor.y, advance, count, shift);
                 gpu.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_down = false;
+                self.drag_active = false;
+                self.drag_origin = None;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {

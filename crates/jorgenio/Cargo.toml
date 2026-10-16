@@ -16,6 +16,7 @@ winit.workspace = true
 pollster.workspace = true
 log.workspace = true
 env_logger.workspace = true
+arboard.workspace = true
 
 [lints]
 workspace = true

@@ -118,6 +118,71 @@ fn byte_at_char(line: &str, char_col: usize) -> usize {
         .map_or(line.len(), |(i, _)| i)
 }
 
+/// Rango de la palabra bajo `pos` (doble click): letras/dígitos/`_` se toman
+/// como una unidad; los espacios forman su propio run; nunca cruza líneas.
+pub fn word_range(buffer: &Buffer, pos: usize) -> std::ops::Range<usize> {
+    use std::ops::Range;
+
+    let len = buffer.len_chars();
+    if len == 0 {
+        return Range { start: 0, end: 0 };
+    }
+    let pos = pos.min(len);
+    let line = buffer.char_to_line(pos);
+    let line_start = buffer.line_to_char(line);
+    let text = buffer.line_text(line);
+    let chars: Vec<char> = text.chars().collect();
+
+    // Clic justo tras una palabra (el char es el espacio siguiente) → esa palabra.
+    let mut col = pos.saturating_sub(line_start).min(chars.len());
+    if col == chars.len() {
+        col = chars.len().saturating_sub(1);
+    } else if !is_word_char(chars[col]) && col > 0 && is_word_char(chars[col - 1]) {
+        col -= 1;
+    }
+    if chars.is_empty() {
+        // Línea vacía: selecciona su terminador (\n) si existe.
+        return Range {
+            start: line_start,
+            end: (line_start + 1).min(len),
+        };
+    }
+
+    let mut begin = col;
+    let mut end = col + 1;
+    if is_word_char(chars[col]) {
+        while begin > 0 && is_word_char(chars[begin - 1]) {
+            begin -= 1;
+        }
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+    } else if chars[col].is_whitespace() {
+        while begin > 0 && chars[begin - 1].is_whitespace() {
+            begin -= 1;
+        }
+        while end < chars.len() && chars[end].is_whitespace() {
+            end += 1;
+        }
+    }
+
+    Range {
+        start: line_start + begin,
+        end: line_start + end,
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Rango de la línea completa (incluye su `\n`; la última usa el fin del buffer).
+pub fn line_range(buffer: &Buffer, line: usize) -> std::ops::Range<usize> {
+    let start = buffer.line_to_char(line);
+    let end = buffer.line_to_char(line + 1);
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +223,44 @@ mod tests {
         assert_eq!(char_col_at_visual("你好", 0, 4), 0);
         assert_eq!(char_col_at_visual("你好", 1, 4), 1); // mitad der del 1er char
         assert_eq!(char_col_at_visual("你好", 2, 4), 1); // mitad izq del 2º
+    }
+
+    #[test]
+    fn word_range_selects_words_spaces_and_stays_on_line() {
+        let buffer = Buffer::from_text("hola mundo\nfoo_bar 42");
+        assert_eq!(word_range(&buffer, 0), 0..4);
+        assert_eq!(word_range(&buffer, 2), 0..4);
+        assert_eq!(word_range(&buffer, 5), 5..10);
+        // Clic en el espacio tras "hola" (col 4) → la palabra anterior.
+        assert_eq!(word_range(&buffer, 4), 0..4);
+        // Clic al final de la primera línea (pos 10 = sobre el \n).
+        assert_eq!(word_range(&buffer, 10), 5..10);
+        // Underscore es parte de la palabra; segunda línea con línea propia.
+        assert_eq!(word_range(&buffer, 12), 11..18); // "foo_bar"
+        assert_eq!(word_range(&buffer, 19), 19..21); // "42"
+        // Clic justo tras "foo_bar" → la palabra anterior (regla de borde).
+        assert_eq!(word_range(&buffer, 18), 11..18);
+
+        // Un run de espacios varios sí se selecciona como tal.
+        let spaces = Buffer::from_text("ab   cd");
+        assert_eq!(word_range(&spaces, 4), 2..5);
+        assert_eq!(word_range(&spaces, 2), 0..2); // tras "ab" → la palabra
+    }
+
+    #[test]
+    fn word_range_on_empty_line_selects_its_newline() {
+        let buffer = Buffer::from_text("abc\n");
+        // pos 4 = línea vacía final: selecciona el \n inexistente → fin del buffer.
+        assert_eq!(word_range(&buffer, 4), 4..4);
+        let buffer = Buffer::from_text("abc\n\nx");
+        assert_eq!(word_range(&buffer, 4), 4..5); // la \n de la línea vacía
+    }
+
+    #[test]
+    fn line_range_includes_newline() {
+        let buffer = Buffer::from_text("uno\ndos\n");
+        assert_eq!(line_range(&buffer, 0), 0..4);
+        assert_eq!(line_range(&buffer, 1), 4..8);
+        assert_eq!(line_range(&buffer, 2), 8..8); // línea vacía final
     }
 }

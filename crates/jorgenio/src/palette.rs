@@ -1,0 +1,406 @@
+//! Paleta de comandos (Ctrl+Shift+P): fuzzy matching con `nucleo-matcher`,
+//! dibujada en la capa superior de la [`Scene`] (tras todo el contenido).
+//!
+//! La resuelve `main.rs`: [`Action::Run`] trae el id del comando ejecutable.
+
+use jorgenio_ui::scene::{Quad, Scene, TextSpan};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32String};
+use winit::event::{ElementState, KeyEvent};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+use crate::commands::{self, COMMANDS};
+use crate::editor::FONT_SIZE;
+
+/// Altura de fila de resultados (px lógicos).
+const ROW_H: f32 = 22.0;
+/// Altura de la fila de prompt (px lógicos).
+const PROMPT_H: f32 = 30.0;
+/// Distancia desde el borde superior de la ventana (px lógicos).
+const TOP: f32 = 48.0;
+/// Margen lateral respecto al borde de la ventana (px lógicos).
+const PAD: f32 = 16.0;
+/// Filas visibles como máximo.
+const MAX_ROWS: usize = 10;
+/// Ancho máximo del panel (px lógicos).
+const MAX_W: f32 = 560.0;
+/// Ancho mínimo del panel (px lógicos).
+const MIN_W: f32 = 200.0;
+
+const PANEL_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
+const PANEL_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
+const HIGHLIGHT: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
+const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
+const DIM: (u8, u8, u8) = (0x75, 0x71, 0x5E);
+/// Caret del prompt (mismo blanco que FG, pero con alfa para los quads).
+const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
+
+/// Qué debe hacer `main.rs` tras [`Palette::on_key`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Close,
+    /// Ejecutar el comando con este id.
+    Run(&'static str),
+}
+
+pub struct Palette {
+    open: bool,
+    query: String,
+    /// Índice dentro de `matches` (no de `COMMANDS`).
+    selected: usize,
+    scroll: usize,
+    /// Índices de `COMMANDS` que puntúan, de mayor a menor.
+    matches: Vec<usize>,
+    matcher: Matcher,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            selected: 0,
+            scroll: 0,
+            matches: (0..COMMANDS.len()).collect(),
+            matcher: Matcher::new(Config::DEFAULT),
+        }
+    }
+}
+
+impl Palette {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Abre vacía (Ctrl+Shift+P): muestra todos los comandos.
+    pub fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.refilter();
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn toggle(&mut self) {
+        if self.open {
+            self.close();
+        } else {
+            self.open();
+        }
+    }
+
+    /// Texto del IME dentro de la paleta abierta.
+    pub fn push_text(&mut self, text: &str) {
+        if !self.open || text.is_empty() {
+            return;
+        }
+        self.query.push_str(text);
+        self.refilter();
+    }
+
+    /// Re-evalúa el fuzzy match sobre `query` y reordena por puntuación
+    /// (sort estable: los empates conservan el orden de `COMMANDS`).
+    fn refilter(&mut self) {
+        let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+        let mut scored: Vec<(usize, u32)> = COMMANDS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                let hay = format!("{} {} {}", command.name, command.category, command.id);
+                let hay = Utf32String::from(hay.as_str());
+                pattern
+                    .score(hay.slice(..), &mut self.matcher)
+                    .map(|score| (index, score))
+            })
+            .collect();
+        scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+        self.matches = scored.into_iter().map(|(index, _)| index).collect();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let max = self.matches.len() - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max as isize) as usize;
+    }
+
+    /// Teclado de la paleta (solo mientras está abierta).
+    pub fn on_key(&mut self, event: &KeyEvent, modifiers: ModifiersState) -> Action {
+        if event.state == ElementState::Released {
+            return Action::None;
+        }
+        self.handle_key(&event.logical_key, modifiers)
+    }
+
+    /// Núcleo de [`Palette::on_key`] (separable para tests: `KeyEvent` no es
+    /// construible fuera de winit).
+    fn handle_key(&mut self, key: &Key, modifiers: ModifiersState) -> Action {
+        if !self.open {
+            return Action::None;
+        }
+        match key {
+            Key::Named(NamedKey::Escape) => Action::Close,
+            Key::Named(NamedKey::Enter) => {
+                if let Some(&index) = self.matches.get(self.selected) {
+                    Action::Run(COMMANDS[index].id)
+                } else {
+                    Action::Close
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if self.query.pop().is_some() {
+                    self.refilter();
+                }
+                Action::None
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.move_selection(-1);
+                Action::None
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.move_selection(1);
+                Action::None
+            }
+            // Imprimibles: salvo Ctrl/Cmd puro; AltGr (Ctrl+Alt) sí escribe.
+            Key::Character(text)
+                if !(modifiers.control_key() || modifiers.super_key()) || modifiers.alt_key() =>
+            {
+                self.query.push_str(text);
+                self.refilter();
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Dibuja el panel en la capa superior (si está abierta). `advance` es el
+    /// ancho de celda (px lógicos), igual que en el editor.
+    pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32) {
+        if !self.open {
+            return;
+        }
+
+        let rows = self.matches.len().clamp(1, MAX_ROWS);
+        // Que la selección siempre quede visible.
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + rows {
+            self.scroll = self.selected - rows + 1;
+        }
+
+        let width = (viewport.0 - 2.0 * PAD).clamp(MIN_W, MAX_W);
+        let x = (viewport.0 - width) / 2.0;
+        let height = PROMPT_H + 1.0 + rows as f32 * ROW_H + 8.0;
+
+        scene
+            .top_quads
+            .push(Quad::new(x, TOP, width, height, PANEL_BG));
+        scene
+            .top_quads
+            .push(Quad::new(x, TOP, width, 1.0, PANEL_EDGE));
+        scene
+            .top_quads
+            .push(Quad::new(x, TOP + height - 1.0, width, 1.0, PANEL_EDGE));
+        scene
+            .top_quads
+            .push(Quad::new(x, TOP + PROMPT_H, width, 1.0, PANEL_EDGE));
+
+        // Prompt "> query" + caret fijo (2 px, siempre visible).
+        let prompt_x = x + 8.0;
+        scene.top_texts.push(TextSpan::new(
+            format!("> {}", self.query),
+            prompt_x,
+            TOP + (PROMPT_H - FONT_SIZE) / 2.0,
+            FONT_SIZE,
+            FG,
+        ));
+        let caret_x = prompt_x + (2 + self.query.chars().count()) as f32 * advance;
+        scene
+            .top_quads
+            .push(Quad::new(caret_x, TOP + 7.0, 2.0, PROMPT_H - 14.0, CARET));
+
+        if self.matches.is_empty() {
+            scene.top_texts.push(TextSpan::new(
+                "(sin coincidencias)",
+                prompt_x,
+                TOP + PROMPT_H + 1.0 + (ROW_H - FONT_SIZE) / 2.0,
+                FONT_SIZE,
+                DIM,
+            ));
+            return;
+        }
+
+        // Fila resaltada (bajo los textos: se dibuja antes que ellos).
+        let highlight_row = self.selected - self.scroll;
+        let highlight_y = TOP + PROMPT_H + 1.0 + highlight_row as f32 * ROW_H;
+        scene
+            .top_quads
+            .push(Quad::new(x, highlight_y, width, ROW_H, HIGHLIGHT));
+
+        for (visible, &index) in self.matches.iter().skip(self.scroll).take(rows).enumerate() {
+            let command = &COMMANDS[index];
+            let y = TOP + PROMPT_H + 1.0 + visible as f32 * ROW_H + (ROW_H - FONT_SIZE) / 2.0;
+            scene
+                .top_texts
+                .push(TextSpan::new(command.name, x + 8.0, y, FONT_SIZE, FG));
+            // Categoría + atajo, alineados a la derecha; se omiten si pisan
+            // el nombre (viewport muy estrecho).
+            let right = match commands::keys_for(command.id) {
+                Some(keys) => format!("{}  {keys}", command.category),
+                None => command.category.to_string(),
+            };
+            let right_x = x + width - 8.0 - right.chars().count() as f32 * advance;
+            if right_x > x + 8.0 + command.name.chars().count() as f32 * advance + 4.0 {
+                scene
+                    .top_texts
+                    .push(TextSpan::new(right, right_x, y, FONT_SIZE, DIM));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods() -> ModifiersState {
+        ModifiersState::empty()
+    }
+
+    fn key(ch: char) -> Key {
+        Key::Character(ch.to_string().into())
+    }
+
+    fn match_ids(palette: &Palette) -> Vec<&'static str> {
+        palette.matches.iter().map(|&i| COMMANDS[i].id).collect()
+    }
+
+    #[test]
+    fn open_close_toggle_reset_query() {
+        let mut palette = Palette::default();
+        assert!(!palette.is_open());
+        palette.open();
+        assert!(palette.is_open());
+        palette.push_text("guardar");
+        assert_eq!(palette.query, "guardar");
+        palette.toggle();
+        assert!(!palette.is_open());
+        palette.toggle();
+        assert!(palette.is_open());
+        assert!(palette.query.is_empty(), "reabrir limpia la query");
+        assert_eq!(palette.matches.len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn refilter_fuzzy_orders_and_filters() {
+        let mut palette = Palette::default();
+        palette.open();
+
+        palette.push_text("línea");
+        let ids = match_ids(&palette);
+        assert_eq!(ids.len(), 2, "solo comandos de línea: {ids:?}");
+        assert!(ids.contains(&"edit.delete_line"));
+        assert!(ids.contains(&"edit.duplicate_line"));
+
+        palette.push_text("xyz");
+        assert!(palette.matches.is_empty(), "query imposible");
+
+        // Backspace hasta "línea" otra vez: re-filtra y recuperan los 2.
+        for _ in 0..3 {
+            palette.handle_key(&Key::Named(NamedKey::Backspace), mods());
+        }
+        assert_eq!(palette.query, "línea");
+        assert_eq!(palette.matches.len(), 2, "backspace re-filtra");
+    }
+
+    #[test]
+    fn enter_runs_selected_escape_closes() {
+        let mut palette = Palette::default();
+        palette.open();
+
+        // La primera fila del estado por defecto es "palette.show".
+        let action = palette.handle_key(&Key::Named(NamedKey::Enter), mods());
+        assert_eq!(action, Action::Run("palette.show"));
+
+        let action = palette.handle_key(&Key::Named(NamedKey::Escape), mods());
+        assert_eq!(action, Action::Close);
+    }
+
+    #[test]
+    fn arrows_move_selection_with_clamp() {
+        let mut palette = Palette::default();
+        palette.open();
+        palette.handle_key(&Key::Named(NamedKey::ArrowDown), mods());
+        palette.handle_key(&Key::Named(NamedKey::ArrowDown), mods());
+        assert_eq!(palette.selected, 2);
+        palette.handle_key(&Key::Named(NamedKey::ArrowUp), mods());
+        assert_eq!(palette.selected, 1);
+        for _ in 0..50 {
+            palette.handle_key(&Key::Named(NamedKey::ArrowUp), mods());
+        }
+        assert_eq!(palette.selected, 0, "no baja de 0");
+        for _ in 0..100 {
+            palette.handle_key(&Key::Named(NamedKey::ArrowDown), mods());
+        }
+        assert_eq!(palette.selected, COMMANDS.len() - 1, "no pasa del final");
+    }
+
+    #[test]
+    fn ctrl_characters_do_not_type_altgr_does() {
+        let mut palette = Palette::default();
+        palette.open();
+        let mut ctrl = ModifiersState::CONTROL;
+        assert_eq!(palette.handle_key(&key('s'), ctrl), Action::None);
+        assert!(palette.query.is_empty(), "Ctrl+S no escribe");
+
+        ctrl.insert(ModifiersState::ALT);
+        assert_eq!(palette.handle_key(&key('é'), ctrl), Action::None);
+        assert_eq!(palette.query, "é", "AltGr sí escribe");
+
+        assert_eq!(
+            palette.handle_key(&key('p'), ModifiersState::empty()),
+            Action::None
+        );
+        assert_eq!(palette.query, "ép");
+    }
+
+    #[test]
+    fn render_pushes_top_layer_only_when_open() {
+        let mut palette = Palette::default();
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        assert!(scene.top_quads.is_empty() && scene.top_texts.is_empty());
+
+        palette.open();
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        assert!(!scene.top_quads.is_empty(), "fondo + bordes + caret");
+        assert!(!scene.top_texts.is_empty(), "prompt + filas");
+        // prompt + hasta 10 filas con nombre y etiqueta a la derecha.
+        assert!(scene.top_texts.len() <= 1 + 2 * MAX_ROWS);
+
+        palette.push_text("xyz");
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        let empty_texts: Vec<_> = scene
+            .top_texts
+            .iter()
+            .filter(|span| span.text.contains("sin coincidencias"))
+            .collect();
+        assert!(!empty_texts.is_empty(), "muestra aviso sin coincidencias");
+    }
+
+    #[test]
+    fn render_handles_narrow_viewport() {
+        let mut palette = Palette::default();
+        palette.open();
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (120.0, 800.0), 8.4);
+        assert!(!scene.top_quads.is_empty());
+        assert!(!scene.top_texts.is_empty());
+    }
+}

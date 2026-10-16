@@ -50,6 +50,10 @@ pub struct Scene {
     pub texts: Vec<TextSpan>,
     /// Rectángulos **encima** del texto (carets).
     pub overlays: Vec<Quad>,
+    /// Capa superior: rectángulos de paneles (paleta) sobre TODO el contenido.
+    pub top_quads: Vec<Quad>,
+    /// Textos de la capa superior: se dibujan tras `top_quads`.
+    pub top_texts: Vec<TextSpan>,
 }
 
 impl Scene {
@@ -59,6 +63,8 @@ impl Scene {
             quads: Vec::new(),
             texts: Vec::new(),
             overlays: Vec::new(),
+            top_quads: Vec::new(),
+            top_texts: Vec::new(),
         }
     }
 }

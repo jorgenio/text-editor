@@ -150,11 +150,19 @@ impl GpuContext {
         let resolution = (self.config.width, self.config.height);
         self.text
             .prepare(&self.device, &self.queue, scale, resolution, &scene.texts);
+        if !scene.top_texts.is_empty() {
+            self.text.prepare_top(
+                &self.device,
+                &self.queue,
+                scale,
+                resolution,
+                &scene.top_texts,
+            );
+        }
         self.quads.prepare(
             &self.device,
             &self.queue,
-            &scene.quads,
-            &scene.overlays,
+            (&scene.quads, &scene.overlays, &scene.top_quads),
             scale,
             resolution,
         );
@@ -181,10 +189,15 @@ impl GpuContext {
                 multiview_mask: None,
             });
             let under = scene.quads.len() as u32;
-            let total = under + scene.overlays.len() as u32;
+            let over = under + scene.overlays.len() as u32;
+            let top = over + scene.top_quads.len() as u32;
             self.quads.draw(&mut pass, 0..under);
             self.text.render(&mut pass);
-            self.quads.draw(&mut pass, under..total);
+            self.quads.draw(&mut pass, under..over);
+            self.quads.draw(&mut pass, over..top);
+            if !scene.top_texts.is_empty() {
+                self.text.render_top(&mut pass);
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);

@@ -193,7 +193,12 @@ impl Editor {
     /// `KeyEvent` no se puede construir fuera de winit).
     fn handle_key(&mut self, key: &Key, modifiers: ModifiersState) -> bool {
         // Los atajos (Ctrl/Cmd + tecla) los maneja el shell de la app.
-        if (modifiers.control_key() || modifiers.super_key()) && matches!(key, Key::Character(_)) {
+        // Con AltGr (Ctrl+Alt en Windows) NO: esa combinación escribe
+        // símbolos del layout (@, €, {…}), que deben insertarse.
+        if (modifiers.control_key() || modifiers.super_key())
+            && !modifiers.alt_key()
+            && matches!(key, Key::Character(_))
+        {
             return false;
         }
         let shift = modifiers.shift_key();
@@ -446,6 +451,97 @@ impl Editor {
             }
         });
         Some(text)
+    }
+
+    /// Líneas (0-based) que contienen cursores, ordenadas y sin duplicados.
+    fn cursor_lines(&self) -> Vec<usize> {
+        let mut lines: Vec<usize> = self
+            .cursors
+            .iter()
+            .map(|cursor| self.buffer.char_to_line(cursor.caret))
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Borra TODAS las líneas con cursores (Ctrl+Shift+K): una sola transacción.
+    pub fn delete_current_line(&mut self) {
+        let lines = self.cursor_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.with_transaction(|editor| {
+            // Descendente: borrar líneas altas no desplaza las de abajo.
+            let mut i = lines.len();
+            while i > 0 {
+                i -= 1;
+                let line = lines[i];
+                let (start, end) = if line + 1 < editor.buffer.line_count() {
+                    // Incluye el \n final de la línea.
+                    (
+                        editor.buffer.line_to_char(line),
+                        editor.buffer.line_to_char(line + 1),
+                    )
+                } else {
+                    let start = editor.buffer.line_to_char(line);
+                    let len = editor.buffer.len_chars();
+                    if start >= len {
+                        // Última línea vacía ("a\n" con caret en línea 1):
+                        // solo existe el \n anterior que la separa.
+                        (start.saturating_sub(1), start)
+                    } else {
+                        // Sin \n final: se lleva solo el contenido.
+                        (start, len)
+                    }
+                };
+                if start >= end {
+                    continue;
+                }
+                editor.buffer.delete(start..end);
+                for cursor in &mut editor.cursors {
+                    cursor.caret = shift_after(cursor.caret, start, end, 0);
+                    cursor.anchor = shift_after(cursor.anchor, start, end, 0);
+                }
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Duplica hacia abajo cada línea con cursor (Ctrl+Shift+D): una
+    /// transacción; los cursores quedan en las líneas originales.
+    pub fn duplicate_current_line(&mut self) {
+        let lines = self.cursor_lines();
+        if lines.is_empty() {
+            return;
+        }
+        self.with_transaction(|editor| {
+            let mut i = lines.len();
+            while i > 0 {
+                i -= 1;
+                let line = lines[i];
+                let last = line + 1 >= editor.buffer.line_count();
+                let content = editor.buffer.line_text(line);
+                // La última línea no tiene \n: se copia añadiéndolo delante.
+                let payload = if last {
+                    format!("\n{content}")
+                } else {
+                    format!("{content}\n")
+                };
+                let at = if last {
+                    editor.buffer.len_chars()
+                } else {
+                    editor.buffer.line_to_char(line + 1)
+                };
+                let len = payload.chars().count();
+                editor.buffer.insert(at, &payload);
+                for cursor in &mut editor.cursors {
+                    cursor.caret = shift_after(cursor.caret, at, at, len);
+                    cursor.anchor = shift_after(cursor.anchor, at, at, len);
+                }
+            }
+        });
+        self.reset_caret_blink();
     }
 
     pub fn undo(&mut self) -> bool {
@@ -1152,5 +1248,98 @@ mod tests {
             2,
             "el cursor duplicado de la línea 0 se fusiona"
         );
+    }
+
+    #[test]
+    fn delete_current_line_drops_line_and_undoes() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres");
+        editor.cursors = vec![Cursor::new(5)]; // sobre "dos"
+
+        editor.delete_current_line();
+        assert_eq!(text_of(&editor), "uno\ntres");
+        assert_eq!(editor.cursors[0].caret, 4, "cae al inicio de 'tres'");
+
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "uno\ndos\ntres");
+        assert_eq!(editor.cursors[0].caret, 5, "restaura el caret");
+    }
+
+    #[test]
+    fn delete_current_line_multi_cursor_dedups_shared_line() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres");
+        editor.cursors = vec![Cursor::new(5), Cursor::new(6)]; // ambos en "dos"
+
+        editor.delete_current_line();
+        assert_eq!(
+            text_of(&editor),
+            "uno\ntres",
+            "la línea solo se borra una vez"
+        );
+        assert_eq!(editor.cursors.len(), 1);
+        assert_eq!(editor.cursors[0].caret, 4);
+    }
+
+    #[test]
+    fn delete_current_line_last_line_keeps_newline_before() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos");
+        editor.cursors = vec![Cursor::new(5)]; // sobre "dos", la última línea
+
+        editor.delete_current_line();
+        assert_eq!(text_of(&editor), "uno\n");
+        assert_eq!(editor.cursors[0].caret, 4);
+    }
+
+    #[test]
+    fn delete_current_line_on_empty_last_line_removes_newline() {
+        let mut editor = Editor::default();
+        editor.insert_text("a\n");
+        editor.cursors = vec![Cursor::new(2)]; // línea 1, vacía
+
+        editor.delete_current_line();
+        assert_eq!(text_of(&editor), "a");
+        assert_eq!(editor.cursors[0].caret, 1);
+    }
+
+    #[test]
+    fn duplicate_line_inserts_copy_keeps_cursor_and_undoes() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos");
+        editor.cursors = vec![Cursor::new(1)]; // en "uno"
+
+        editor.duplicate_current_line();
+        assert_eq!(text_of(&editor), "uno\nuno\ndos");
+        assert_eq!(editor.cursors[0].caret, 1, "el caret queda en la original");
+
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "uno\ndos");
+        assert_eq!(editor.cursors[0].caret, 1);
+    }
+
+    #[test]
+    fn duplicate_last_line_appends_copy() {
+        let mut editor = Editor::default();
+        editor.insert_text("a\nbb");
+        editor.cursors = vec![Cursor::new(3)]; // en "bb", última línea
+
+        editor.duplicate_current_line();
+        assert_eq!(text_of(&editor), "a\nbb\nbb");
+        assert_eq!(editor.cursors[0].caret, 3, "caret en la original");
+    }
+
+    #[test]
+    fn altgr_writes_symbols_but_ctrl_is_shortcut() {
+        let mut editor = Editor::default();
+
+        // AltGr (Ctrl+Alt) en Windows escribe símbolos: no se traga.
+        let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
+        assert!(editor.handle_key(&Key::Character("@".into()), ctrl_alt));
+        assert_eq!(text_of(&editor), "@");
+
+        // Ctrl solo: el shell de la app maneja el atajo (aquí se ignora).
+        assert!(!editor.handle_key(&Key::Character("s".into()), ModifiersState::CONTROL));
+        assert_eq!(text_of(&editor), "@");
     }
 }

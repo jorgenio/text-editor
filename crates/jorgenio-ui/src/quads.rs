@@ -1,8 +1,9 @@
-//! Pipeline instanciado de rectángulos (bajo y encima del texto).
+//! Pipeline instanciado de rectángulos (bajo el texto, encima y capa superior).
 //!
 //! Un quad por instancia: posición/tamaño en px físicos + color RGBA.
-//! Dos draws con el mismo pipeline: `0..n_bajo` antes del texto y
-//! `n_bajo..n_total` después (carets encima).
+//! Tres draws con el mismo pipeline en orden: `0..under` antes del texto,
+//! `under..over` después (carets) y `over..top` para la capa superior
+//! (paneles), que va tras los carets.
 
 use std::ops::Range;
 
@@ -163,36 +164,37 @@ impl QuadRenderer {
         }
     }
 
-    /// Sube los quads a la GPU en px físicos: `under` (bajo el texto) en el
-    /// rango `0..under.len()`, `over` (carets) a continuación.
+    /// Sube los quads a la GPU en px físicos en el orden del render pass:
+    /// `under` (bajo el texto) en `0..under.len()`, `over` (carets) a
+    /// continuación y `top` (paneles) al final.
     pub fn prepare(
         &mut self,
         device: &Device,
         queue: &wgpu::Queue,
-        under: &[Quad],
-        over: &[Quad],
+        layers: (&[Quad], &[Quad], &[Quad]),
         scale: f64,
         resolution: (u32, u32),
     ) {
-        let total = under.len() + over.len();
+        let (under, over, top) = layers;
+        let total = under.len() + over.len() + top.len();
         if total > self.capacity {
             self.capacity = total.next_power_of_two();
             self.quads = create_quad_buffer(device, self.capacity);
             self.bind_group = create_bind_group(device, &self.layout, &self.uniform, &self.quads);
         }
 
-        if !under.is_empty() {
+        for (group, offset) in [
+            (under, 0),
+            (over, under.len()),
+            (top, under.len() + over.len()),
+        ] {
+            if group.is_empty() {
+                continue;
+            }
             queue.write_buffer(
                 &self.quads,
-                0,
-                bytemuck::cast_slice(&to_instance_data(under, scale)),
-            );
-        }
-        if !over.is_empty() {
-            queue.write_buffer(
-                &self.quads,
-                under.len() as u64 * BYTES_PER_QUAD,
-                bytemuck::cast_slice(&to_instance_data(over, scale)),
+                offset as u64 * BYTES_PER_QUAD,
+                bytemuck::cast_slice(&to_instance_data(group, scale)),
             );
         }
 

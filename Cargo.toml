@@ -36,6 +36,8 @@ tempfile = "3"
 arboard = { version = "3", default-features = false }
 # Syntax highlighting (fancy-regex: puro Rust, sin librerías C)
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+# Fuzzy matching para la paleta de comandos (de helix/nucleo)
+nucleo-matcher = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

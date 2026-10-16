@@ -18,6 +18,11 @@ pollster.workspace = true
 log.workspace = true
 env_logger.workspace = true
 arboard.workspace = true
+nucleo-matcher.workspace = true
+
+[dev-dependencies]
+# Solo tests: construir `Scene` exige `wgpu::Color`.
+wgpu.workspace = true
 
 [lints]
 workspace = true

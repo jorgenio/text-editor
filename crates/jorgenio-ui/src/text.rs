@@ -34,8 +34,13 @@ pub struct TextLayer {
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
+    /// Renderer del contenido del editor.
     renderer: TextRenderer,
     buffers: Vec<SpanBuffer>,
+    /// Renderer de la capa superior (paneles): independiente para poder
+    /// dibujar texto en dos puntos del mismo pass sin pisarse.
+    renderer_top: TextRenderer,
+    buffers_top: Vec<SpanBuffer>,
     resolution: (u32, u32),
     /// Avance (advance) de la fuente monoespaciada en emisiones (≈ 0.6).
     advance_ratio: f32,
@@ -58,6 +63,7 @@ impl TextLayer {
         let mut viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
+        let renderer_top = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
         let swash_cache = SwashCache::new();
 
         viewport.update(
@@ -75,6 +81,8 @@ impl TextLayer {
             atlas,
             renderer,
             buffers: Vec::new(),
+            renderer_top,
+            buffers_top: Vec::new(),
             resolution,
             advance_ratio,
         }
@@ -94,6 +102,25 @@ impl TextLayer {
         resolution: (u32, u32),
         spans: &[TextSpan],
     ) {
+        self.update_resolution(queue, resolution);
+        self.prepare_impl(device, queue, scale, resolution, spans, false);
+    }
+
+    /// Igual que [`TextLayer::prepare`] pero para la capa superior (se llama
+    /// tras el contenido principal; la resolución la fija `prepare`).
+    pub fn prepare_top(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scale: f64,
+        resolution: (u32, u32),
+        spans: &[TextSpan],
+    ) {
+        self.update_resolution(queue, resolution);
+        self.prepare_impl(device, queue, scale, resolution, spans, true);
+    }
+
+    fn update_resolution(&mut self, queue: &Queue, resolution: (u32, u32)) {
         if self.resolution != resolution {
             self.resolution = resolution;
             self.viewport.update(
@@ -104,10 +131,26 @@ impl TextLayer {
                 },
             );
         }
+    }
 
-        self.buffers.truncate(spans.len());
+    fn prepare_impl(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scale: f64,
+        resolution: (u32, u32),
+        spans: &[TextSpan],
+        top: bool,
+    ) {
+        let (renderer, buffers) = if top {
+            (&mut self.renderer_top, &mut self.buffers_top)
+        } else {
+            (&mut self.renderer, &mut self.buffers)
+        };
+
+        buffers.truncate(spans.len());
         for (index, span) in spans.iter().enumerate() {
-            let stale = self.buffers.get(index).is_none_or(|entry| {
+            let stale = buffers.get(index).is_none_or(|entry| {
                 entry.text != span.text || entry.size != span.size || entry.scale != scale
             });
             if !stale {
@@ -137,16 +180,16 @@ impl TextLayer {
                 size: span.size,
                 scale,
             };
-            if index < self.buffers.len() {
-                self.buffers[index] = entry;
+            if index < buffers.len() {
+                buffers[index] = entry;
             } else {
-                self.buffers.push(entry);
+                buffers.push(entry);
             }
         }
 
         let areas: Vec<TextArea<'_>> = spans
             .iter()
-            .zip(&self.buffers)
+            .zip(buffers)
             .map(|(span, entry)| TextArea {
                 buffer: &entry.buffer,
                 left: span.x * scale as f32,
@@ -163,7 +206,7 @@ impl TextLayer {
             })
             .collect();
 
-        self.renderer
+        renderer
             .prepare(
                 device,
                 queue,
@@ -180,6 +223,13 @@ impl TextLayer {
         self.renderer
             .render(&self.atlas, &self.viewport, pass)
             .expect("glyphon render falló");
+    }
+
+    /// Dibuja la capa superior; llamar tras `render` y los quads de `top`.
+    pub fn render_top(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.renderer_top
+            .render(&self.atlas, &self.viewport, pass)
+            .expect("glyphon render (top) falló");
     }
 
     pub fn trim(&mut self) {

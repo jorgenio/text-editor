@@ -1,12 +1,15 @@
 //! Jorgenio Text — binario principal: ventana + event loop + orquestación.
 
+mod commands;
 mod editor;
+mod palette;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
+use palette::Palette;
 use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -29,6 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct Application {
     editor: Editor,
+    /// Paleta de comandos (Ctrl+Shift+P).
+    palette: Palette,
     gpu: Option<GpuContext>,
     /// Portapapeles del SO, creado en la primera uso (lazy).
     clipboard: Option<arboard::Clipboard>,
@@ -48,6 +53,7 @@ impl Application {
     fn new(path: Option<std::path::PathBuf>) -> Self {
         Self {
             editor: Editor::from_cli(path),
+            palette: Palette::default(),
             gpu: None,
             clipboard: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -106,6 +112,69 @@ fn paste_clipboard(editor: &mut Editor, slot: &mut Option<arboard::Clipboard>) {
         return;
     };
     editor.insert_text(&text);
+}
+
+/// Ejecuta un comando por id (keymap o paleta de comandos).
+/// `true` = pide redraw.
+fn run_command(
+    editor: &mut Editor,
+    clipboard: &mut Option<arboard::Clipboard>,
+    palette: &mut Palette,
+    id: &str,
+) -> bool {
+    match id {
+        "palette.show" => {
+            palette.open();
+            true
+        }
+        "file.save" => {
+            match editor.save() {
+                Ok(()) => log::info!("guardado"),
+                Err(err) => log::error!("error al guardar: {err}"),
+            }
+            true
+        }
+        "edit.undo" => {
+            editor.undo();
+            true
+        }
+        "edit.redo" => {
+            editor.redo();
+            true
+        }
+        "edit.copy" => {
+            copy_selection(editor, clipboard);
+            true
+        }
+        "edit.cut" => {
+            cut_selection(editor, clipboard);
+            true
+        }
+        "edit.paste" => {
+            paste_clipboard(editor, clipboard);
+            true
+        }
+        "edit.select_all" => {
+            editor.select_all();
+            true
+        }
+        "edit.select_next_occurrence" => {
+            editor.select_next_occurrence();
+            true
+        }
+        "edit.delete_line" => {
+            editor.delete_current_line();
+            true
+        }
+        "edit.duplicate_line" => {
+            editor.duplicate_current_line();
+            true
+        }
+        other => {
+            log::warn!("comando desconocido: {other}");
+            false
+        }
+    }
 }
 
 impl winit::application::ApplicationHandler for Application {
@@ -175,7 +244,10 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::RedrawRequested => {
                 let viewport = gpu.logical_size();
                 self.editor.set_viewport(viewport.0, viewport.1);
-                let scene = self.editor.build_scene(viewport, gpu.advance_ratio());
+                let advance = gpu.advance_ratio();
+                let mut scene = self.editor.build_scene(viewport, advance);
+                self.palette
+                    .render(&mut scene, viewport, editor::FONT_SIZE * advance);
                 gpu.render(&scene);
                 let title = self.editor.title();
                 if title != self.last_title {
@@ -190,54 +262,51 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
-                if (self.modifiers.control_key() || self.modifiers.super_key())
-                    && key_event.state == ElementState::Pressed
-                    && let Key::Character(text) = &key_event.logical_key
+                // Atajos del keymap (combinaciones exactas: ni mods extra
+                // ni de menos). AltGr (Ctrl+Alt) no llega aquí: sin binding
+                // con alt coincide.
+                if key_event.state == ElementState::Pressed
+                    && (self.modifiers.control_key() || self.modifiers.super_key())
+                    && matches!(key_event.logical_key, Key::Character(_))
+                    && let Some(id) = commands::command_for(self.modifiers, &key_event.logical_key)
                 {
-                    let shift = self.modifiers.shift_key();
-                    let shortcut = match text.to_lowercase().as_str() {
-                        "s" if !shift => {
-                            match self.editor.save() {
-                                Ok(()) => log::info!("guardado"),
-                                Err(err) => log::error!("error al guardar: {err}"),
-                            }
-                            true
+                    if self.palette.is_open() {
+                        // Con la paleta abierta solo actúa el toggle; el
+                        // resto de comandos se traga.
+                        if id == "palette.show" {
+                            self.palette.toggle();
+                            gpu.request_redraw();
                         }
-                        "c" => {
-                            copy_selection(&self.editor, &mut self.clipboard);
-                            true
-                        }
-                        "x" => {
-                            cut_selection(&mut self.editor, &mut self.clipboard);
-                            true
-                        }
-                        "v" => {
-                            paste_clipboard(&mut self.editor, &mut self.clipboard);
-                            true
-                        }
-                        "a" => {
-                            self.editor.select_all();
-                            true
-                        }
-                        "z" => {
-                            if shift {
-                                self.editor.redo();
-                            } else {
-                                self.editor.undo();
-                            }
-                            true
-                        }
-                        "y" => self.editor.redo(),
-                        "d" => {
-                            self.editor.select_next_occurrence();
-                            true
-                        }
-                        _ => false,
-                    };
-                    if shortcut {
+                    } else if run_command(
+                        &mut self.editor,
+                        &mut self.clipboard,
+                        &mut self.palette,
+                        id,
+                    ) {
                         gpu.request_redraw();
-                        return;
                     }
+                    return;
+                }
+                // Paleta abierta: su teclado manda (todo se traga).
+                if self.palette.is_open() {
+                    match self.palette.on_key(&key_event, self.modifiers) {
+                        palette::Action::Run(id) => {
+                            self.palette.close();
+                            run_command(
+                                &mut self.editor,
+                                &mut self.clipboard,
+                                &mut self.palette,
+                                id,
+                            );
+                            gpu.request_redraw();
+                        }
+                        palette::Action::Close => {
+                            self.palette.close();
+                            gpu.request_redraw();
+                        }
+                        palette::Action::None => {}
+                    }
+                    return;
                 }
                 if self.editor.on_key(&key_event, self.modifiers) {
                     gpu.request_redraw();
@@ -268,6 +337,10 @@ impl winit::application::ApplicationHandler for Application {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Clic fuera de la paleta la cierra (sigue colocando caret).
+                if self.palette.is_open() {
+                    self.palette.close();
+                }
                 // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
                 let mut count = 1;
                 if let Some((at, point)) = self.last_click {
@@ -312,7 +385,11 @@ impl winit::application::ApplicationHandler for Application {
                 gpu.request_redraw();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.editor.insert_text(&text);
+                if self.palette.is_open() {
+                    self.palette.push_text(&text);
+                } else {
+                    self.editor.insert_text(&text);
+                }
                 gpu.request_redraw();
             }
             _ => {}

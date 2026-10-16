@@ -112,7 +112,7 @@ fn grapheme_cells(grapheme: &str, column: usize, tab_width: usize) -> usize {
     }
 }
 
-fn byte_at_char(line: &str, char_col: usize) -> usize {
+pub fn byte_at_char(line: &str, char_col: usize) -> usize {
     line.char_indices()
         .nth(char_col)
         .map_or(line.len(), |(i, _)| i)

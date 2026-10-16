@@ -1,30 +1,27 @@
 //! Historial undo/redo transaccional.
 //!
 //! Cada acción de edición genera una [`Transaction`] con sus edits inversos y
-//! los carets antes/después. Las pulsaciones contiguas de tecleo o backspace
-//! se fusionan (coalesce) para que Ctrl+Z deshaga bloques naturales en lugar
-//! de un carácter a la vez.
+//! los carets (pares `caret, anchor` de cada cursor) antes/después. Las
+//! pulsaciones contiguas de tecleo o backspace se fusionan (coalesce) para que
+//! Ctrl+Z deshaga bloques naturales en lugar de un carácter a la vez.
 
 use crate::buffer::{Buffer, Edit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub edits: Vec<Edit>,
-    pub caret_before: usize,
-    pub anchor_before: usize,
-    pub caret_after: usize,
-    pub anchor_after: usize,
+    /// `(caret, anchor)` de cada cursor antes del cambio.
+    pub cursors_before: Vec<(usize, usize)>,
+    /// `(caret, anchor)` de cada cursor después del cambio.
+    pub cursors_after: Vec<(usize, usize)>,
 }
 
 impl Transaction {
-    /// `before`/`after` = `(caret, anchor)` antes y después del cambio.
-    pub fn new(edits: Vec<Edit>, before: (usize, usize), after: (usize, usize)) -> Self {
+    pub fn new(edits: Vec<Edit>, before: Vec<(usize, usize)>, after: Vec<(usize, usize)>) -> Self {
         Self {
             edits,
-            caret_before: before.0,
-            anchor_before: before.1,
-            caret_after: after.0,
-            anchor_after: after.1,
+            cursors_before: before,
+            cursors_after: after,
         }
     }
 
@@ -32,19 +29,17 @@ impl Transaction {
     pub fn inverse(&self) -> Self {
         Self {
             edits: self.edits.iter().rev().map(Edit::inverse).collect(),
-            caret_before: self.caret_after,
-            anchor_before: self.anchor_after,
-            caret_after: self.caret_before,
-            anchor_after: self.anchor_before,
+            cursors_before: self.cursors_after.clone(),
+            cursors_after: self.cursors_before.clone(),
         }
     }
 
-    pub fn undo_position(&self) -> (usize, usize) {
-        (self.caret_before, self.anchor_before)
+    pub fn undo_position(&self) -> Vec<(usize, usize)> {
+        self.cursors_before.clone()
     }
 
-    pub fn redo_position(&self) -> (usize, usize) {
-        (self.caret_after, self.anchor_after)
+    pub fn redo_position(&self) -> Vec<(usize, usize)> {
+        self.cursors_after.clone()
     }
 }
 
@@ -68,15 +63,14 @@ impl History {
         if let Some(prev) = self.undo_stack.last_mut()
             && merge(prev, &txn)
         {
-            prev.caret_after = txn.caret_after;
-            prev.anchor_after = txn.anchor_after;
+            prev.cursors_after = txn.cursors_after;
             return;
         }
         self.undo_stack.push(txn);
     }
 
-    /// Aplica el inverse del último txn; devuelve `(caret, anchor)` a restaurar.
-    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<(usize, usize)> {
+    /// Aplica el inverse del último txn; devuelve los carets a restaurar.
+    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<Vec<(usize, usize)>> {
         let txn = self.undo_stack.pop()?;
         for edit in txn.inverse().edits {
             edit.apply(buffer);
@@ -86,8 +80,8 @@ impl History {
         Some(position)
     }
 
-    /// Reaplica el último txn deshecho; devuelve `(caret, anchor)` a restaurar.
-    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<(usize, usize)> {
+    /// Reaplica el último txn deshecho; devuelve los carets a restaurar.
+    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<Vec<(usize, usize)>> {
         let txn = self.redo_stack.pop()?;
         for edit in &txn.edits {
             edit.apply(buffer);
@@ -174,8 +168,8 @@ mod tests {
                 at,
                 text: text.to_owned(),
             }],
-            (at, at),
-            (at + text.chars().count(), at + text.chars().count()),
+            vec![(at, at)],
+            vec![(at + text.chars().count(), at + text.chars().count())],
         )
     }
 
@@ -185,20 +179,16 @@ mod tests {
         let mut history = History::new();
 
         let txn = txn_insert(0, "hola");
-        let edits = txn.edits.clone();
         buffer.insert(0, "hola");
         history.commit(txn);
 
         let position = history.undo(&mut buffer).expect("debe poder deshacer");
         assert_eq!(buffer.text_range(0..buffer.len_chars()), "");
-        assert_eq!(position, (0, 0));
+        assert_eq!(position, vec![(0, 0)]);
 
         let position = history.redo(&mut buffer).expect("debe poder rehacer");
         assert_eq!(buffer.text_range(0..buffer.len_chars()), "hola");
-        assert_eq!(position, (4, 4));
-
-        // Las aplicaciones manuales en el test no deben enmascarar el inverse:
-        assert_eq!(edits.len(), 1);
+        assert_eq!(position, vec![(4, 4)]);
     }
 
     #[test]
@@ -211,8 +201,8 @@ mod tests {
                 at: 2,
                 text: "cd".to_owned(),
             }],
-            (4, 4),
-            (2, 2),
+            vec![(4, 4)],
+            vec![(2, 2)],
         );
         buffer.delete(2..4);
         history.commit(txn);
@@ -240,22 +230,21 @@ mod tests {
     #[test]
     fn backspace_runs_merge_backwards() {
         let mut history = History::new();
-        // "hola": backspace en 4 → Delete{3,"a"}; en 3 → Delete{2,"l"}.
         history.commit(Transaction::new(
             vec![Edit::Delete {
                 at: 3,
                 text: "a".to_owned(),
             }],
-            (4, 4),
-            (3, 3),
+            vec![(4, 4)],
+            vec![(3, 3)],
         ));
         history.commit(Transaction::new(
             vec![Edit::Delete {
                 at: 2,
                 text: "l".to_owned(),
             }],
-            (3, 3),
-            (2, 2),
+            vec![(3, 3)],
+            vec![(2, 2)],
         ));
         assert_eq!(history.undo_stack.len(), 1, "backspace contiguo se fusiona");
         assert_eq!(
@@ -274,5 +263,30 @@ mod tests {
         history.commit(txn_insert(1, "\n"));
         history.commit(txn_insert(2, "b"));
         assert_eq!(history.undo_stack.len(), 3, "Enter corta el grupo de undo");
+    }
+
+    #[test]
+    fn multi_cursor_positions_survive_undo() {
+        let mut buffer = Buffer::new();
+        let mut history = History::new();
+        let txn = Transaction::new(
+            vec![Edit::Insert {
+                at: 0,
+                text: "ab".to_owned(),
+            }],
+            vec![(0, 0), (5, 5)],
+            vec![(2, 2), (7, 7)],
+        );
+        history.commit(txn);
+        assert_eq!(
+            history.undo(&mut buffer),
+            Some(vec![(0, 0), (5, 5)]),
+            "undo restaura TODOS los carets"
+        );
+        assert_eq!(
+            history.redo(&mut buffer),
+            Some(vec![(2, 2), (7, 7)]),
+            "redo restaura TODOS los carets"
+        );
     }
 }

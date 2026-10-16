@@ -228,6 +228,10 @@ impl winit::application::ApplicationHandler for Application {
                             true
                         }
                         "y" => self.editor.redo(),
+                        "d" => {
+                            self.editor.select_next_occurrence();
+                            true
+                        }
                         _ => false,
                     };
                     if shortcut {
@@ -281,8 +285,13 @@ impl winit::application::ApplicationHandler for Application {
 
                 let advance = editor::FONT_SIZE * gpu.advance_ratio();
                 let shift = self.modifiers.shift_key();
-                self.editor
-                    .on_click(self.cursor.x, self.cursor.y, advance, count, shift);
+                if self.modifiers.alt_key() && count == 1 {
+                    self.editor
+                        .add_cursor_at(self.cursor.x, self.cursor.y, advance);
+                } else {
+                    self.editor
+                        .on_click(self.cursor.x, self.cursor.y, advance, count, shift);
+                }
                 gpu.request_redraw();
             }
             WindowEvent::MouseInput {

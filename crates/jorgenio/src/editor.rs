@@ -1,4 +1,10 @@
-//! Editor de texto: buffer + caret/anchor (selección) + historial + escena.
+//! Editor de texto: buffer + cursores (multi-cursor) + historial + escena.
+//!
+//! El estado de entrada vive en `cursors` (siempre ≥ 1). El **primario** es
+//! `cursors[0]` (el de más a la izquierda tras [`Editor::sort_and_merge`]).
+//! Las ediciones se aplican de derecha a izquierda (los edits altos no afectan
+//! a las posiciones bajas aún sin procesar) y se registran como UNA
+//! transacción de undo con los carets antes/después.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -35,6 +41,33 @@ const GUTTER_CURRENT: (u8, u8, u8) = (0xFD, 0x97, 0x1F);
 const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
 const SELECTION: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
 
+/// Un cursor con su selección (`anchor == caret` → sin selección).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    /// Offset del punto de inserción en **chars**.
+    pub caret: usize,
+    /// Ancla de la selección.
+    pub anchor: usize,
+}
+
+impl Cursor {
+    pub fn new(caret: usize) -> Self {
+        Self {
+            caret,
+            anchor: caret,
+        }
+    }
+
+    /// Selección en rango normalizado `min..max` de chars.
+    pub fn range(&self) -> Range<usize> {
+        self.caret.min(self.anchor)..self.caret.max(self.anchor)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.caret != self.anchor
+    }
+}
+
 pub struct Editor {
     buffer: Buffer,
     history: History,
@@ -43,10 +76,8 @@ pub struct Editor {
     /// Extensión del archivo ("rs", "py"…); "" = texto plano.
     lang: String,
     path: Option<PathBuf>,
-    /// Offset del caret (punto de inserción) en **chars**.
-    caret: usize,
-    /// Ancla de la selección; `anchor == caret` → sin selección.
-    anchor: usize,
+    /// Cursores con su selección; ordenados y sin solapes (invariante).
+    cursors: Vec<Cursor>,
     /// Scroll vertical en px lógicos.
     scroll_y: f32,
     viewport: (f32, f32),
@@ -62,8 +93,7 @@ impl Default for Editor {
             syntax: SyntaxHighlighter::new(),
             lang: String::new(),
             path: None,
-            caret: 0,
-            anchor: 0,
+            cursors: vec![Cursor::new(0)],
             scroll_y: 0.0,
             viewport: (1200.0, 800.0),
             focused: true,
@@ -141,18 +171,12 @@ impl Editor {
         self.caret_on = true;
     }
 
-    pub fn has_selection(&self) -> bool {
-        self.anchor != self.caret
-    }
-
-    /// Selección en rango normalizado `min..max` de chars.
-    pub fn selected_range(&self) -> Range<usize> {
-        self.caret.min(self.anchor)..self.caret.max(self.anchor)
-    }
-
+    /// Selección completa del buffer (un solo cursor primario).
     pub fn select_all(&mut self) {
-        self.anchor = 0;
-        self.caret = self.buffer.len_chars();
+        self.cursors = vec![Cursor {
+            caret: self.buffer.len_chars(),
+            anchor: 0,
+        }];
         self.reset_caret_blink();
         self.scroll_into_view();
     }
@@ -162,15 +186,19 @@ impl Editor {
         if event.state == ElementState::Released {
             return false;
         }
+        self.handle_key(&event.logical_key, modifiers)
+    }
+
+    /// Núcleo de [`Editor::on_key`] (separable para los tests, ya que
+    /// `KeyEvent` no se puede construir fuera de winit).
+    fn handle_key(&mut self, key: &Key, modifiers: ModifiersState) -> bool {
         // Los atajos (Ctrl/Cmd + tecla) los maneja el shell de la app.
-        if (modifiers.control_key() || modifiers.super_key())
-            && matches!(event.logical_key, Key::Character(_))
-        {
+        if (modifiers.control_key() || modifiers.super_key()) && matches!(key, Key::Character(_)) {
             return false;
         }
         let shift = modifiers.shift_key();
 
-        let handled = match &event.logical_key {
+        let handled = match key {
             Key::Named(NamedKey::Backspace) => {
                 self.backspace();
                 true
@@ -187,60 +215,90 @@ impl Editor {
                 self.insert_text("\t");
                 true
             }
+            Key::Named(NamedKey::Escape) => {
+                self.collapse_to_primary();
+                true
+            }
             Key::Named(NamedKey::ArrowLeft) => {
                 // Sin Shift, con selección: colapsa al borde izquierdo.
-                let target = if !shift && self.has_selection() {
-                    self.selected_range().start
-                } else {
-                    movement::prev_grapheme(&self.buffer, self.caret)
-                };
-                self.move_caret(target, shift);
+                let collapse = !shift;
+                self.move_cursors(
+                    |cursor, buffer| {
+                        if collapse && cursor.has_selection() {
+                            cursor.range().start
+                        } else {
+                            movement::prev_grapheme(buffer, cursor.caret)
+                        }
+                    },
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
                 // Sin Shift, con selección: colapsa al borde derecho.
-                let target = if !shift && self.has_selection() {
-                    self.selected_range().end
-                } else {
-                    movement::next_grapheme(&self.buffer, self.caret)
-                };
-                self.move_caret(target, shift);
+                let collapse = !shift;
+                self.move_cursors(
+                    |cursor, buffer| {
+                        if collapse && cursor.has_selection() {
+                            cursor.range().end
+                        } else {
+                            movement::next_grapheme(buffer, cursor.caret)
+                        }
+                    },
+                    shift,
+                );
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) if modifiers.alt_key() && modifiers.control_key() => {
+                self.add_cursor_vertical(-1);
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) if modifiers.alt_key() && modifiers.control_key() => {
+                self.add_cursor_vertical(1);
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                let target = movement::vertical_move(&self.buffer, self.caret, -1, TAB_WIDTH);
-                self.move_caret(target, shift);
+                self.move_cursors(
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, -1, TAB_WIDTH),
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                let target = movement::vertical_move(&self.buffer, self.caret, 1, TAB_WIDTH);
-                self.move_caret(target, shift);
+                self.move_cursors(
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, 1, TAB_WIDTH),
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::Home) => {
-                let target = movement::line_start(&self.buffer, self.caret);
-                self.move_caret(target, shift);
+                self.move_cursors(
+                    |cursor, buffer| movement::line_start(buffer, cursor.caret),
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::End) => {
-                let target = movement::line_end(&self.buffer, self.caret);
-                self.move_caret(target, shift);
+                self.move_cursors(
+                    |cursor, buffer| movement::line_end(buffer, cursor.caret),
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::PageUp) => {
-                let target = movement::vertical_move(
-                    &self.buffer,
-                    self.caret,
-                    -self.page_lines(),
-                    TAB_WIDTH,
+                let page = -self.page_lines();
+                self.move_cursors(
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, TAB_WIDTH),
+                    shift,
                 );
-                self.move_caret(target, shift);
                 true
             }
             Key::Named(NamedKey::PageDown) => {
-                let target =
-                    movement::vertical_move(&self.buffer, self.caret, self.page_lines(), TAB_WIDTH);
-                self.move_caret(target, shift);
+                let page = self.page_lines();
+                self.move_cursors(
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, TAB_WIDTH),
+                    shift,
+                );
                 true
             }
             Key::Character(text) => {
@@ -255,8 +313,9 @@ impl Editor {
         handled
     }
 
-    /// Inserta texto (teclado, IME o pegado): reemplaza la selección como UNA
-    /// transacción de undo. Normaliza `\r\n`/`\r` a `\n`.
+    /// Inserta texto en TODOS los cursores (teclado, IME o pegado):
+    /// reemplaza cada selección y deja UNA transacción de undo.
+    /// Normaliza `\r\n`/`\r` a `\n`.
     pub fn insert_text(&mut self, text: &str) {
         let cleaned: Cow<'_, str> = if text.contains('\r') {
             Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
@@ -266,71 +325,132 @@ impl Editor {
         if cleaned.is_empty() {
             return;
         }
+        let len = cleaned.chars().count();
 
-        let before = (self.caret, self.anchor);
-        let range = self.selected_range();
-        self.buffer.begin();
-        if !range.is_empty() {
-            self.buffer.delete(range.clone());
-            self.caret = range.start;
-        }
-        self.buffer.insert(self.caret, &cleaned);
-        self.caret += cleaned.chars().count();
-        self.anchor = self.caret;
-        self.commit(before);
-        self.scroll_into_view();
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let range = editor.cursors[i].range();
+                let (start, end) = (range.start, range.end);
+                if end > start {
+                    editor.buffer.delete(start..end);
+                }
+                editor.buffer.insert(start, &cleaned);
+                let pos = start + len;
+                // Los cursores de la derecha ya están en su sitio: solo se
+                // desplazan por este edit.
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, start, end, len);
+                    other.anchor = shift_after(other.anchor, start, end, len);
+                }
+                editor.cursors[i].caret = pos;
+                editor.cursors[i].anchor = pos;
+            }
+        });
+        self.reset_caret_blink();
     }
 
     pub fn backspace(&mut self) {
-        if self.has_selection() {
-            let range = self.selected_range();
-            self.delete_range(range);
-            return;
-        }
-        if self.caret == 0 {
-            return;
-        }
-        let start = movement::prev_grapheme(&self.buffer, self.caret);
-        self.delete_range(start..self.caret);
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let range = editor.cursors[i].range();
+                let (start, end) = if !range.is_empty() {
+                    (range.start, range.end)
+                } else if range.start > 0 {
+                    (
+                        movement::prev_grapheme(&editor.buffer, range.start),
+                        range.start,
+                    )
+                } else {
+                    continue; // sin selección y al inicio del buffer
+                };
+                editor.buffer.delete(start..end);
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, start, end, 0);
+                    other.anchor = shift_after(other.anchor, start, end, 0);
+                }
+                editor.cursors[i].caret = start;
+                editor.cursors[i].anchor = start;
+            }
+        });
+        self.reset_caret_blink();
     }
 
     pub fn delete_forward(&mut self) {
-        if self.has_selection() {
-            let range = self.selected_range();
-            self.delete_range(range);
-            return;
-        }
-        if self.caret >= self.buffer.len_chars() {
-            return;
-        }
-        let end = movement::next_grapheme(&self.buffer, self.caret);
-        self.delete_range(self.caret..end);
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let range = editor.cursors[i].range();
+                let (start, end) = if !range.is_empty() {
+                    (range.start, range.end)
+                } else if range.start < editor.buffer.len_chars() {
+                    (
+                        range.start,
+                        movement::next_grapheme(&editor.buffer, range.start),
+                    )
+                } else {
+                    continue; // sin selección y al final del buffer
+                };
+                editor.buffer.delete(start..end);
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, start, end, 0);
+                    other.anchor = shift_after(other.anchor, start, end, 0);
+                }
+                editor.cursors[i].caret = start;
+                editor.cursors[i].anchor = start;
+            }
+        });
+        self.reset_caret_blink();
     }
 
-    /// Texto de la selección con el EOL del archivo (para el portapapeles).
+    /// Texto de TODAS las selecciones unidas con `\n` (portapapeles).
     pub fn copy(&self) -> Option<String> {
-        if !self.has_selection() {
+        let parts: Vec<String> = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.has_selection())
+            .map(|cursor| self.buffer.text_range(cursor.range()))
+            .collect();
+        if parts.is_empty() {
             return None;
         }
-        let text = self.buffer.text_range(self.selected_range());
+        let text = parts.join("\n");
         Some(match self.buffer.line_ending() {
             LineEnding::Lf => text,
             LineEnding::Crlf => text.replace('\n', "\r\n"),
         })
     }
 
-    /// Copia la selección y la borra (una transacción de undo).
+    /// Copia las selecciones y las borra (una transacción de undo).
     pub fn cut(&mut self) -> Option<String> {
         let text = self.copy()?;
-        let range = self.selected_range();
-        self.delete_range(range);
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let range = editor.cursors[i].range();
+                if range.is_empty() {
+                    continue; // los cursores sin selección solo se desplazan
+                }
+                editor.buffer.delete(range.clone());
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, range.start, range.end, 0);
+                    other.anchor = shift_after(other.anchor, range.start, range.end, 0);
+                }
+                editor.cursors[i].caret = range.start;
+                editor.cursors[i].anchor = range.start;
+            }
+        });
         Some(text)
     }
 
     pub fn undo(&mut self) -> bool {
-        if let Some((caret, anchor)) = self.history.undo(&mut self.buffer) {
-            self.caret = caret;
-            self.anchor = anchor;
+        if let Some(pairs) = self.history.undo(&mut self.buffer) {
+            self.restore_cursors(pairs);
             self.scroll_into_view();
             self.reset_caret_blink();
             return true;
@@ -339,9 +459,8 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
-        if let Some((caret, anchor)) = self.history.redo(&mut self.buffer) {
-            self.caret = caret;
-            self.anchor = anchor;
+        if let Some(pairs) = self.history.redo(&mut self.buffer) {
+            self.restore_cursors(pairs);
             self.scroll_into_view();
             self.reset_caret_blink();
             return true;
@@ -357,33 +476,153 @@ impl Editor {
         }
         let pos = self.caret_at(x, y, advance);
         match (count, shift) {
-            // Shift+click: extiende la selección desde el ancla.
-            (1, true) => self.caret = pos,
+            // Shift+click: extiende la selección del cursor primario.
+            (1, true) => {
+                if let Some(primary) = self.cursors.first_mut() {
+                    primary.caret = pos;
+                }
+            }
             (2, _) => {
                 let range = movement::word_range(&self.buffer, pos);
-                self.anchor = range.start;
-                self.caret = range.end;
+                self.cursors = vec![Cursor {
+                    caret: range.end,
+                    anchor: range.start,
+                }];
             }
             (3.., _) => {
                 let line = self.buffer.char_to_line(pos);
                 let range = movement::line_range(&self.buffer, line);
-                self.anchor = range.start;
-                self.caret = range.end;
+                self.cursors = vec![Cursor {
+                    caret: range.end,
+                    anchor: range.start,
+                }];
             }
             _ => {
-                self.caret = pos;
-                self.anchor = pos;
+                self.cursors = vec![Cursor::new(pos)];
             }
         }
+        self.sort_and_merge();
         self.scroll_into_view();
     }
 
-    /// Extiende la selección hasta el cursor (arrastre con el botón izquierdo).
+    /// Alt+click: añade un cursor en la posición (sin tocar los demás).
+    pub fn add_cursor_at(&mut self, x: f32, y: f32, advance: f32) {
+        self.reset_caret_blink();
+        if advance <= 0.0 {
+            return;
+        }
+        let pos = self.caret_at(x, y, advance);
+        self.cursors.push(Cursor::new(pos));
+        self.sort_and_merge();
+        self.scroll_into_view();
+    }
+
+    /// Ctrl+Alt+↑/↓: añade cursores arriba/abajo conservando la columna visual.
+    /// Los duplicados se fusionan solos en [`Editor::sort_and_merge`].
+    pub fn add_cursor_vertical(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let mut additions = Vec::with_capacity(self.cursors.len());
+        for cursor in &self.cursors {
+            let line = self.buffer.char_to_line(cursor.caret);
+            let target =
+                (line as isize + delta).clamp(0, self.buffer.line_count() as isize - 1) as usize;
+            let line_start = self.buffer.line_to_char(line);
+            let text = self.buffer.line_text(line);
+            let col = cursor.caret.saturating_sub(line_start);
+            let visual = movement::visual_column(&text, col, TAB_WIDTH);
+            let target_text = self.buffer.line_text(target);
+            let target_col = movement::char_col_at_visual(&target_text, visual, TAB_WIDTH);
+            additions.push(Cursor::new(self.buffer.line_to_char(target) + target_col));
+        }
+        self.cursors.extend(additions);
+        self.sort_and_merge();
+        self.reset_caret_blink();
+        self.scroll_into_view();
+    }
+
+    /// Ctrl+D: sin selección, selecciona la palabra; con selección, añade la
+    /// siguiente ocurrencia (dando la vuelta al final del buffer y saltando
+    /// las que ya están seleccionadas).
+    pub fn select_next_occurrence(&mut self) {
+        self.sort_and_merge();
+        if !self.cursors.iter().any(Cursor::has_selection) {
+            let range = movement::word_range(&self.buffer, self.primary().caret);
+            if range.is_empty() {
+                return;
+            }
+            self.cursors = vec![Cursor {
+                caret: range.end,
+                anchor: range.start,
+            }];
+            self.scroll_into_view();
+            return;
+        }
+
+        let needle = self
+            .cursors
+            .iter()
+            .find(|cursor| cursor.has_selection())
+            .map(|cursor| self.buffer.text_range(cursor.range()))
+            .unwrap_or_default();
+        if needle.is_empty() {
+            return;
+        }
+        let needle_len = needle.chars().count();
+        let mut search_from = self
+            .cursors
+            .iter()
+            .map(|cursor| cursor.range().end)
+            .max()
+            .unwrap_or(0);
+
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                return;
+            }
+            let Some(pos) = self.find_wrapping(&needle, search_from) else {
+                return;
+            };
+            let end = pos + needle_len;
+            let covered = self.cursors.iter().any(|cursor| {
+                let range = cursor.range();
+                pos < range.end && range.start < end
+            });
+            if covered {
+                search_from = pos + 1;
+                continue;
+            }
+            self.cursors.push(Cursor {
+                caret: end,
+                anchor: pos,
+            });
+            self.sort_and_merge();
+            self.scroll_into_view();
+            return;
+        }
+    }
+
+    /// Escape: deja un solo cursor (el primario) sin selección.
+    pub fn collapse_to_primary(&mut self) {
+        let caret = self.primary().caret;
+        self.cursors = vec![Cursor::new(caret)];
+        self.reset_caret_blink();
+        self.scroll_into_view();
+    }
+
+    /// Extiende la selección primaria hasta el cursor (arrastre con el botón izquierdo).
     pub fn select_to(&mut self, x: f32, y: f32, advance: f32) {
         if advance <= 0.0 {
             return;
         }
-        self.caret = self.caret_at(x, y, advance);
+        let pos = self.caret_at(x, y, advance);
+        if let Some(primary) = self.cursors.first_mut() {
+            primary.caret = pos;
+        }
+        self.sort_and_merge();
         self.scroll_into_view();
     }
 
@@ -393,7 +632,7 @@ impl Editor {
         self.clamp_scroll();
     }
 
-    /// Escena de este frame: selección + gutter + líneas visibles + caret.
+    /// Escena de este frame: selecciones + gutter + líneas visibles + carets.
     /// Resalta lo que haga falta (cache) hasta la última línea visible.
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
         let mut scene = Scene::new(srgb(BG.0, BG.1, BG.2));
@@ -411,8 +650,11 @@ impl Editor {
         self.syntax.set_extension(&self.lang);
         self.syntax.prepare(&mut self.buffer, visible_last);
 
-        if self.has_selection() {
-            let range = self.selected_range();
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            if range.is_empty() {
+                continue;
+            }
             let first = self.buffer.char_to_line(range.start);
             let last = self.buffer.char_to_line(range.end.saturating_sub(1));
             for line in first..=last {
@@ -449,7 +691,7 @@ impl Editor {
             }
         }
 
-        let caret_line = self.buffer.char_to_line(self.caret);
+        let caret_line = self.buffer.char_to_line(self.primary().caret);
         for line in visible_first..=visible_last {
             let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
             let color = if line == caret_line {
@@ -494,43 +736,139 @@ impl Editor {
         }
 
         if self.focused && self.caret_on {
-            let y = PADDING_TOP + caret_line as f32 * LINE_HEIGHT - self.scroll_y;
-            let col = self.caret - self.buffer.line_to_char(caret_line);
-            let cells = movement::visual_column(&self.buffer.line_text(caret_line), col, TAB_WIDTH);
-            scene.overlays.push(Quad::new(
-                CODE_X + cells as f32 * advance,
-                y,
-                CARET_WIDTH,
-                LINE_HEIGHT - 2.0,
-                CARET,
-            ));
+            for cursor in &self.cursors {
+                let line = self.buffer.char_to_line(cursor.caret);
+                if line < visible_first || line > visible_last {
+                    continue;
+                }
+                let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
+                let col = cursor.caret - self.buffer.line_to_char(line);
+                let cells = movement::visual_column(&self.buffer.line_text(line), col, TAB_WIDTH);
+                scene.overlays.push(Quad::new(
+                    CODE_X + cells as f32 * advance,
+                    y,
+                    CARET_WIDTH,
+                    LINE_HEIGHT - 2.0,
+                    CARET,
+                ));
+            }
         }
         scene
     }
 
-    /// Borra un rango como transacción y colapsa la selección ahí.
-    fn delete_range(&mut self, range: Range<usize>) {
-        let before = (self.caret, self.anchor);
+    /// Cursor primario (izquierdo); defensa ante una lista vacía.
+    fn primary(&self) -> Cursor {
+        self.cursors.first().copied().unwrap_or(Cursor::new(0))
+    }
+
+    fn cursor_pairs(&self) -> Vec<(usize, usize)> {
+        self.cursors.iter().map(|c| (c.caret, c.anchor)).collect()
+    }
+
+    /// Ordena los cursores y fusiona los que se solapan o tocan (la fusión
+    /// resulta siempre en una selección hacia delante que cubre la unión).
+    /// Mantiene la invariante ≥ 1 cursor y rangos disjuntos en orden creciente.
+    fn sort_and_merge(&mut self) {
+        self.cursors
+            .sort_by_key(|cursor| (cursor.range().start, cursor.range().end));
+        let mut merged: Vec<Cursor> = Vec::with_capacity(self.cursors.len());
+        for cursor in self.cursors.drain(..) {
+            let overlaps = merged
+                .last()
+                .is_some_and(|prev| cursor.range().start <= prev.range().end);
+            if overlaps {
+                let prev = merged.last_mut().expect("overlaps implica previo");
+                let start = prev.range().start.min(cursor.range().start);
+                let end = prev.range().end.max(cursor.range().end);
+                prev.caret = end;
+                prev.anchor = start;
+            } else {
+                merged.push(cursor);
+            }
+        }
+        if merged.is_empty() {
+            merged.push(Cursor::new(0));
+        }
+        self.cursors = merged;
+    }
+
+    /// Ejecuta `body` (ediciones al buffer + cursores) y lo registra como UNA
+    /// transacción de undo con los carets antes/después.
+    fn with_transaction(&mut self, body: impl FnOnce(&mut Self)) {
+        self.sort_and_merge();
+        let before = self.cursor_pairs();
         self.buffer.begin();
-        self.buffer.delete(range.clone());
-        self.caret = range.start;
-        self.anchor = range.start;
-        self.commit(before);
+        body(self);
+        self.sort_and_merge();
+        let edits = self.buffer.take_edits();
+        let after = self.cursor_pairs();
+        self.history.commit(Transaction::new(edits, before, after));
         self.scroll_into_view();
     }
 
-    /// Cierra la transacción abierta con `before` y registra los carets actuales.
-    fn commit(&mut self, before: (usize, usize)) {
-        let edits = self.buffer.take_edits();
-        let after = (self.caret, self.anchor);
-        self.history.commit(Transaction::new(edits, before, after));
+    fn restore_cursors(&mut self, pairs: Vec<(usize, usize)>) {
+        let len = self.buffer.len_chars();
+        self.cursors = pairs
+            .into_iter()
+            .map(|(caret, anchor)| Cursor {
+                caret: caret.min(len),
+                anchor: anchor.min(len),
+            })
+            .collect();
+        self.sort_and_merge();
     }
 
-    fn move_caret(&mut self, caret: usize, shift: bool) {
-        self.caret = caret;
-        if !shift {
-            self.anchor = caret;
+    /// Siguiente ocurrencia de `needle` a partir de `from` (con vuelta al
+    /// inicio). Las agujas multilínea buscan en el texto completo.
+    fn find_wrapping(&self, needle: &str, from: usize) -> Option<usize> {
+        let len = self.buffer.len_chars();
+        if needle.is_empty() || len == 0 {
+            return None;
         }
+        let from = from.min(len);
+
+        if needle.contains('\n') {
+            let hay = self.buffer.text_range(0..len);
+            let start = movement::byte_at_char(&hay, from);
+            let found = hay[start..]
+                .find(needle)
+                .map(|rel| start + rel)
+                .or_else(|| hay[..start].find(needle));
+            return found.map(|byte| hay[..byte].chars().count());
+        }
+
+        // Búsqueda por líneas: de `from` al final y, si no, del inicio a `from`.
+        let line_count = self.buffer.line_count();
+        let start_line = self.buffer.char_to_line(from);
+        let start_col = from - self.buffer.line_to_char(start_line);
+        for line in start_line..line_count {
+            let text = self.buffer.line_text(line);
+            let from_col = if line == start_line { start_col } else { 0 };
+            if let Some(col) = find_in_text(&text, from_col, needle) {
+                return Some(self.buffer.line_to_char(line) + col);
+            }
+        }
+        for line in 0..=start_line {
+            let text = self.buffer.line_text(line);
+            let found =
+                find_in_text(&text, 0, needle).filter(|&col| line < start_line || col < start_col);
+            if let Some(col) = found {
+                return Some(self.buffer.line_to_char(line) + col);
+            }
+        }
+        None
+    }
+
+    /// Movimiento de todos los cursores con una función de destino.
+    fn move_cursors(&mut self, target: impl Fn(&Cursor, &Buffer) -> usize, shift: bool) {
+        for cursor in &mut self.cursors {
+            let next = target(cursor, &self.buffer);
+            cursor.caret = next;
+            if !shift {
+                cursor.anchor = next;
+            }
+        }
+        self.sort_and_merge();
         self.scroll_into_view();
     }
 
@@ -549,7 +887,7 @@ impl Editor {
     }
 
     fn scroll_into_view(&mut self) {
-        let line = self.buffer.char_to_line(self.caret);
+        let line = self.buffer.char_to_line(self.primary().caret);
         let top = PADDING_TOP + line as f32 * LINE_HEIGHT;
         let bottom = top + LINE_HEIGHT;
         if top < self.scroll_y {
@@ -568,6 +906,26 @@ impl Editor {
     }
 }
 
+/// Mapeo de una posición tras borrar `start..end` e insertar `inserted` chars
+/// en `start`: lo que quedaba dentro del rango borrado colapsa al inicio.
+fn shift_after(pos: usize, start: usize, end: usize, inserted: usize) -> usize {
+    if pos < start {
+        pos
+    } else if pos < end {
+        start + inserted
+    } else {
+        pos - (end - start) + inserted
+    }
+}
+
+/// Primera ocurrencia de `needle` en `text` a partir del char `from_col`
+/// (la aguja debe caber entera en `text`); devuelve su posición en chars.
+fn find_in_text(text: &str, from_col: usize, needle: &str) -> Option<usize> {
+    let start = movement::byte_at_char(text, from_col);
+    let rel = text.get(start..)?.find(needle)?;
+    Some(text[..start + rel].chars().count())
+}
+
 /// Ruta del archivo a abrir, si la pasaron por CLI (M9: args completos).
 pub fn cli_path() -> Option<PathBuf> {
     std::env::args_os().nth(1).map(PathBuf::from)
@@ -577,45 +935,43 @@ pub fn cli_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn text_of(editor: &Editor) -> String {
+        editor.buffer.text_range(0..editor.buffer.len_chars())
+    }
+
     #[test]
     fn typing_joins_into_one_undo_step() {
         let mut editor = Editor::default();
         for ch in "hola".chars() {
             editor.insert_text(&ch.to_string());
         }
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            "hola"
-        );
+        assert_eq!(text_of(&editor), "hola");
 
         assert!(editor.undo());
-        assert_eq!(editor.buffer.text_range(0..editor.buffer.len_chars()), "");
+        assert_eq!(text_of(&editor), "");
         assert!(editor.redo());
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            "hola"
-        );
-        assert_eq!(editor.caret, 4);
+        assert_eq!(text_of(&editor), "hola");
+        assert_eq!(editor.cursors[0].caret, 4);
     }
 
     #[test]
     fn replace_selection_is_one_atomic_undo() {
         let mut editor = Editor::default();
         editor.insert_text("hola mundo");
-        editor.caret = 0;
-        editor.anchor = 4; // selecciona "hola"
+        editor.cursors = vec![Cursor {
+            caret: 0,
+            anchor: 4,
+        }]; // selecciona "hola"
         editor.insert_text("x");
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            "x mundo"
-        );
+        assert_eq!(text_of(&editor), "x mundo");
 
         assert!(editor.undo());
+        assert_eq!(text_of(&editor), "hola mundo");
         assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            "hola mundo"
+            (editor.cursors[0].caret, editor.cursors[0].anchor),
+            (0, 4),
+            "restaura carets"
         );
-        assert_eq!((editor.caret, editor.anchor), (0, 4), "restaura carets");
     }
 
     #[test]
@@ -624,41 +980,30 @@ mod tests {
         editor.insert_text("abc");
         editor.backspace();
         editor.backspace();
-        assert_eq!(editor.buffer.text_range(0..editor.buffer.len_chars()), "a");
+        assert_eq!(text_of(&editor), "a");
         assert!(editor.undo(), "los backspaces se deshacen juntos");
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            "abc"
-        );
+        assert_eq!(text_of(&editor), "abc");
     }
 
     #[test]
     fn copy_cut_and_paste_roundtrip() {
         let mut editor = Editor::default();
         editor.insert_text("hola mundo");
-        editor.caret = 0;
-        editor.anchor = 4;
+        editor.cursors = vec![Cursor {
+            caret: 0,
+            anchor: 4,
+        }];
 
         assert_eq!(editor.copy().as_deref(), Some("hola"));
         let cut = editor.cut().expect("cut debe devolver el texto");
         assert_eq!(cut, "hola");
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            " mundo"
-        );
+        assert_eq!(text_of(&editor), " mundo");
 
-        editor.caret = editor.buffer.len_chars();
-        editor.anchor = editor.caret;
+        editor.cursors = vec![Cursor::new(editor.buffer.len_chars())];
         editor.insert_text(&cut);
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            " mundohola"
-        );
+        assert_eq!(text_of(&editor), " mundohola");
         assert!(editor.undo(), "el pegado es un solo undo");
-        assert_eq!(
-            editor.buffer.text_range(0..editor.buffer.len_chars()),
-            " mundo"
-        );
+        assert_eq!(text_of(&editor), " mundo");
     }
 
     #[test]
@@ -669,36 +1014,35 @@ mod tests {
 
         // Doble click sobre "hola" (x=0) → palabra.
         editor.on_click(CODE_X, 0.0, advance, 2, false);
-        assert_eq!(editor.selected_range(), 0..4);
+        assert_eq!(editor.primary().range(), 0..4);
 
         // Triple click → línea completa (con \n si existe; aquí no lo hay).
         editor.on_click(CODE_X, 0.0, advance, 3, false);
-        assert_eq!(editor.selected_range(), 0..10);
+        assert_eq!(editor.primary().range(), 0..10);
 
         // Con fin de línea, la selección incluye el \n.
         let mut editor = Editor::default();
         editor.insert_text("hola\nmundo");
         editor.on_click(CODE_X, 0.0, advance, 3, false);
-        assert_eq!(editor.selected_range(), 0..5);
+        assert_eq!(editor.primary().range(), 0..5);
     }
 
     #[test]
     fn shift_arrow_extends_and_plain_arrow_collapses() {
         let mut editor = Editor::default();
         editor.insert_text("abc");
-        editor.caret = 0;
-        editor.anchor = 0;
+        editor.cursors = vec![Cursor::new(0)];
 
-        // Shift+Right extiende.
-        editor.move_caret(1, true);
-        assert_eq!(editor.selected_range(), 0..1);
-        editor.move_caret(2, true);
-        assert_eq!(editor.selected_range(), 0..2);
+        let shift = ModifiersState::SHIFT;
+        let right = Key::Named(NamedKey::ArrowRight);
+        editor.handle_key(&right, shift);
+        assert_eq!(editor.primary().range(), 0..1);
+        editor.handle_key(&right, shift);
+        assert_eq!(editor.primary().range(), 0..2);
 
         // Sin Shift, colapsa al borde izquierdo.
-        editor.caret = editor.selected_range().start;
-        editor.anchor = editor.caret;
-        assert!(!editor.has_selection());
+        editor.handle_key(&Key::Named(NamedKey::ArrowLeft), ModifiersState::empty());
+        assert!(!editor.cursors.iter().any(Cursor::has_selection));
     }
 
     #[test]
@@ -720,6 +1064,93 @@ mod tests {
         assert!(
             distinct.len() >= 2,
             "los tokens deben llevar colores distintos: {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn multi_cursor_edits_apply_everywhere() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola mundo");
+        // Dos cursores: "hola" (0..4) y "mundo" (5..10).
+        editor.cursors = vec![
+            Cursor {
+                caret: 4,
+                anchor: 0,
+            },
+            Cursor {
+                caret: 10,
+                anchor: 5,
+            },
+        ];
+
+        editor.insert_text("X");
+        assert_eq!(text_of(&editor), "X X", "escribe en los dos sitios");
+        assert_eq!(editor.cursors.len(), 2, "un cursor por selección");
+        assert_eq!(
+            editor.cursors.iter().map(|c| c.caret).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        assert!(editor.undo(), "una sola transacción para ambos edits");
+        assert_eq!(text_of(&editor), "hola mundo");
+        assert_eq!(
+            editor
+                .cursors
+                .iter()
+                .map(|c| (c.caret, c.anchor))
+                .collect::<Vec<_>>(),
+            vec![(4, 0), (10, 5)],
+            "undo restaura TODOS los carets"
+        );
+        assert!(editor.redo());
+        assert_eq!(text_of(&editor), "X X");
+    }
+
+    #[test]
+    fn ctrl_d_selects_word_then_next_occurrence() {
+        let mut editor = Editor::default();
+        editor.insert_text("foo bar foo");
+        editor.cursors = vec![Cursor::new(0)];
+
+        editor.select_next_occurrence();
+        assert_eq!(
+            editor.primary().range(),
+            0..3,
+            "primero selecciona la palabra"
+        );
+
+        editor.select_next_occurrence();
+        assert_eq!(editor.cursors.len(), 2);
+        let ranges: Vec<_> = editor.cursors.iter().map(Cursor::range).collect();
+        assert_eq!(ranges, vec![0..3, 8..11], "añade la siguiente ocurrencia");
+
+        editor.select_next_occurrence();
+        assert_eq!(
+            editor.cursors.len(),
+            2,
+            "las dos ya están cubiertas: no añade más"
+        );
+    }
+
+    #[test]
+    fn add_cursor_vertical_dedups_repeated_lines() {
+        let mut editor = Editor::default();
+        editor.insert_text("ab\ncd\nef");
+        editor.cursors = vec![Cursor::new(4)]; // línea 1, columna 1
+
+        editor.add_cursor_vertical(-1);
+        assert_eq!(editor.cursors.len(), 2);
+        assert_eq!(
+            editor.cursors.iter().map(|c| c.caret).collect::<Vec<_>>(),
+            vec![1, 4],
+            "conserva la columna visual"
+        );
+
+        editor.add_cursor_vertical(-1);
+        assert_eq!(
+            editor.cursors.len(),
+            2,
+            "el cursor duplicado de la línea 0 se fusiona"
         );
     }
 }

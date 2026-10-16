@@ -44,6 +44,30 @@ pub enum Action {
     Run(&'static str),
 }
 
+/// Qué toca el ratón dentro de la paleta abierta ([`Palette::click`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Click {
+    /// Fuera del panel: se cierra y el click sigue hacia el editor.
+    Miss,
+    /// Dentro pero sin fila de comando (prompt o zona vacía): se traga.
+    Panel,
+    /// Una fila de resultados: ejecutar este comando.
+    Command(&'static str),
+}
+
+/// Geometría del panel del último render (para [`Palette::click`]).
+#[derive(Clone, Copy)]
+struct PanelRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Y donde empiezan las filas de resultados.
+    rows_y: f32,
+    /// Filas de resultados visibles (no confundir con la de "(sin…)".
+    rows: usize,
+}
+
 pub struct Palette {
     open: bool,
     query: String,
@@ -53,6 +77,7 @@ pub struct Palette {
     /// Índices de `COMMANDS` que puntúan, de mayor a menor.
     matches: Vec<usize>,
     matcher: Matcher,
+    panel: Option<PanelRect>,
 }
 
 impl Default for Palette {
@@ -64,6 +89,7 @@ impl Default for Palette {
             scroll: 0,
             matches: (0..COMMANDS.len()).collect(),
             matcher: Matcher::new(Config::DEFAULT),
+            panel: None,
         }
     }
 }
@@ -82,6 +108,7 @@ impl Palette {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.panel = None;
     }
 
     pub fn toggle(&mut self) {
@@ -179,6 +206,27 @@ impl Palette {
         }
     }
 
+    /// Qué toca el ratón dentro de la paleta (usa el layout del último
+    /// render). `main` cierra siempre y solo ejecuta con [`Click::Command`].
+    pub fn click(&self, x: f32, y: f32) -> Click {
+        let Some(panel) = self.panel else {
+            return Click::Miss;
+        };
+        if x < panel.x || x > panel.x + panel.w || y < panel.y || y > panel.y + panel.h {
+            return Click::Miss;
+        }
+        if y < panel.rows_y {
+            return Click::Panel;
+        }
+        let row = ((y - panel.rows_y) / ROW_H).floor() as usize;
+        let index = row + self.scroll;
+        if row < panel.rows && index < self.matches.len() {
+            Click::Command(COMMANDS[self.matches[index]].id)
+        } else {
+            Click::Panel
+        }
+    }
+
     /// Dibuja el panel en la capa superior (si está abierta). `advance` es el
     /// ancho de celda (px lógicos), igual que en el editor.
     pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32) {
@@ -197,6 +245,14 @@ impl Palette {
         let width = (viewport.0 - 2.0 * PAD).clamp(MIN_W, MAX_W);
         let x = (viewport.0 - width) / 2.0;
         let height = PROMPT_H + 1.0 + rows as f32 * ROW_H + 8.0;
+        self.panel = Some(PanelRect {
+            x,
+            y: TOP,
+            w: width,
+            h: height,
+            rows_y: TOP + PROMPT_H + 1.0,
+            rows: self.matches.len().min(MAX_ROWS),
+        });
 
         scene
             .top_quads
@@ -402,5 +458,49 @@ mod tests {
         palette.render(&mut scene, (120.0, 800.0), 8.4);
         assert!(!scene.top_quads.is_empty());
         assert!(!scene.top_texts.is_empty());
+    }
+
+    #[test]
+    fn click_runs_row_reports_panel_or_miss() {
+        let mut palette = Palette::default();
+        assert_eq!(
+            palette.click(0.0, 0.0),
+            Click::Miss,
+            "sin render no hay layout"
+        );
+
+        palette.open();
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        let panel = palette.panel.expect("render guarda el panel");
+
+        // Filas 0 y 1 del orden por defecto (= orden de COMMANDS).
+        assert_eq!(
+            palette.click(panel.x + 10.0, panel.rows_y + 5.0),
+            Click::Command("palette.show")
+        );
+        assert_eq!(
+            palette.click(panel.x + 10.0, panel.rows_y + ROW_H + 5.0),
+            Click::Command("file.save")
+        );
+        // Prompt (encima de las filas): dentro del panel, sin comando.
+        assert_eq!(palette.click(panel.x + 10.0, panel.y + 5.0), Click::Panel);
+        // Fuera del panel: main lo cierra y el click sigue al editor.
+        assert_eq!(palette.click(0.0, 0.0), Click::Miss);
+
+        // Con query filtrada, el índice de fila mapea por matches, no por COMMANDS.
+        palette.push_text("línea");
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        let expected = COMMANDS[palette.matches[0]].id;
+        assert_eq!(
+            palette.click(panel.x + 10.0, panel.rows_y + 5.0),
+            Click::Command(expected)
+        );
+
+        palette.close();
+        assert_eq!(
+            palette.click(panel.x + 10.0, panel.rows_y + 5.0),
+            Click::Miss
+        );
     }
 }

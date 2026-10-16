@@ -3,6 +3,7 @@
 mod commands;
 mod editor;
 mod palette;
+mod search;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
 use palette::Palette;
+use search::SearchBar;
 use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -34,6 +36,8 @@ struct Application {
     editor: Editor,
     /// Paleta de comandos (Ctrl+Shift+P).
     palette: Palette,
+    /// Barra de buscar/reemplazar (Ctrl+F / Ctrl+H).
+    search: SearchBar,
     gpu: Option<GpuContext>,
     /// Portapapeles del SO, creado en la primera uso (lazy).
     clipboard: Option<arboard::Clipboard>,
@@ -54,6 +58,7 @@ impl Application {
         Self {
             editor: Editor::from_cli(path),
             palette: Palette::default(),
+            search: SearchBar::default(),
             gpu: None,
             clipboard: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -120,11 +125,22 @@ fn run_command(
     editor: &mut Editor,
     clipboard: &mut Option<arboard::Clipboard>,
     palette: &mut Palette,
+    search: &mut SearchBar,
     id: &str,
 ) -> bool {
     match id {
         "palette.show" => {
             palette.open();
+            true
+        }
+        "find.show" => {
+            let prefill = editor.single_line_selection();
+            search.open(false, prefill.as_deref(), editor);
+            true
+        }
+        "replace.show" => {
+            let prefill = editor.single_line_selection();
+            search.open(true, prefill.as_deref(), editor);
             true
         }
         "file.save" => {
@@ -254,6 +270,12 @@ impl winit::application::ApplicationHandler for Application {
                 self.editor.set_viewport(viewport.0, viewport.1);
                 let advance = gpu.advance_ratio();
                 let mut scene = self.editor.build_scene(viewport, advance);
+                self.search.render(
+                    &mut scene,
+                    viewport,
+                    editor::FONT_SIZE * advance,
+                    &self.editor,
+                );
                 self.palette
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
                 let built = frame.elapsed();
@@ -296,6 +318,7 @@ impl winit::application::ApplicationHandler for Application {
                         &mut self.editor,
                         &mut self.clipboard,
                         &mut self.palette,
+                        &mut self.search,
                         id,
                     ) {
                         gpu.request_redraw();
@@ -311,6 +334,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.editor,
                                 &mut self.clipboard,
                                 &mut self.palette,
+                                &mut self.search,
                                 id,
                             );
                             gpu.request_redraw();
@@ -320,6 +344,17 @@ impl winit::application::ApplicationHandler for Application {
                             gpu.request_redraw();
                         }
                         palette::Action::None => {}
+                    }
+                    return;
+                }
+                // Barra de búsqueda abierta: su teclado manda (todo se traga;
+                // Enter/F3/flechas llegan aquí porque no son Character y los
+                // Ctrl+Enter caen fuera del keymap).
+                if self.search.is_open() {
+                    if key_event.state == ElementState::Pressed {
+                        self.search
+                            .on_key(&key_event, self.modifiers, &mut self.editor);
+                        gpu.request_redraw();
                     }
                     return;
                 }
@@ -352,9 +387,41 @@ impl winit::application::ApplicationHandler for Application {
                 button: MouseButton::Left,
                 ..
             } => {
-                // Clic fuera de la paleta la cierra (sigue colocando caret).
+                // Paleta (capa superior): fila → ejecutar; dentro del panel →
+                // solo cerrar; fuera → cerrar y que el click siga al editor.
                 if self.palette.is_open() {
-                    self.palette.close();
+                    match self.palette.click(self.cursor.x, self.cursor.y) {
+                        palette::Click::Command(id) => {
+                            self.palette.close();
+                            run_command(
+                                &mut self.editor,
+                                &mut self.clipboard,
+                                &mut self.palette,
+                                &mut self.search,
+                                id,
+                            );
+                            gpu.request_redraw();
+                            return;
+                        }
+                        palette::Click::Panel => {
+                            self.palette.close();
+                            gpu.request_redraw();
+                            return;
+                        }
+                        palette::Click::Miss => {
+                            self.palette.close();
+                        }
+                    }
+                }
+                // Barra de búsqueda: campos y botones consumen el click;
+                // fuera de la barra llega al editor (la barra se queda abierta).
+                if self.search.is_open()
+                    && self
+                        .search
+                        .handle_click(self.cursor.x, self.cursor.y, &mut self.editor)
+                {
+                    gpu.request_redraw();
+                    return;
                 }
                 // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
                 let mut count = 1;
@@ -402,6 +469,8 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if self.palette.is_open() {
                     self.palette.push_text(&text);
+                } else if self.search.is_open() {
+                    self.search.push_text(&text, &mut self.editor);
                 } else {
                     self.editor.insert_text(&text);
                 }

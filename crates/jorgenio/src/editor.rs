@@ -40,6 +40,10 @@ const GUTTER_FG: (u8, u8, u8) = (0x75, 0x71, 0x5E);
 const GUTTER_CURRENT: (u8, u8, u8) = (0xFD, 0x97, 0x1F);
 const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
 const SELECTION: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
+/// Coincidencias de la búsqueda (tono apagado, debajo del texto).
+const MATCH: (u8, u8, u8, u8) = (0x5A, 0x57, 0x44, 0xB0);
+/// La coincidencia actual (encima de las demás).
+const CURRENT_MATCH: (u8, u8, u8, u8) = (0x9A, 0x91, 0x58, 0xFF);
 
 /// Un cursor con su selección (`anchor == caret` → sin selección).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +87,12 @@ pub struct Editor {
     viewport: (f32, f32),
     focused: bool,
     caret_on: bool,
+    /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
+    find: Vec<Range<usize>>,
+    find_current: usize,
+    find_query: String,
+    /// Revisión del buffer con la que `find` está calculado.
+    find_revision: u64,
 }
 
 impl Default for Editor {
@@ -98,6 +108,10 @@ impl Default for Editor {
             viewport: (1200.0, 800.0),
             focused: true,
             caret_on: true,
+            find: Vec::new(),
+            find_current: 0,
+            find_query: String::new(),
+            find_revision: 0,
         }
     }
 }
@@ -728,6 +742,162 @@ impl Editor {
         self.clamp_scroll();
     }
 
+    //── Buscar y reemplazar (Ctrl+F / Ctrl+H) ──────────────────────────────
+
+    /// Texto de la selección primaria si cabe en una sola línea: la consulta
+    /// inicial al abrir la barra con selección (lo usa `run_command`).
+    pub fn single_line_selection(&self) -> Option<String> {
+        let cursor = self.cursors.first()?;
+        if !cursor.has_selection() {
+            return None;
+        }
+        let text = self.buffer.text_range(cursor.range());
+        (!text.contains('\n')).then_some(text)
+    }
+
+    /// Fija la consulta y recalcula las coincidencias (smart-case: escribe una
+    /// mayúscula para que distinga mayúsculas; sin ella pliega el ASCII).
+    /// La actual es la primera coincidencia en o después del caret, con vuelta.
+    pub fn find_set_query(&mut self, query: &str) {
+        self.find_query = query.to_owned();
+        if query.is_empty() {
+            self.find.clear();
+            self.find_current = 0;
+            self.find_revision = self.buffer.revision();
+            return;
+        }
+        let from = self.primary().caret;
+        self.recompute_find(from);
+        self.reveal_current_match();
+    }
+
+    /// Resincroniza `find` si el buffer cambió desde su cálculo (undo/redo,
+    /// edición…). Lo llaman build_scene y la navegación, así que el estado
+    /// nunca queda viejo más de un frame.
+    fn find_sync(&mut self) {
+        if self.find_revision == self.buffer.revision() {
+            return;
+        }
+        if self.find_query.is_empty() {
+            self.find.clear();
+            self.find_current = 0;
+        } else {
+            let from = self
+                .find
+                .get(self.find_current)
+                .map_or_else(|| self.primary().caret, |range| range.start);
+            self.recompute_find(from);
+        }
+        self.find_revision = self.buffer.revision();
+    }
+
+    /// Recalcula `find` y deja como actual la primera coincidencia en o
+    /// después de `from` (si no hay, la primera).
+    fn recompute_find(&mut self, from: usize) {
+        self.find = find_in_buffer(&self.buffer, &self.find_query);
+        self.find_current = self
+            .find
+            .iter()
+            .position(|range| range.start >= from)
+            .unwrap_or(0);
+        self.find_revision = self.buffer.revision();
+    }
+
+    /// Siguiente (o anterior con `backwards`) coincidencia, con vuelta al
+    /// otro extremo; la saca a la vista.
+    pub fn find_next(&mut self, backwards: bool) {
+        self.find_sync();
+        if self.find.is_empty() {
+            return;
+        }
+        let last = self.find.len() - 1;
+        self.find_current = self.find_current.min(last);
+        self.find_current = if backwards {
+            self.find_current.checked_sub(1).unwrap_or(last)
+        } else {
+            (self.find_current + 1) % (last + 1)
+        };
+        self.reveal_current_match();
+    }
+
+    /// Cierra la búsqueda; la coincidencia actual queda como selección.
+    pub fn find_close(&mut self) {
+        if let Some(range) = self.find.get(self.find_current).cloned() {
+            self.cursors = vec![Cursor {
+                caret: range.end,
+                anchor: range.start,
+            }];
+            self.scroll_into_view();
+        }
+        self.find.clear();
+        self.find_current = 0;
+        self.find_query.clear();
+        self.find_revision = self.buffer.revision();
+        self.reset_caret_blink();
+    }
+
+    /// Reemplaza la coincidencia actual en su transacción de undo y avanza a
+    /// la siguiente a partir del texto nuevo (con vuelta). `false` si no hay.
+    pub fn find_replace_current(&mut self, replacement: &str) -> bool {
+        self.find_sync();
+        let Some(range) = self.find.get(self.find_current).cloned() else {
+            return false;
+        };
+        let start = range.start;
+        self.with_transaction(|editor| editor.replace_match(&range, replacement));
+        self.recompute_find(start + replacement.chars().count());
+        self.reveal_current_match();
+        true
+    }
+
+    /// Reemplaza TODAS las coincidencias de derecha a izquierda (los offsets
+    /// altos no afectan a los bajos) en UNA transacción de undo.
+    /// Devuelve cuántas había.
+    pub fn find_replace_all(&mut self, replacement: &str) -> usize {
+        self.find_sync();
+        if self.find.is_empty() {
+            return 0;
+        }
+        let matches = self.find.clone();
+        let count = matches.len();
+        self.with_transaction(|editor| {
+            for range in matches.iter().rev() {
+                editor.replace_match(range, replacement);
+            }
+        });
+        self.recompute_find(0);
+        self.reset_caret_blink();
+        count
+    }
+
+    /// (coincidencia actual 1-based, total) para el contador de la barra.
+    pub fn find_stats(&self) -> (usize, usize) {
+        let total = self.find.len();
+        let current = if total == 0 { 0 } else { self.find_current + 1 };
+        (current, total)
+    }
+
+    /// Borra `range` e inserta `replacement` en su sitio, desplazando todos
+    /// los cursores (lo que quedaba dentro del rango colapsa al principio).
+    fn replace_match(&mut self, range: &Range<usize>, replacement: &str) {
+        let (start, end) = (range.start, range.end);
+        let inserted = replacement.chars().count();
+        self.buffer.delete(start..end);
+        self.buffer.insert(start, replacement);
+        for cursor in &mut self.cursors {
+            cursor.caret = shift_after(cursor.caret, start, end, inserted);
+            cursor.anchor = shift_after(cursor.anchor, start, end, inserted);
+        }
+    }
+
+    /// Sitúa la coincidencia actual a la vista y reinicia el parpadeo.
+    fn reveal_current_match(&mut self) {
+        if let Some(start) = self.find.get(self.find_current).map(|range| range.start) {
+            self.scroll_position_into_view(start);
+        }
+        self.reset_caret_blink();
+    }
+
     /// Escena de este frame: selecciones + gutter + líneas visibles + carets.
     /// Resalta lo que haga falta (cache) hasta la última línea visible.
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
@@ -745,44 +915,22 @@ impl Editor {
 
         self.syntax.set_extension(&self.lang);
         self.syntax.prepare(&mut self.buffer, visible_last);
+        // La búsqueda se resincroniza si el buffer cambió (undo, edición…).
+        self.find_sync();
+        let ctx = (visible_first, visible_last, self.scroll_y, advance);
         for cursor in &self.cursors {
             let range = cursor.range();
-            if range.is_empty() {
-                continue;
-            }
-            let first = self.buffer.char_to_line(range.start);
-            let last = self.buffer.char_to_line(range.end.saturating_sub(1));
-            // Solo la intersección con lo visible: O(viewport), no O(selección)
-            // (seleccionar todo en un archivo enorme no itera todas las líneas).
-            for line in visible_line_range(first, last, visible_first, visible_last) {
-                let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
-                let text = self.buffer.line_text(line);
-                let line_start = self.buffer.line_to_char(line);
-
-                let start_cells = if line == first {
-                    let col = range.start - line_start;
-                    movement::visual_column(&text, col, TAB_WIDTH)
-                } else {
-                    0
-                };
-                let end_cells = if line == last {
-                    let col = range.end - line_start;
-                    // Seleccionar el \n añade una celda más (como Sublime).
-                    if col > text.chars().count() {
-                        movement::visual_column(&text, text.chars().count(), TAB_WIDTH) + 1
-                    } else {
-                        movement::visual_column(&text, col, TAB_WIDTH)
-                    }
-                } else {
-                    movement::visual_column(&text, text.chars().count(), TAB_WIDTH)
-                };
-
-                let x = CODE_X + start_cells as f32 * advance;
-                let w = (end_cells.saturating_sub(start_cells)) as f32 * advance;
-                if w > 0.0 {
-                    scene.quads.push(Quad::new(x, y, w, LINE_HEIGHT, SELECTION));
-                }
-            }
+            push_range_quad(&mut scene, &range, &self.buffer, ctx, SELECTION);
+        }
+        // Coincidencias de la búsqueda (Ctrl+F): apagadas y, en su turno,
+        // la actual por encima (no se solapan: rangos disjuntos).
+        for (index, range) in self.find.iter().enumerate() {
+            let color = if index == self.find_current {
+                CURRENT_MATCH
+            } else {
+                MATCH
+            };
+            push_range_quad(&mut scene, range, &self.buffer, ctx, color);
         }
 
         let caret_line = self.buffer.char_to_line(self.primary().caret);
@@ -983,7 +1131,13 @@ impl Editor {
     }
 
     fn scroll_into_view(&mut self) {
-        let line = self.buffer.char_to_line(self.primary().caret);
+        let caret = self.primary().caret;
+        self.scroll_position_into_view(caret);
+    }
+
+    /// Garantiza que la posición `pos` (un offset de char) quede a la vista.
+    fn scroll_position_into_view(&mut self, pos: usize) {
+        let line = self.buffer.char_to_line(pos);
         let top = PADDING_TOP + line as f32 * LINE_HEIGHT;
         let bottom = top + LINE_HEIGHT;
         if top < self.scroll_y {
@@ -1021,6 +1175,90 @@ fn visible_line_range(
     visible_last: usize,
 ) -> std::ops::RangeInclusive<usize> {
     first.max(visible_first)..=last.min(visible_last)
+}
+
+/// Contexto de dibujo de un rango: (visible_first, visible_last, scroll_y,
+/// advance). En tupla como `quads3` para no pasar 8 argumentos sueltos.
+type RangeCtx = (usize, usize, f32, f32);
+
+/// Quad de selección/coincidencia para `range`, recortado a las líneas
+/// visibles: una sola implementación para selecciones y para la búsqueda.
+fn push_range_quad(
+    scene: &mut Scene,
+    range: &Range<usize>,
+    buffer: &Buffer,
+    ctx: RangeCtx,
+    color: (u8, u8, u8, u8),
+) {
+    if range.is_empty() {
+        return;
+    }
+    let (visible_first, visible_last, scroll_y, advance) = ctx;
+    let first = buffer.char_to_line(range.start);
+    let last = buffer.char_to_line(range.end.saturating_sub(1));
+    // Solo la intersección con lo visible: O(viewport), no O(rango).
+    for line in visible_line_range(first, last, visible_first, visible_last) {
+        let y = PADDING_TOP + line as f32 * LINE_HEIGHT - scroll_y;
+        let text = buffer.line_text(line);
+        let line_start = buffer.line_to_char(line);
+
+        let start_cells = if line == first {
+            let col = range.start - line_start;
+            movement::visual_column(&text, col, TAB_WIDTH)
+        } else {
+            0
+        };
+        let end_cells = if line == last {
+            let col = range.end - line_start;
+            // Seleccionar el \n añade una celda más (como Sublime).
+            if col > text.chars().count() {
+                movement::visual_column(&text, text.chars().count(), TAB_WIDTH) + 1
+            } else {
+                movement::visual_column(&text, col, TAB_WIDTH)
+            }
+        } else {
+            movement::visual_column(&text, text.chars().count(), TAB_WIDTH)
+        };
+
+        let x = CODE_X + start_cells as f32 * advance;
+        let w = (end_cells.saturating_sub(start_cells)) as f32 * advance;
+        if w > 0.0 {
+            scene.quads.push(Quad::new(x, y, w, LINE_HEIGHT, color));
+        }
+    }
+}
+
+/// Todas las posiciones (chars) de `query` en el buffer, en orden.
+///
+/// smart-case: si `query` trae mayúsculas, distingue mayúsculas; si no,
+/// pliega SOLO el ASCII de ambos lados (los offsets byte no cambian, así que
+/// los rangos siguen siendo válidos; lo no-ASCII no se case-foldea, decisión
+/// documentada). Las agujas multilínea buscan en el texto entero.
+fn find_in_buffer(buffer: &Buffer, query: &str) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let hay = buffer.text_range(0..buffer.len_chars());
+    let (hay_cmp, needle): (Cow<str>, Cow<str>) = if query.chars().any(char::is_uppercase) {
+        (Cow::Borrowed(hay.as_str()), Cow::Borrowed(query))
+    } else {
+        (
+            Cow::Owned(hay.to_ascii_lowercase()),
+            Cow::Owned(query.to_ascii_lowercase()),
+        )
+    };
+    let needle_chars = needle.chars().count();
+    let mut found = Vec::new();
+    let mut prev_byte = 0;
+    let mut prev_chars = 0;
+    // Conversión byte→char incremental: O(n) por consulta, no O(n) por match.
+    for (byte, _) in hay_cmp.match_indices(needle.as_ref()) {
+        let chars = prev_chars + hay_cmp[prev_byte..byte].chars().count();
+        found.push(chars..chars + needle_chars);
+        prev_byte = byte;
+        prev_chars = chars;
+    }
+    found
 }
 
 /// Mapeo de una posición tras borrar `start..end` e insertar `inserted` chars
@@ -1418,6 +1656,185 @@ mod tests {
             11,
             "un quad de selección por línea visible, no por línea del archivo"
         );
+    }
+
+    #[test]
+    fn find_set_query_smart_case_and_counts() {
+        let mut editor = Editor::default();
+        editor.insert_text("Foo bar foo FOO");
+        editor.cursors = vec![Cursor::new(0)];
+
+        editor.find_set_query("foo");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 3),
+            "sin mayúsculas: case-insensitive"
+        );
+
+        editor.find_set_query("Foo");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 1),
+            "con mayúscula: smart-case sensible"
+        );
+        editor.find_set_query("FOO");
+        assert_eq!(editor.find_stats(), (1, 1));
+
+        editor.find_set_query("");
+        assert_eq!(
+            editor.find_stats(),
+            (0, 0),
+            "consulta vacía sin coincidencias"
+        );
+    }
+
+    #[test]
+    fn find_next_wraps_and_shift_goes_backwards() {
+        let mut editor = Editor::default();
+        editor.insert_text("a a a");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("a");
+        assert_eq!(editor.find_stats(), (1, 3));
+
+        editor.find_next(false);
+        assert_eq!(editor.find_stats(), (2, 3));
+        editor.find_next(true);
+        assert_eq!(editor.find_stats(), (1, 3));
+        editor.find_next(true);
+        assert_eq!(editor.find_stats(), (3, 3), "hacia atrás con vuelta");
+        editor.find_next(false);
+        assert_eq!(editor.find_stats(), (1, 3), "hacia delante con vuelta");
+    }
+
+    #[test]
+    fn find_close_selects_current_match() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola mundo hola");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("mundo");
+        assert_eq!(editor.find_stats(), (1, 1));
+
+        editor.find_close();
+        assert_eq!(
+            editor.primary().range(),
+            5..10,
+            "selecciona la coincidencia"
+        );
+        assert_eq!(editor.find_stats(), (0, 0), "la búsqueda queda cerrada");
+    }
+
+    #[test]
+    fn find_replace_current_advances_and_undoes() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno dos uno");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("uno");
+
+        assert!(editor.find_replace_current("1"));
+        assert_eq!(text_of(&editor), "1 dos uno");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 1),
+            "queda el segundo y es el actual"
+        );
+
+        assert!(editor.find_replace_current("1"));
+        assert_eq!(text_of(&editor), "1 dos 1");
+        assert_eq!(editor.find_stats(), (0, 0), "sin coincidencias");
+        assert!(!editor.find_replace_current("x"), "no hay qué reemplazar");
+
+        assert!(editor.undo(), "cada reemplazo es su propia transacción");
+        assert_eq!(text_of(&editor), "1 dos uno");
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "uno dos uno");
+    }
+
+    #[test]
+    fn find_replace_all_is_one_undo() {
+        let mut editor = Editor::default();
+        editor.insert_text("a-a-a");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("a");
+
+        assert_eq!(editor.find_replace_all("X"), 3, "cuenta las tres");
+        assert_eq!(text_of(&editor), "X-X-X");
+        assert!(editor.undo(), "un solo undo para todo");
+        assert_eq!(text_of(&editor), "a-a-a");
+        assert_eq!(
+            (editor.cursors[0].caret, editor.cursors[0].anchor),
+            (0, 0),
+            "restaura el caret"
+        );
+    }
+
+    #[test]
+    fn find_sync_after_undo_recomputes_matches() {
+        let mut editor = Editor::default();
+        editor.insert_text("aa");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("a");
+        assert_eq!(editor.find_stats(), (1, 2));
+
+        editor.find_replace_all("b");
+        assert_eq!(text_of(&editor), "bb");
+        assert_eq!(editor.find_stats(), (0, 0), "las coincidencias desaparecen");
+
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "aa");
+        editor.find_next(false); // la revisión nueva dispara find_sync
+        assert_eq!(editor.find_stats(), (2, 2), "resincronizado tras undo");
+    }
+
+    #[test]
+    fn find_multiline_and_single_line_selection() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ndos\nfin");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("dos\ndos");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 1),
+            "la aguja multilínea busca en todo el texto"
+        );
+
+        // La selección multilínea no precarga la barra; la de una línea, sí.
+        editor.cursors = vec![Cursor {
+            caret: 7,
+            anchor: 0,
+        }];
+        assert_eq!(editor.single_line_selection(), None);
+        editor.cursors = vec![Cursor {
+            caret: 3,
+            anchor: 0,
+        }];
+        assert_eq!(editor.single_line_selection().as_deref(), Some("uno"));
+        editor.cursors = vec![Cursor::new(0)];
+        assert_eq!(editor.single_line_selection(), None, "sin selección");
+    }
+
+    #[test]
+    fn match_quads_draw_above_selections() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola hola");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("hola");
+
+        let scene = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(scene.quads.len(), 2, "una por coincidencia");
+        assert_eq!(scene.quads[0].color, CURRENT_MATCH, "la actual la última…");
+        assert_eq!(scene.quads[1].color, MATCH, "…y por encima de las demás");
+
+        // Con la palabra seleccionada (prefill de Ctrl+F) el quad actual
+        // tapa al de selección: se dibuja después.
+        editor.cursors = vec![Cursor {
+            caret: 4,
+            anchor: 0,
+        }];
+        let scene = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(scene.quads.len(), 3);
+        assert_eq!(scene.quads[0].color, SELECTION);
+        assert_eq!(scene.quads[1].color, CURRENT_MATCH);
+        assert_eq!(scene.quads[2].color, MATCH);
     }
 
     /// Bench manual: `cargo test bench_build_scene -- --ignored --nocapture`.

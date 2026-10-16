@@ -45,6 +45,8 @@ pub static KEYMAP: &[Binding] = &[
     bind("d", true, false, false, "edit.select_next_occurrence"),
     bind("k", true, true, false, "edit.delete_line"),
     bind("d", true, true, false, "edit.duplicate_line"),
+    bind("f", true, false, false, "find.show"),
+    bind("h", true, false, false, "replace.show"),
 ];
 
 /// Un comando ejecutable desde la paleta.
@@ -109,6 +111,16 @@ pub static COMMANDS: &[Command] = &[
         id: "edit.duplicate_line",
         name: "Duplicar línea",
         category: "Línea",
+    },
+    Command {
+        id: "find.show",
+        name: "Buscar",
+        category: "Buscar",
+    },
+    Command {
+        id: "replace.show",
+        name: "Reemplazar",
+        category: "Buscar",
     },
 ];
 

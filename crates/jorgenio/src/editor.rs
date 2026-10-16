@@ -19,6 +19,8 @@ use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use crate::snippets;
+
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 20.0;
 /// Ancho de tabulador por defecto (el `settings.json` lo sobrescribe).
@@ -317,8 +319,12 @@ impl Editor {
                 true
             }
             Key::Named(NamedKey::Tab) => {
-                self.insert_text("\t");
-                true
+                if self.try_expand_snippet() {
+                    true
+                } else {
+                    self.insert_text("\t");
+                    true
+                }
             }
             Key::Named(NamedKey::Escape) => {
                 self.collapse_to_primary();
@@ -646,6 +652,206 @@ impl Editor {
             }
         });
         self.reset_caret_blink();
+    }
+
+    /// Comenta o desenvuelve las líneas de todos los cursores (Ctrl+/). Si
+    /// TODAS las líneas con contenido están comentadas las desenvuelve; si no,
+    /// añade el prefijo solo a las que falten (nunca duplica comentarios).
+    /// Las líneas vacías también reciben el prefijo al comentar.
+    pub fn toggle_line_comment(&mut self) {
+        let prefix = comment_prefix(&self.lang);
+        let lines = self.comment_lines();
+        if lines.is_empty() {
+            return;
+        }
+
+        let mut any_content = false;
+        let mut all_commented = true;
+        for &line in &lines {
+            let text = self.buffer.line_text(line);
+            let body = trim_line_ending(&text);
+            if body.trim().is_empty() {
+                continue;
+            }
+            any_content = true;
+            if !body.trim_start().starts_with(prefix) {
+                all_commented = false;
+                break;
+            }
+        }
+        let commenting = !(any_content && all_commented);
+
+        self.with_transaction(|editor| {
+            // Descendente: cada línea se edita en sus coordenadas originales.
+            for &line in lines.iter().rev() {
+                let line_start = editor.buffer.line_to_char(line);
+                let body = trim_line_ending(&editor.buffer.line_text(line)).to_string();
+                let trimmed = body.trim_start();
+                let ws = body.chars().count() - trimmed.chars().count();
+                if commenting {
+                    if trimmed.starts_with(prefix) {
+                        continue; // ya comentada: no duplica
+                    }
+                    let at = line_start + ws;
+                    let payload = format!("{prefix} ");
+                    editor.buffer.insert(at, &payload);
+                    let len = payload.chars().count();
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, at, at, len);
+                        cursor.anchor = shift_after(cursor.anchor, at, at, len);
+                    }
+                } else if let Some(after) = trimmed.strip_prefix(prefix) {
+                    let mut remove = prefix.chars().count();
+                    if after.starts_with(' ') {
+                        remove += 1;
+                    }
+                    let start = line_start + ws;
+                    let end = start + remove;
+                    editor.buffer.delete(start..end);
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, start, end, 0);
+                        cursor.anchor = shift_after(cursor.anchor, start, end, 0);
+                    }
+                }
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Envuelve la selección (o la línea actual, sin selección) en
+    /// `/* … */`; si ya está envuelta, desenvuelve los marcadores.
+    pub fn toggle_block_comment(&mut self) {
+        let range = self.primary().range();
+        let (start, end) = if range.is_empty() {
+            let line = self.buffer.char_to_line(range.start);
+            let line_start = self.buffer.line_to_char(line);
+            let body = trim_line_ending(&self.buffer.line_text(line)).to_string();
+            (line_start, line_start + body.chars().count())
+        } else {
+            (range.start, range.end)
+        };
+        if start >= end {
+            return; // línea vacía y sin selección
+        }
+        let text = self.buffer.text_range(start..end);
+
+        // ¿Hay un comentario de bloque que desenvolver? (sin solapamientos raros)
+        let mut unwrap = None;
+        let trimmed = text.trim();
+        if trimmed.starts_with("/*")
+            && trimmed.ends_with("*/")
+            && trimmed.chars().count() >= 4
+            && let (Some(open_b), Some(close_b)) = (text.find("/*"), text.rfind("*/"))
+            && close_b >= open_b + 2
+        {
+            let open_at = start + text[..open_b].chars().count();
+            let close_at = start + text[..close_b].chars().count();
+            let open_to = open_at
+                + if text[open_b..].starts_with("/* ") {
+                    3
+                } else {
+                    2
+                };
+            let close_from = if close_b > 0 && text.as_bytes()[close_b - 1] == b' ' {
+                close_at - 1
+            } else {
+                close_at
+            };
+            unwrap =
+                (open_to <= close_from).then_some((open_at, open_to, close_from, close_at + 2));
+        }
+
+        self.with_transaction(|editor| {
+            match unwrap {
+                Some((open_at, open_to, close_from, close_to)) => {
+                    // Descendente: primero el cierre, después la apertura.
+                    editor.buffer.delete(close_from..close_to);
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, close_from, close_to, 0);
+                        cursor.anchor = shift_after(cursor.anchor, close_from, close_to, 0);
+                    }
+                    editor.buffer.delete(open_at..open_to);
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, open_at, open_to, 0);
+                        cursor.anchor = shift_after(cursor.anchor, open_at, open_to, 0);
+                    }
+                }
+                None => {
+                    // Envuelve: primero el cierre (coordenadas originales)
+                    // y luego la apertura.
+                    editor.buffer.insert(end, " */");
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, end, end, 3);
+                        cursor.anchor = shift_after(cursor.anchor, end, end, 3);
+                    }
+                    editor.buffer.insert(start, "/* ");
+                    for cursor in &mut editor.cursors {
+                        cursor.caret = shift_after(cursor.caret, start, start, 3);
+                        cursor.anchor = shift_after(cursor.anchor, start, start, 3);
+                    }
+                }
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Tab: si justo antes del caret hay una palabra-clave con snippet para
+    /// esta extensión, la expande en una sola transacción de undo y devuelve
+    /// `true`. Con selección o varios cursores no hace nada (→ se inserta `\t`).
+    pub fn try_expand_snippet(&mut self) -> bool {
+        if self.cursors.len() != 1 {
+            return false;
+        }
+        let primary = self.primary();
+        if primary.has_selection() {
+            return false;
+        }
+        let caret = primary.caret;
+        let line_start = self.buffer.line_to_char(self.buffer.char_to_line(caret));
+        let before = self.buffer.text_range(line_start..caret);
+        let word_chars = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .count();
+        if word_chars == 0 {
+            return false;
+        }
+        let skip = before.chars().count() - word_chars;
+        let trigger = &before[before.char_indices().nth(skip).map_or(0, |(i, _)| i)..];
+        let Some(body) = snippets::body_for(&self.lang, trigger) else {
+            return false;
+        };
+        let word_start = caret - word_chars;
+        let (text, caret_off) = snippets::render(body);
+        self.with_transaction(|editor| {
+            editor.buffer.delete(word_start..caret);
+            editor.buffer.insert(word_start, &text);
+            let pos = word_start + caret_off;
+            editor.cursors[0].caret = pos;
+            editor.cursors[0].anchor = pos;
+        });
+        self.reset_caret_blink();
+        true
+    }
+
+    /// Líneas 0-based abarcadas por cualquier cursor (selección incluida),
+    /// ordenadas y sin duplicados.
+    fn comment_lines(&self) -> Vec<usize> {
+        let mut lines = Vec::new();
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            let first = self.buffer.char_to_line(range.start);
+            let last = if range.is_empty() {
+                first
+            } else {
+                self.buffer.char_to_line(range.end.saturating_sub(1))
+            };
+            lines.extend(first..=last);
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
     }
 
     pub fn undo(&mut self) -> bool {
@@ -1400,6 +1606,23 @@ fn shift_after(pos: usize, start: usize, end: usize, inserted: usize) -> usize {
     }
 }
 
+/// Prefijo de comentario de línea según la extensión del archivo (default `//`).
+fn comment_prefix(lang: &str) -> &'static str {
+    match lang {
+        "py" | "sh" | "bash" | "rb" | "yaml" | "yml" | "toml" | "pl" | "ps1" | "r" | "mk" => "#",
+        "sql" | "lua" | "hs" | "elm" => "--",
+        "html" | "xml" | "svg" => "<!--",
+        _ => "//",
+    }
+}
+
+/// Texto de una línea sin su final (`\n` o `\r\n`).
+fn trim_line_ending(text: &str) -> &str {
+    text.strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(text)
+}
+
 /// Primera ocurrencia de `needle` en `text` a partir del char `from_col`
 /// (la aguja debe caber entera en `text`); devuelve su posición en chars.
 fn find_in_text(text: &str, from_col: usize, needle: &str) -> Option<usize> {
@@ -2127,5 +2350,149 @@ mod tests {
             let _ = editor.build_scene((1200.0, 40.0), 1.0);
         }
         eprintln!("build_scene media (2 líneas): {:?}", t.elapsed() / iters);
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_and_uncomments_selection() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola\nadios");
+        editor.select_all();
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "// hola\n// adios");
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "hola\nadios");
+    }
+
+    #[test]
+    fn toggle_line_comment_keeps_indent_and_never_doubles() {
+        let mut editor = Editor::default();
+        editor.insert_text("    let x = 1;\n// ya\n    // también");
+        editor.select_all();
+        editor.toggle_line_comment();
+        assert_eq!(
+            text_of(&editor),
+            "    // let x = 1;\n// ya\n    // también",
+            "respeta la indentación y no duplica comentarios"
+        );
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "    let x = 1;\nya\n    también");
+    }
+
+    #[test]
+    fn toggle_line_comment_uses_hash_for_python() {
+        let mut editor = Editor {
+            lang: "py".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text("print(1)");
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "# print(1)");
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "print(1)");
+    }
+
+    #[test]
+    fn toggle_line_comment_is_a_single_undo_step() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos");
+        editor.select_all();
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "// uno\n// dos");
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "uno\ndos");
+    }
+
+    #[test]
+    fn toggle_line_comment_on_blank_line_is_reversible() {
+        let mut editor = Editor::default();
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "// ");
+        editor.toggle_line_comment();
+        assert_eq!(text_of(&editor), "");
+    }
+
+    #[test]
+    fn toggle_block_comment_wraps_line_and_unwraps() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola");
+        editor.toggle_block_comment();
+        assert_eq!(text_of(&editor), "/* hola */");
+        editor.toggle_block_comment();
+        assert_eq!(text_of(&editor), "hola");
+        assert_eq!(editor.cursors[0].caret, 4, "vuelve el caret al final");
+    }
+
+    #[test]
+    fn toggle_block_comment_wraps_only_the_selection() {
+        let mut editor = Editor::default();
+        editor.insert_text("abc");
+        editor.cursors = vec![Cursor {
+            caret: 3,
+            anchor: 1,
+        }];
+        editor.toggle_block_comment();
+        assert_eq!(text_of(&editor), "a/* bc */");
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "abc");
+    }
+
+    #[test]
+    fn toggle_block_comment_is_a_noop_on_an_empty_line() {
+        let mut editor = Editor::default();
+        editor.toggle_block_comment();
+        assert_eq!(text_of(&editor), "");
+    }
+
+    #[test]
+    fn tab_expands_snippet_with_caret_at_zero_marker() {
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text("fn");
+        let handled = editor.handle_key(&Key::Named(NamedKey::Tab), ModifiersState::empty());
+        assert!(handled, "Tab consume la tecla al expandir");
+        assert_eq!(text_of(&editor), "fn nombre() {\n    \n}");
+        assert_eq!(editor.cursors[0].caret, 18, "caret en $0");
+        assert_eq!(editor.cursors[0].anchor, 18);
+        assert!(editor.undo(), "una sola transacción");
+        assert_eq!(text_of(&editor), "fn");
+        assert_eq!(editor.cursors[0].caret, 2);
+    }
+
+    #[test]
+    fn tab_without_snippet_falls_back_to_tab_char() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola");
+        editor.handle_key(&Key::Named(NamedKey::Tab), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "hola\t");
+    }
+
+    #[test]
+    fn snippet_skips_selection_and_multi_cursor() {
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text("fn");
+        editor.cursors = vec![Cursor {
+            caret: 2,
+            anchor: 0,
+        }];
+        assert!(!editor.try_expand_snippet(), "selección → sin snippet");
+        assert_eq!(text_of(&editor), "fn");
+
+        editor.cursors = vec![
+            Cursor {
+                caret: 2,
+                anchor: 2,
+            },
+            Cursor {
+                caret: 0,
+                anchor: 0,
+            },
+        ];
+        assert!(!editor.try_expand_snippet(), "multi-cursor → sin snippet");
+        assert_eq!(text_of(&editor), "fn");
     }
 }

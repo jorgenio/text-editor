@@ -5,6 +5,7 @@ mod editor;
 mod palette;
 mod search;
 mod settings;
+mod snippets;
 mod tabs;
 
 use std::sync::Arc;
@@ -355,6 +356,14 @@ fn run_command(
         }
         "edit.duplicate_line" => {
             tabs.active_mut().duplicate_current_line();
+            true
+        }
+        "edit.comment" => {
+            tabs.active_mut().toggle_line_comment();
+            true
+        }
+        "edit.comment_block" => {
+            tabs.active_mut().toggle_block_comment();
             true
         }
         "view.split" => {

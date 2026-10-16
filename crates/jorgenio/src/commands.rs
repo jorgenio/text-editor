@@ -49,6 +49,12 @@ pub static KEYMAP: &[Binding] = &[
     bind("d", true, false, false, "edit.select_next_occurrence"),
     bind("k", true, true, false, "edit.delete_line"),
     bind("d", true, true, false, "edit.duplicate_line"),
+    // Ctrl+/ con y sin Shift: en teclados ES "/" nace con Shift y en US sin él;
+    // ambos eventos ('/' con ctrl) alternan comentarios de línea.
+    bind("/", true, false, false, "edit.comment"),
+    bind("/", true, true, false, "edit.comment"),
+    // En US Ctrl+Shift+/ produce '?' (mayúsculas de '/'); ese es el bloque.
+    bind("?", true, true, false, "edit.comment_block"),
     bind("f", true, false, false, "find.show"),
     bind("h", true, false, false, "replace.show"),
     bind("\\", true, false, false, "view.split"),
@@ -138,6 +144,16 @@ pub static COMMANDS: &[Command] = &[
         id: "edit.duplicate_line",
         name: "Duplicar línea",
         category: "Línea",
+    },
+    Command {
+        id: "edit.comment",
+        name: "Comentar/destacar",
+        category: "Edición",
+    },
+    Command {
+        id: "edit.comment_block",
+        name: "Comentar bloque",
+        category: "Edición",
     },
     Command {
         id: "find.show",
@@ -253,6 +269,27 @@ mod tests {
         let mut state = ModifiersState::empty();
         state.set(ModifiersState::SUPER, true);
         assert_eq!(command_for(state, &key('c')), Some("edit.copy"));
+    }
+
+    #[test]
+    fn comment_bindings_cover_both_layouts() {
+        // US: Ctrl+/ (sin Shift) → comentar.
+        assert_eq!(
+            command_for(mods(true, false, false), &key('/')),
+            Some("edit.comment")
+        );
+        // ES: "/" nace con Shift (Ctrl+Shift+7) → también comentar.
+        assert_eq!(
+            command_for(mods(true, true, false), &key('/')),
+            Some("edit.comment")
+        );
+        // US: Ctrl+Shift+/ produce '?' → comentario de bloque.
+        assert_eq!(
+            command_for(mods(true, true, false), &key('?')),
+            Some("edit.comment_block")
+        );
+        assert_eq!(command_for(mods(true, false, false), &key('?')), None);
+        assert_eq!(keys_for("edit.comment").as_deref(), Some("Ctrl+/"));
     }
 
     #[test]

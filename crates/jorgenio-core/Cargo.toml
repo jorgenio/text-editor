@@ -1,0 +1,11 @@
+[package]
+name = "jorgenio-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Modelo de edición puro de Jorgenio Text (buffer, selecciones, comandos)"
+
+[dependencies]
+
+[lints]
+workspace = true

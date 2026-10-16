@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jorgenio-core",
+    "crates/jorgenio-syntax",
+    "crates/jorgenio-ui",
+    "crates/jorgenio",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+jorgenio-core = { path = "crates/jorgenio-core" }
+jorgenio-syntax = { path = "crates/jorgenio-syntax" }
+jorgenio-ui = { path = "crates/jorgenio-ui" }
+
+# Ventana / GPU (winit 0.30 + wgpu 30, compatibles con glyphon 0.12)
+winit = "0.30"
+wgpu = "30.0"
+pollster = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

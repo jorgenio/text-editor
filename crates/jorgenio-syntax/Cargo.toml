@@ -1,0 +1,11 @@
+[package]
+name = "jorgenio-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Syntax highlighting (syntect) y temas .tmTheme de Jorgenio Text"
+
+[dependencies]
+
+[lints]
+workspace = true

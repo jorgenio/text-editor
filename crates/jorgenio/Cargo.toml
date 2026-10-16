@@ -1,0 +1,20 @@
+[package]
+name = "jorgenio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jorgenio Text — editor de texto inspirado en Sublime Text"
+
+[[bin]]
+name = "jorgenio"
+path = "src/main.rs"
+
+[dependencies]
+jorgenio-ui.workspace = true
+winit.workspace = true
+pollster.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true

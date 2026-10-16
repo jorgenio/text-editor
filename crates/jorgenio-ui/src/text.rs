@@ -44,6 +44,8 @@ pub struct TextLayer {
     resolution: (u32, u32),
     /// Avance (advance) de la fuente monoespaciada en emisiones (≈ 0.6).
     advance_ratio: f32,
+    /// Ancho de tabulador en celdas (debe coincidir con el editor; M11).
+    tab_width: u16,
 }
 
 impl TextLayer {
@@ -85,6 +87,19 @@ impl TextLayer {
             buffers_top: Vec::new(),
             resolution,
             advance_ratio,
+            tab_width: TAB_WIDTH as u16,
+        }
+    }
+
+    /// Ancho de tabulador en celdas para los `\t` shapeados (igual que los
+    /// calcula el editor). Al cambiar se invalida el cache: los buffers se
+    /// re-shapean con el nuevo ancho en el siguiente `prepare`.
+    pub fn set_tab_width(&mut self, cells: u16) {
+        let cells = cells.max(1);
+        if cells != self.tab_width {
+            self.tab_width = cells;
+            self.buffers.clear();
+            self.buffers_top.clear();
         }
     }
 
@@ -165,7 +180,7 @@ impl TextLayer {
             buffer.set_size(Some(resolution.0 as f32), Some(resolution.1 as f32));
             // Sin wrap: una línea = un span; los tabs usan el mismo ancho que el editor.
             buffer.set_wrap(Wrap::None);
-            buffer.set_tab_width(TAB_WIDTH as u16);
+            buffer.set_tab_width(self.tab_width);
             buffer.set_text(
                 &span.text,
                 &Attrs::new().family(Family::Monospace),

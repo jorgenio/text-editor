@@ -1063,6 +1063,8 @@ dependencies = [
  "nucleo-matcher",
  "pollster",
  "rfd",
+ "serde",
+ "serde_json",
  "tempfile",
  "wgpu",
  "winit",

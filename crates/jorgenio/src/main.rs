@@ -4,6 +4,7 @@ mod commands;
 mod editor;
 mod palette;
 mod search;
+mod settings;
 mod tabs;
 
 use std::sync::Arc;
@@ -42,6 +43,8 @@ struct Application {
     palette: Palette,
     /// Barra de buscar/reemplazar (Ctrl+F / Ctrl+H).
     search: SearchBar,
+    /// Preferencias cargadas de `settings.json` (M11).
+    settings: settings::Settings,
     gpu: Option<GpuContext>,
     /// Portapapeles del SO, creado en la primera uso (lazy).
     clipboard: Option<arboard::Clipboard>,
@@ -59,16 +62,21 @@ struct Application {
 
 impl Application {
     fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        let settings = settings::load();
+        let mut tabs = Tabs::from_paths(paths);
+        tabs.apply_prefs(&settings);
+        let blink = blink_interval(&settings);
         Self {
-            tabs: Tabs::from_paths(paths),
+            tabs,
             palette: Palette::default(),
             search: SearchBar::default(),
+            settings,
             gpu: None,
             clipboard: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             last_title: String::new(),
             cursor: LogicalPosition::new(0.0, 0.0),
-            caret_blink_deadline: Instant::now() + editor::CARET_BLINK,
+            caret_blink_deadline: Instant::now() + blink,
             last_click: None,
             click_count: 0,
             mouse_down: false,
@@ -76,6 +84,12 @@ impl Application {
             drag_active: false,
         }
     }
+}
+
+/// Duración del parpadeo del caret según preferencias (con suelo: un valor
+/// diminuto recargaría la escena en bucle).
+fn blink_interval(settings: &settings::Settings) -> Duration {
+    Duration::from_millis(settings.caret_blink_ms.clamp(50, 10_000))
 }
 
 /// Portapapeles lazy (se crea en el primer uso).
@@ -192,6 +206,21 @@ fn focus_tab(tabs: &mut Tabs, group: usize, tab: usize) {
     tabs.active_mut().set_focused(focused);
 }
 
+/// Si se guardó el `settings.json`, recarga preferencias y las reaplica a
+/// TODOS los editores abiertos (tab/gutter/parpadeo se ven al instante).
+fn reload_settings_if_needed(
+    settings: &mut settings::Settings,
+    tabs: &mut Tabs,
+    saved: &std::path::Path,
+) {
+    if saved != settings::path() {
+        return;
+    }
+    *settings = settings::load();
+    tabs.apply_prefs(settings);
+    log::info!("preferencias recargadas");
+}
+
 /// Ejecuta un comando por id (keymap o paleta de comandos).
 /// `true` = pide redraw.
 fn run_command(
@@ -199,6 +228,7 @@ fn run_command(
     clipboard: &mut Option<arboard::Clipboard>,
     palette: &mut Palette,
     search: &mut SearchBar,
+    settings: &mut settings::Settings,
     id: &str,
 ) -> bool {
     match id {
@@ -218,6 +248,7 @@ fn run_command(
         }
         "file.new" => {
             tabs.add(Editor::default());
+            tabs.apply_prefs(settings);
             true
         }
         "file.open" => {
@@ -227,35 +258,60 @@ fn run_command(
                     tabs.add(Editor::from_cli(path));
                 }
                 tabs.set_active(first);
+                tabs.apply_prefs(settings);
             }
             true
         }
         "file.save" => {
-            let editor = tabs.active_mut();
-            if editor.has_path() {
-                match editor.save() {
-                    Ok(()) => log::info!("guardado"),
-                    Err(err) => log::error!("error al guardar: {err}"),
-                }
-            } else {
-                let name = default_save_name(&editor.tab_label());
-                if let Some(path) = save_dialog(&name) {
-                    match editor.save_as(path) {
-                        Ok(()) => log::info!("guardado"),
-                        Err(err) => log::error!("error al guardar: {err}"),
+            let saved: Option<std::path::PathBuf> = {
+                let editor = tabs.active_mut();
+                if editor.has_path() {
+                    match editor.save() {
+                        Ok(()) => {
+                            log::info!("guardado");
+                            editor.path().map(|p| p.to_path_buf())
+                        }
+                        Err(err) => {
+                            log::error!("error al guardar: {err}");
+                            None
+                        }
                     }
+                } else {
+                    let name = default_save_name(&editor.tab_label());
+                    save_dialog(&name).and_then(|path| match editor.save_as(path.clone()) {
+                        Ok(()) => {
+                            log::info!("guardado");
+                            Some(path)
+                        }
+                        Err(err) => {
+                            log::error!("error al guardar: {err}");
+                            None
+                        }
+                    })
                 }
+            };
+            if let Some(saved) = &saved {
+                reload_settings_if_needed(settings, tabs, saved);
             }
             true
         }
         "file.save_as" => {
-            let editor = tabs.active_mut();
-            let name = default_save_name(&editor.tab_label());
-            if let Some(path) = save_dialog(&name) {
-                match editor.save_as(path) {
-                    Ok(()) => log::info!("guardado"),
-                    Err(err) => log::error!("error al guardar: {err}"),
-                }
+            let saved: Option<std::path::PathBuf> = {
+                let editor = tabs.active_mut();
+                let name = default_save_name(&editor.tab_label());
+                save_dialog(&name).and_then(|path| match editor.save_as(path.clone()) {
+                    Ok(()) => {
+                        log::info!("guardado");
+                        Some(path)
+                    }
+                    Err(err) => {
+                        log::error!("error al guardar: {err}");
+                        None
+                    }
+                })
+            };
+            if let Some(saved) = &saved {
+                reload_settings_if_needed(settings, tabs, saved);
             }
             true
         }
@@ -303,10 +359,25 @@ fn run_command(
         }
         "view.split" => {
             tabs.split();
+            // El editor en blanco del grupo nuevo nace con las preferencias.
+            tabs.apply_prefs(settings);
             true
         }
         "view.unsplit" => {
             tabs.unsplit();
+            true
+        }
+        "settings.open" => {
+            let target = settings::path();
+            settings::ensure_exists();
+            if let Some((group, tab)) = tabs.find_path(&target) {
+                focus_tab(tabs, group, tab);
+            } else {
+                tabs.add(Editor::from_cli(target));
+            }
+            // Aplica lo que ya estuviera en disco (ediciones externas).
+            *settings = settings::load();
+            tabs.apply_prefs(settings);
             true
         }
         other => {
@@ -359,7 +430,7 @@ impl winit::application::ApplicationHandler for Application {
                         gpu.request_redraw();
                     }
                 }
-                self.caret_blink_deadline = now + editor::CARET_BLINK;
+                self.caret_blink_deadline = now + blink_interval(&self.settings);
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.caret_blink_deadline));
         } else {
@@ -391,6 +462,8 @@ impl winit::application::ApplicationHandler for Application {
                 let frame = Instant::now();
                 let viewport = gpu.logical_size();
                 let advance = gpu.advance_ratio();
+                // Preferencias → glifos (no-op si el ancho no cambió).
+                gpu.set_tab_width(self.settings.tab_width as u16);
                 // Cada grupo ocupa una columna de ancho igual; su editor vive
                 // debajo de la barra (inset superior) y a la derecha de su
                 // origen horizontal (inset izquierdo).
@@ -437,7 +510,7 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.set_title(&title);
                     self.last_title = title;
                 }
-                self.caret_blink_deadline = Instant::now() + editor::CARET_BLINK;
+                self.caret_blink_deadline = Instant::now() + blink_interval(&self.settings);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -465,6 +538,7 @@ impl winit::application::ApplicationHandler for Application {
                         &mut self.clipboard,
                         &mut self.palette,
                         &mut self.search,
+                        &mut self.settings,
                         id,
                     ) {
                         gpu.request_redraw();
@@ -481,6 +555,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
+                                &mut self.settings,
                                 id,
                             );
                             gpu.request_redraw();
@@ -560,6 +635,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
+                                &mut self.settings,
                                 id,
                             );
                             gpu.request_redraw();

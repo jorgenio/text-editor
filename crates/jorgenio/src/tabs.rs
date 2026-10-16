@@ -189,6 +189,29 @@ impl Tabs {
         editor.set_viewport(w, editor_h);
     }
 
+    /// Aplica preferencias a TODOS los editores abiertos (todos los grupos);
+    /// el cambio de tab/gutter es solo geométrico, se ve en el siguiente frame.
+    pub fn apply_prefs(&mut self, prefs: &crate::settings::Settings) {
+        for group in &mut self.groups {
+            for editor in &mut group.list {
+                editor.set_tab_width(prefs.tab_width);
+                editor.set_show_line_numbers(prefs.show_line_numbers);
+            }
+        }
+    }
+
+    /// ¿Ya está abierto `path` en algún grupo? Devuelve (grupo, pestaña) para
+    /// enfocarlo en vez de duplicar el buffer (Ctrl+, y "Abrir archivo").
+    pub fn find_path(&self, path: &std::path::Path) -> Option<(usize, usize)> {
+        self.groups.iter().enumerate().find_map(|(gi, group)| {
+            group
+                .list
+                .iter()
+                .position(|editor| editor.path() == Some(path))
+                .map(|tab| (gi, tab))
+        })
+    }
+
     /// Cierra la pestaña `index` (la activa si es `None`) del grupo activo y
     /// reajusta la activa. Si era la ÚLTIMA de su grupo y hay más de un
     /// grupo, se cierra el grupo entero. La última pestaña del último grupo
@@ -480,5 +503,38 @@ mod tests {
         tabs.set_active(0);
         assert_eq!(tabs.active_group_index(), 0);
         assert_eq!(tabs.active().tab_label(), "uno.rs");
+    }
+
+    #[test]
+    fn apply_prefs_reaches_every_group_and_find_path_locates_tabs() {
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.add(tab_named("b.rs"));
+        tabs.split();
+        tabs.add(tab_named("c.rs")); // en el grupo derecho
+
+        let prefs = crate::settings::Settings {
+            tab_width: 8,
+            show_line_numbers: false,
+            ..crate::settings::Settings::default()
+        };
+        tabs.apply_prefs(&prefs);
+
+        for gi in 0..tabs.group_count() {
+            let editor = tabs.group_active_mut(gi);
+            assert_eq!(editor.tab_width(), 8, "grupo {gi} actualizado");
+            assert!(!editor.show_line_numbers(), "grupo {gi} sin gutter");
+        }
+
+        assert_eq!(
+            tabs.find_path(std::path::Path::new("b.rs")),
+            Some((0, 1)),
+            "la pestaña del grupo izquierdo"
+        );
+        assert_eq!(
+            tabs.find_path(std::path::Path::new("c.rs")),
+            Some((1, 1)),
+            "la pestaña del grupo derecho"
+        );
+        assert_eq!(tabs.find_path(std::path::Path::new("no.rs")), None);
     }
 }

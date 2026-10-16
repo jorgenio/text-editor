@@ -20,6 +20,8 @@ env_logger.workspace = true
 arboard.workspace = true
 nucleo-matcher.workspace = true
 rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Solo tests: construir `Scene` exige `wgpu::Color` y save_as escribe en disco.

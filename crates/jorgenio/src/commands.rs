@@ -53,6 +53,7 @@ pub static KEYMAP: &[Binding] = &[
     bind("h", true, false, false, "replace.show"),
     bind("\\", true, false, false, "view.split"),
     bind("\\", true, true, false, "view.unsplit"),
+    bind(",", true, false, false, "settings.open"),
 ];
 
 /// Un comando ejecutable desde la paleta.
@@ -157,6 +158,11 @@ pub static COMMANDS: &[Command] = &[
         id: "view.unsplit",
         name: "Unir paneles",
         category: "Ver",
+    },
+    Command {
+        id: "settings.open",
+        name: "Abrir preferencias (settings.json)",
+        category: "Preferencias",
     },
 ];
 
@@ -264,6 +270,7 @@ mod tests {
         assert_eq!(keys_for("edit.redo").as_deref(), Some("Ctrl+Shift+Z"));
         assert_eq!(keys_for("view.split").as_deref(), Some("Ctrl+\\"));
         assert_eq!(keys_for("view.unsplit").as_deref(), Some("Ctrl+Shift+\\"));
+        assert_eq!(keys_for("settings.open").as_deref(), Some("Ctrl+,"));
         assert_eq!(keys_for("missing.command"), None);
     }
 

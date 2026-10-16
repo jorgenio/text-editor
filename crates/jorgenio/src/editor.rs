@@ -9,7 +9,6 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use jorgenio_core::buffer::{Buffer, LineEnding};
 use jorgenio_core::history::{History, Transaction};
@@ -20,15 +19,15 @@ use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-/// Cadena del parpadeo del caret (la usa el shell de la app con `WaitUntil`).
-pub const CARET_BLINK: Duration = Duration::from_millis(530);
-
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 20.0;
+/// Ancho de tabulador por defecto (el `settings.json` lo sobrescribe).
 pub const TAB_WIDTH: usize = 4;
 
 /// Inicio del área de código (tras el gutter).
 const CODE_X: f32 = 64.0;
+/// Inicio del código con el gutter oculto (`show_line_numbers: false`).
+const HIDDEN_GUTTER_X: f32 = 12.0;
 /// Derecha de los números de línea (alineados a la derecha).
 const GUTTER_RIGHT_X: f32 = 56.0;
 const PADDING_TOP: f32 = 8.0;
@@ -93,6 +92,10 @@ pub struct Editor {
     /// Hueco izquierdo (px): desplaza el gutter y el código para que el panel
     /// derecho de un split no pinte encima del izquierdo.
     left_inset: f32,
+    /// Ancho de tabulador en celdas (preferencias; ver [`TAB_WIDTH`]).
+    tab_width: usize,
+    /// ¿Dibujar los números de línea? (`show_line_numbers` de preferencias).
+    show_line_numbers: bool,
     /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
     find: Vec<Range<usize>>,
     find_current: usize,
@@ -116,6 +119,8 @@ impl Default for Editor {
             caret_on: true,
             top_inset: 0.0,
             left_inset: 0.0,
+            tab_width: TAB_WIDTH,
+            show_line_numbers: true,
             find: Vec::new(),
             find_current: 0,
             find_query: String::new(),
@@ -169,6 +174,11 @@ impl Editor {
         self.path.is_some()
     }
 
+    /// Ruta fija del archivo, si la tiene (para detectar pestañas duplicadas).
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
     /// ¿Hay cambios sin guardar? (el "●" de la pestaña y del título).
     pub fn dirty(&self) -> bool {
         self.buffer.dirty()
@@ -204,10 +214,41 @@ impl Editor {
         self.left_inset = px;
     }
 
+    /// Ancho de tabulador en celdas (recortado a 1-32: 0 partiría la
+    /// aritmética de columnas). El clic y el caret se recalculan solos.
+    pub fn set_tab_width(&mut self, width: usize) {
+        self.tab_width = width.clamp(1, 32);
+    }
+
+    pub fn set_show_line_numbers(&mut self, show: bool) {
+        self.show_line_numbers = show;
+    }
+
+    /// Inicio del área de código según el gutter (preferencias).
+    fn code_offset(&self) -> f32 {
+        if self.show_line_numbers {
+            CODE_X
+        } else {
+            HIDDEN_GUTTER_X
+        }
+    }
+
     /// Solo para tests (comprobar la geometría de un split).
     #[cfg(test)]
     pub fn left_inset(&self) -> f32 {
         self.left_inset
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn tab_width(&self) -> usize {
+        self.tab_width
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn show_line_numbers(&self) -> bool {
+        self.show_line_numbers
     }
 
     pub fn focused(&self) -> bool {
@@ -322,15 +363,17 @@ impl Editor {
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
+                let tab_width = self.tab_width;
                 self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, -1, TAB_WIDTH),
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, -1, tab_width),
                     shift,
                 );
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
+                let tab_width = self.tab_width;
                 self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, 1, TAB_WIDTH),
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, 1, tab_width),
                     shift,
                 );
                 true
@@ -351,16 +394,18 @@ impl Editor {
             }
             Key::Named(NamedKey::PageUp) => {
                 let page = -self.page_lines();
+                let tab_width = self.tab_width;
                 self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, TAB_WIDTH),
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, tab_width),
                     shift,
                 );
                 true
             }
             Key::Named(NamedKey::PageDown) => {
                 let page = self.page_lines();
+                let tab_width = self.tab_width;
                 self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, TAB_WIDTH),
+                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, tab_width),
                     shift,
                 );
                 true
@@ -679,6 +724,7 @@ impl Editor {
             return;
         }
         let mut additions = Vec::with_capacity(self.cursors.len());
+        let tab_width = self.tab_width;
         for cursor in &self.cursors {
             let line = self.buffer.char_to_line(cursor.caret);
             let target =
@@ -686,9 +732,9 @@ impl Editor {
             let line_start = self.buffer.line_to_char(line);
             let text = self.buffer.line_text(line);
             let col = cursor.caret.saturating_sub(line_start);
-            let visual = movement::visual_column(&text, col, TAB_WIDTH);
+            let visual = movement::visual_column(&text, col, tab_width);
             let target_text = self.buffer.line_text(target);
-            let target_col = movement::char_col_at_visual(&target_text, visual, TAB_WIDTH);
+            let target_col = movement::char_col_at_visual(&target_text, visual, tab_width);
             additions.push(Cursor::new(self.buffer.line_to_char(target) + target_col));
         }
         self.cursors.extend(additions);
@@ -952,6 +998,8 @@ impl Editor {
         let line_count = self.buffer.line_count();
         let inset = self.top_inset;
         let xin = self.left_inset;
+        let cx = xin + self.code_offset();
+        let tab_width = self.tab_width;
 
         let visible_first = (((self.scroll_y - inset - PADDING_TOP) / LINE_HEIGHT)
             .floor()
@@ -965,14 +1013,15 @@ impl Editor {
         self.syntax.prepare(&mut self.buffer, visible_last);
         // La búsqueda se resincroniza si el buffer cambió (undo, edición…).
         self.find_sync();
-        let ctx = (
-            xin,
-            inset,
+        let ctx = RangeCtx {
+            code_x: cx,
+            top_inset: inset,
             visible_first,
             visible_last,
-            self.scroll_y,
+            scroll_y: self.scroll_y,
             advance,
-        );
+            tab_width,
+        };
         for cursor in &self.cursors {
             let range = cursor.range();
             push_range_quad(&mut scene, &range, &self.buffer, ctx, SELECTION);
@@ -991,16 +1040,18 @@ impl Editor {
         let caret_line = self.buffer.char_to_line(self.primary().caret);
         for line in visible_first..=visible_last {
             let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
-            let color = if line == caret_line {
-                GUTTER_CURRENT
-            } else {
-                GUTTER_FG
-            };
-            let number = format!("{}", line + 1);
-            let number_x = xin + GUTTER_RIGHT_X - number.len() as f32 * advance;
-            scene
-                .texts
-                .push(TextSpan::new(number, number_x, y, FONT_SIZE, color));
+            if self.show_line_numbers {
+                let color = if line == caret_line {
+                    GUTTER_CURRENT
+                } else {
+                    GUTTER_FG
+                };
+                let number = format!("{}", line + 1);
+                let number_x = xin + GUTTER_RIGHT_X - number.len() as f32 * advance;
+                scene
+                    .texts
+                    .push(TextSpan::new(number, number_x, y, FONT_SIZE, color));
+            }
 
             let text = self.buffer.line_text(line);
             if text.is_empty() {
@@ -1008,15 +1059,13 @@ impl Editor {
             }
             let tokens = self.syntax.tokens(line);
             if tokens.is_empty() {
-                scene
-                    .texts
-                    .push(TextSpan::new(text, xin + CODE_X, y, FONT_SIZE, FG));
+                scene.texts.push(TextSpan::new(text, cx, y, FONT_SIZE, FG));
                 continue;
             }
             // Columnas de TODOS los tokens en un solo recorrido de la línea
             // (antes: visual_column por token = O(tokens × columna) por frame).
             let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
-            let columns = movement::visual_columns_at(&text, &starts, TAB_WIDTH);
+            let columns = movement::visual_columns_at(&text, &starts, tab_width);
             for (token, &cells) in tokens.iter().zip(&columns) {
                 let piece = text
                     .get(token.start..token.end.min(text.len()))
@@ -1026,7 +1075,7 @@ impl Editor {
                 }
                 scene.texts.push(TextSpan::new(
                     piece,
-                    xin + CODE_X + cells as f32 * advance,
+                    cx + cells as f32 * advance,
                     y,
                     FONT_SIZE,
                     token.color,
@@ -1042,9 +1091,9 @@ impl Editor {
                 }
                 let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
                 let col = cursor.caret - self.buffer.line_to_char(line);
-                let cells = movement::visual_column(&self.buffer.line_text(line), col, TAB_WIDTH);
+                let cells = movement::visual_column(&self.buffer.line_text(line), col, tab_width);
                 scene.overlays.push(Quad::new(
-                    xin + CODE_X + cells as f32 * advance,
+                    cx + cells as f32 * advance,
                     y,
                     CARET_WIDTH,
                     LINE_HEIGHT - 2.0,
@@ -1173,11 +1222,13 @@ impl Editor {
 
     /// Coordenadas lógicas → offset de char (columna visual, media celda).
     fn caret_at(&self, x: f32, y: f32, advance: f32) -> usize {
-        let visual = ((x - self.left_inset - CODE_X) / advance).floor().max(0.0) as usize;
+        let visual = ((x - self.left_inset - self.code_offset()) / advance)
+            .floor()
+            .max(0.0) as usize;
         let line_f = ((y - self.top_inset - PADDING_TOP + self.scroll_y) / LINE_HEIGHT).floor();
         let line = (line_f.max(0.0) as usize).min(self.buffer.line_count() - 1);
         let text = self.buffer.line_text(line);
-        let char_col = movement::char_col_at_visual(&text, visual, TAB_WIDTH);
+        let char_col = movement::char_col_at_visual(&text, visual, self.tab_width);
         self.buffer.line_to_char(line) + char_col
     }
 
@@ -1235,10 +1286,19 @@ fn visible_line_range(
     first.max(visible_first)..=last.min(visible_last)
 }
 
-/// Contexto de dibujo de un rango: (left_inset, top_inset, visible_first,
-/// visible_last, scroll_y, advance). En tupla como `quads3` para no pasar
-/// demasiados argumentos.
-type RangeCtx = (f32, f32, usize, usize, f32, f32);
+/// Contexto de dibujo de un rango (parámetros fijos del frame) para no
+/// pasar ocho argumentos a [`push_range_quad`]. `code_x` ya incluye el
+/// inset izquierdo y el gutter (visible u oculto).
+#[derive(Clone, Copy)]
+struct RangeCtx {
+    code_x: f32,
+    top_inset: f32,
+    visible_first: usize,
+    visible_last: usize,
+    scroll_y: f32,
+    advance: f32,
+    tab_width: usize,
+}
 
 /// Quad de selección/coincidencia para `range`, recortado a las líneas
 /// visibles: una sola implementación para selecciones y para la búsqueda.
@@ -1252,7 +1312,15 @@ fn push_range_quad(
     if range.is_empty() {
         return;
     }
-    let (x_inset, inset, visible_first, visible_last, scroll_y, advance) = ctx;
+    let RangeCtx {
+        code_x,
+        top_inset: inset,
+        visible_first,
+        visible_last,
+        scroll_y,
+        advance,
+        tab_width,
+    } = ctx;
     let first = buffer.char_to_line(range.start);
     let last = buffer.char_to_line(range.end.saturating_sub(1));
     // Solo la intersección con lo visible: O(viewport), no O(rango).
@@ -1263,7 +1331,7 @@ fn push_range_quad(
 
         let start_cells = if line == first {
             let col = range.start - line_start;
-            movement::visual_column(&text, col, TAB_WIDTH)
+            movement::visual_column(&text, col, tab_width)
         } else {
             0
         };
@@ -1271,15 +1339,15 @@ fn push_range_quad(
             let col = range.end - line_start;
             // Seleccionar el \n añade una celda más (como Sublime).
             if col > text.chars().count() {
-                movement::visual_column(&text, text.chars().count(), TAB_WIDTH) + 1
+                movement::visual_column(&text, text.chars().count(), tab_width) + 1
             } else {
-                movement::visual_column(&text, col, TAB_WIDTH)
+                movement::visual_column(&text, col, tab_width)
             }
         } else {
-            movement::visual_column(&text, text.chars().count(), TAB_WIDTH)
+            movement::visual_column(&text, text.chars().count(), tab_width)
         };
 
-        let x = x_inset + CODE_X + start_cells as f32 * advance;
+        let x = code_x + start_cells as f32 * advance;
         let w = (end_cells.saturating_sub(start_cells)) as f32 * advance;
         if w > 0.0 {
             scene.quads.push(Quad::new(x, y, w, LINE_HEIGHT, color));
@@ -1960,6 +2028,58 @@ mod tests {
         assert_eq!(editor.caret_at(500.0 + CODE_X + 2.0 * 10.0, 0.0, 10.0), 2);
         editor.set_left_inset(0.0);
         assert_eq!(editor.caret_at(500.0 + CODE_X + 2.0 * 10.0, 0.0, 10.0), 4);
+    }
+
+    #[test]
+    fn show_line_numbers_hides_the_gutter_and_shifts_code() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola");
+        editor.scroll_y = 0.0;
+
+        let shown = editor.build_scene((600.0, 200.0), 1.0);
+        assert!(
+            shown.texts.iter().any(|span| span.text == "1"),
+            "el número de línea se dibuja"
+        );
+
+        editor.set_show_line_numbers(false);
+        let hidden = editor.build_scene((600.0, 200.0), 1.0);
+        assert!(
+            !hidden.texts.iter().any(|span| span.text == "1"),
+            "el gutter desaparece"
+        );
+        assert_eq!(
+            hidden.texts[0].x, HIDDEN_GUTTER_X,
+            "el código arranca pegado a la izquierda"
+        );
+    }
+
+    #[test]
+    fn tab_width_setting_widens_selection_quads() {
+        let mut editor = Editor::default();
+        editor.insert_text("\tx");
+        editor.cursors = vec![Cursor {
+            caret: 2,
+            anchor: 0,
+        }];
+        editor.scroll_y = 0.0;
+
+        // advance = FONT_SIZE con ratio 1.0.
+        let four = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(four.quads[0].w, 5.0 * FONT_SIZE, "tab de 4 celdas + la x");
+
+        editor.set_tab_width(8);
+        let eight = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(
+            eight.quads[0].w,
+            9.0 * FONT_SIZE,
+            "el tab de 8 celdas ensancha la selección"
+        );
+
+        // 0 rompería la aritmética de columnas: se recorta a 1.
+        editor.set_tab_width(0);
+        let clamped = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(clamped.quads[0].w, 2.0 * FONT_SIZE, "0 → 1 celda");
     }
 
     #[test]

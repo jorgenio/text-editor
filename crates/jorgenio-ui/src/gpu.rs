@@ -111,6 +111,12 @@ impl GpuContext {
         self.text.advance_ratio()
     }
 
+    /// Ancho de tabulador en celdas para los glifos (preferencias); si no
+    /// cambia, no hace nada (el cache de texto queda intacto).
+    pub fn set_tab_width(&mut self, cells: u16) {
+        self.text.set_tab_width(cells);
+    }
+
     pub fn set_title(&self, title: &str) {
         self.window.set_title(title);
     }

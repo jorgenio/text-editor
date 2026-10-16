@@ -40,6 +40,9 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 nucleo-matcher = "0.3"
 # Diálogos nativos de abrir/guardar (async: en Linux usa xdg-portal, sin GTK)
 rfd = "0.17"
+# Preferencias del usuario (settings.json con comentarios → serde_json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

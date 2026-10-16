@@ -8,6 +8,7 @@ use std::time::Duration;
 use jorgenio_core::buffer::{Buffer, LineEnding};
 use jorgenio_core::history::{History, Transaction};
 use jorgenio_core::movement;
+use jorgenio_syntax::SyntaxHighlighter;
 use jorgenio_ui::gpu::srgb;
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use winit::event::{ElementState, KeyEvent};
@@ -37,6 +38,10 @@ const SELECTION: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
 pub struct Editor {
     buffer: Buffer,
     history: History,
+    /// Resaltado por gramática (syntect) con cache incremental.
+    syntax: SyntaxHighlighter,
+    /// Extensión del archivo ("rs", "py"…); "" = texto plano.
+    lang: String,
     path: Option<PathBuf>,
     /// Offset del caret (punto de inserción) en **chars**.
     caret: usize,
@@ -54,6 +59,8 @@ impl Default for Editor {
         Self {
             buffer: Buffer::new(),
             history: History::new(),
+            syntax: SyntaxHighlighter::new(),
+            lang: String::new(),
             path: None,
             caret: 0,
             anchor: 0,
@@ -71,6 +78,7 @@ impl Editor {
         let Some(path) = path else {
             return Self::default();
         };
+        let lang = SyntaxHighlighter::detect(&path);
         let buffer = match Buffer::load(&path) {
             Ok(buffer) => buffer,
             Err(err) => {
@@ -80,6 +88,7 @@ impl Editor {
         };
         Self {
             buffer,
+            lang,
             path: Some(path),
             ..Self::default()
         }
@@ -385,7 +394,8 @@ impl Editor {
     }
 
     /// Escena de este frame: selección + gutter + líneas visibles + caret.
-    pub fn build_scene(&self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
+    /// Resalta lo que haga falta (cache) hasta la última línea visible.
+    pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
         let mut scene = Scene::new(srgb(BG.0, BG.1, BG.2));
         let advance = FONT_SIZE * advance_ratio;
         let line_count = self.buffer.line_count();
@@ -397,6 +407,9 @@ impl Editor {
         let visible_last = (((self.scroll_y + viewport.1 - PADDING_TOP) / LINE_HEIGHT).ceil()
             as usize)
             .min(line_count - 1);
+
+        self.syntax.set_extension(&self.lang);
+        self.syntax.prepare(&mut self.buffer, visible_last);
 
         if self.has_selection() {
             let range = self.selected_range();
@@ -451,10 +464,32 @@ impl Editor {
                 .push(TextSpan::new(number, number_x, y, FONT_SIZE, color));
 
             let text = self.buffer.line_text(line);
-            if !text.is_empty() {
+            if text.is_empty() {
+                continue;
+            }
+            let tokens = self.syntax.tokens(line);
+            if tokens.is_empty() {
                 scene
                     .texts
                     .push(TextSpan::new(text, CODE_X, y, FONT_SIZE, FG));
+                continue;
+            }
+            for token in tokens {
+                let piece = text
+                    .get(token.start..token.end.min(text.len()))
+                    .unwrap_or("");
+                if piece.is_empty() || piece.chars().all(|c| c == '\n') {
+                    continue;
+                }
+                let char_col = text[..token.start.min(text.len())].chars().count();
+                let cells = movement::visual_column(&text, char_col, TAB_WIDTH);
+                scene.texts.push(TextSpan::new(
+                    piece,
+                    CODE_X + cells as f32 * advance,
+                    y,
+                    FONT_SIZE,
+                    token.color,
+                ));
             }
         }
 
@@ -664,5 +699,27 @@ mod tests {
         editor.caret = editor.selected_range().start;
         editor.anchor = editor.caret;
         assert!(!editor.has_selection());
+    }
+
+    #[test]
+    fn syntax_colors_split_code_lines_into_tokens() {
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text("fn main() {}");
+
+        let scene = editor.build_scene((1200.0, 800.0), 0.6);
+        let code: Vec<_> = scene.texts.iter().filter(|span| span.x >= CODE_X).collect();
+        assert!(
+            code.len() >= 2,
+            "la línea Rust parte en tokens: {}",
+            code.len()
+        );
+        let distinct: std::collections::HashSet<_> = code.iter().map(|span| span.color).collect();
+        assert!(
+            distinct.len() >= 2,
+            "los tokens deben llevar colores distintos: {distinct:?}"
+        );
     }
 }

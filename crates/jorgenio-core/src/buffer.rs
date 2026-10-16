@@ -68,6 +68,8 @@ pub struct Buffer {
     dirty: bool,
     /// Edits grabados entre `begin` y `take_edits` (para armar la transacción).
     journal: Option<Vec<Edit>>,
+    /// Primera línea afectada por ediciones aún no consumidas (syntax cache).
+    dirty_from_line: usize,
 }
 
 impl Default for Buffer {
@@ -84,6 +86,7 @@ impl Buffer {
             line_ending: LineEnding::default(),
             dirty: false,
             journal: None,
+            dirty_from_line: usize::MAX,
         }
     }
 
@@ -96,6 +99,7 @@ impl Buffer {
             line_ending,
             dirty: false,
             journal: None,
+            dirty_from_line: usize::MAX,
         }
     }
 
@@ -131,11 +135,29 @@ impl Buffer {
         self.journal.take().unwrap_or_default()
     }
 
+    /// Toma (y limpia) la primera línea afectada por ediciones sin consumir.
+    pub fn take_dirty_from_line(&mut self) -> Option<usize> {
+        (self.dirty_from_line != usize::MAX).then(|| {
+            let line = self.dirty_from_line;
+            self.dirty_from_line = usize::MAX;
+            line
+        })
+    }
+
+    fn note_dirty_at(&mut self, char_offset: usize) {
+        // ANTES de mutar: el offset sigue indexando la línea vieja.
+        let line = self.char_to_line(char_offset);
+        if line < self.dirty_from_line {
+            self.dirty_from_line = line;
+        }
+    }
+
     pub fn insert(&mut self, char_offset: usize, text: &str) {
         if text.is_empty() {
             return;
         }
         let at = char_offset.min(self.rope.len_chars());
+        self.note_dirty_at(at);
         self.rope.insert(at, text);
         if let Some(journal) = &mut self.journal {
             journal.push(Edit::Insert {
@@ -152,6 +174,7 @@ impl Buffer {
         if start >= end {
             return;
         }
+        self.note_dirty_at(start);
         let text = self.rope.slice(start..end).to_string();
         self.rope.remove(start..end);
         if let Some(journal) = &mut self.journal {
@@ -334,5 +357,20 @@ mod tests {
             edit.apply(&mut restored);
         }
         assert_eq!(restored.text_range(0..restored.len_chars()), "hola");
+    }
+
+    #[test]
+    fn dirty_from_line_reports_lowest_edited_line() {
+        let mut buffer = Buffer::from_text("uno\ndos\ntres");
+        assert_eq!(buffer.take_dirty_from_line(), None);
+
+        buffer.insert(0, "x");
+        assert_eq!(buffer.take_dirty_from_line(), Some(0));
+        assert_eq!(buffer.take_dirty_from_line(), None, "se limpia al tomar");
+
+        // Edición en la línea 2 + otra en la línea 1 → reporta la menor.
+        buffer.insert(buffer.len_chars(), "!");
+        buffer.insert(5, "y"); // línea 1
+        assert_eq!(buffer.take_dirty_from_line(), Some(1));
     }
 }

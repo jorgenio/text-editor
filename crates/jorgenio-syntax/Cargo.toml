@@ -6,6 +6,8 @@ license.workspace = true
 description = "Syntax highlighting (syntect) y temas .tmTheme de Jorgenio Text"
 
 [dependencies]
+jorgenio-core.workspace = true
+syntect.workspace = true
 
 [lints]
 workspace = true

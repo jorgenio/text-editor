@@ -19,10 +19,12 @@ log.workspace = true
 env_logger.workspace = true
 arboard.workspace = true
 nucleo-matcher.workspace = true
+rfd.workspace = true
 
 [dev-dependencies]
-# Solo tests: construir `Scene` exige `wgpu::Color`.
+# Solo tests: construir `Scene` exige `wgpu::Color` y save_as escribe en disco.
 wgpu.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

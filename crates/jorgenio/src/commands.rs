@@ -34,7 +34,11 @@ pub const fn bind(
 
 pub static KEYMAP: &[Binding] = &[
     bind("p", true, true, false, "palette.show"),
+    bind("n", true, false, false, "file.new"),
+    bind("o", true, false, false, "file.open"),
     bind("s", true, false, false, "file.save"),
+    bind("s", true, true, false, "file.save_as"),
+    bind("w", true, false, false, "file.close"),
     bind("z", true, false, false, "edit.undo"),
     bind("z", true, true, false, "edit.redo"),
     bind("y", true, false, false, "edit.redo"),
@@ -65,6 +69,26 @@ pub static COMMANDS: &[Command] = &[
     Command {
         id: "file.save",
         name: "Guardar archivo",
+        category: "Archivo",
+    },
+    Command {
+        id: "file.new",
+        name: "Archivo nuevo",
+        category: "Archivo",
+    },
+    Command {
+        id: "file.open",
+        name: "Abrir archivo…",
+        category: "Archivo",
+    },
+    Command {
+        id: "file.save_as",
+        name: "Guardar como…",
+        category: "Archivo",
+    },
+    Command {
+        id: "file.close",
+        name: "Cerrar pestaña",
         category: "Archivo",
     },
     Command {
@@ -197,7 +221,10 @@ mod tests {
             Some("edit.redo")
         );
         assert_eq!(command_for(mods(false, false, false), &key('s')), None);
-        assert_eq!(command_for(mods(true, true, false), &key('s')), None);
+        assert_eq!(
+            command_for(mods(true, true, false), &key('s')),
+            Some("file.save_as")
+        );
         // AltGr (Ctrl+Alt) no dispara nada: debe insertar el símbolo.
         assert_eq!(command_for(mods(true, false, true), &key('s')), None);
         assert_eq!(command_for(mods(true, true, true), &key('p')), None);

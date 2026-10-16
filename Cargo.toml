@@ -38,6 +38,8 @@ arboard = { version = "3", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 # Fuzzy matching para la paleta de comandos (de helix/nucleo)
 nucleo-matcher = "0.3"
+# Diálogos nativos de abrir/guardar (async: en Linux usa xdg-portal, sin GTK)
+rfd = "0.17"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

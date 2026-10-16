@@ -4,6 +4,7 @@ mod commands;
 mod editor;
 mod palette;
 mod search;
+mod tabs;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,10 +13,11 @@ use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
 use palette::Palette;
 use search::SearchBar;
+use tabs::{TAB_BAR_H, Tabs};
 use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::Key;
+use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
 /// Ventana de doble/triple click (misma "tanda" de clicks).
@@ -28,12 +30,13 @@ const DRAG_SLOP2: f32 = 16.0;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut Application::new(editor::cli_path()))?;
+    event_loop.run_app(&mut Application::new(editor::cli_paths()))?;
     Ok(())
 }
 
 struct Application {
-    editor: Editor,
+    /// Una pestaña por archivo (M9); la activa es la que recibe los eventos.
+    tabs: Tabs,
     /// Paleta de comandos (Ctrl+Shift+P).
     palette: Palette,
     /// Barra de buscar/reemplazar (Ctrl+F / Ctrl+H).
@@ -54,9 +57,9 @@ struct Application {
 }
 
 impl Application {
-    fn new(path: Option<std::path::PathBuf>) -> Self {
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
         Self {
-            editor: Editor::from_cli(path),
+            tabs: Tabs::from_paths(paths),
             palette: Palette::default(),
             search: SearchBar::default(),
             gpu: None,
@@ -119,10 +122,52 @@ fn paste_clipboard(editor: &mut Editor, slot: &mut Option<arboard::Clipboard>) {
     editor.insert_text(&text);
 }
 
+/// Nombre sugerido para "Guardar como…": añade `.txt` si el nombre no tiene
+/// ya una extensión.
+fn default_save_name(label: &str) -> String {
+    if label.contains('.') {
+        label.to_owned()
+    } else {
+        format!("{label}.txt")
+    }
+}
+
+/// Diálogo "Abrir" (modal nativo; bloquea el event loop). Devuelve varios
+/// archivos (uno por pestaña). En Linux usa xdg-portal vía rfd.
+fn open_dialog() -> Option<Vec<std::path::PathBuf>> {
+    let files = pollster::block_on(
+        rfd::AsyncFileDialog::new()
+            .set_title("Abrir archivo")
+            .add_filter(
+                "Texto",
+                &[
+                    "txt", "rs", "py", "js", "ts", "json", "md", "toml", "yaml", "yml", "html",
+                    "css", "c", "h", "cpp", "go", "sh",
+                ],
+            )
+            .add_filter("Todos los archivos", &["*"])
+            .pick_files(),
+    )?;
+    let paths: Vec<_> = files.iter().map(|file| file.path().to_path_buf()).collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Diálogo "Guardar como…" con `default_name` precargado (sin filtros: el
+/// usuario decide la extensión real del archivo).
+fn save_dialog(default_name: &str) -> Option<std::path::PathBuf> {
+    pollster::block_on(
+        rfd::AsyncFileDialog::new()
+            .set_title("Guardar como…")
+            .set_file_name(default_name)
+            .save_file(),
+    )
+    .map(|file| file.path().to_path_buf())
+}
+
 /// Ejecuta un comando por id (keymap o paleta de comandos).
 /// `true` = pide redraw.
 fn run_command(
-    editor: &mut Editor,
+    tabs: &mut Tabs,
     clipboard: &mut Option<arboard::Clipboard>,
     palette: &mut Palette,
     search: &mut SearchBar,
@@ -134,56 +179,98 @@ fn run_command(
             true
         }
         "find.show" => {
-            let prefill = editor.single_line_selection();
-            search.open(false, prefill.as_deref(), editor);
+            let prefill = tabs.active().single_line_selection();
+            search.open(false, prefill.as_deref(), tabs.active_mut());
             true
         }
         "replace.show" => {
-            let prefill = editor.single_line_selection();
-            search.open(true, prefill.as_deref(), editor);
+            let prefill = tabs.active().single_line_selection();
+            search.open(true, prefill.as_deref(), tabs.active_mut());
+            true
+        }
+        "file.new" => {
+            tabs.add(Editor::default());
+            true
+        }
+        "file.open" => {
+            if let Some(paths) = open_dialog() {
+                let first = tabs.len();
+                for path in paths {
+                    tabs.add(Editor::from_cli(path));
+                }
+                tabs.set_active(first);
+            }
             true
         }
         "file.save" => {
-            match editor.save() {
-                Ok(()) => log::info!("guardado"),
-                Err(err) => log::error!("error al guardar: {err}"),
+            let editor = tabs.active_mut();
+            if editor.has_path() {
+                match editor.save() {
+                    Ok(()) => log::info!("guardado"),
+                    Err(err) => log::error!("error al guardar: {err}"),
+                }
+            } else {
+                let name = default_save_name(&editor.tab_label());
+                if let Some(path) = save_dialog(&name) {
+                    match editor.save_as(path) {
+                        Ok(()) => log::info!("guardado"),
+                        Err(err) => log::error!("error al guardar: {err}"),
+                    }
+                }
+            }
+            true
+        }
+        "file.save_as" => {
+            let editor = tabs.active_mut();
+            let name = default_save_name(&editor.tab_label());
+            if let Some(path) = save_dialog(&name) {
+                match editor.save_as(path) {
+                    Ok(()) => log::info!("guardado"),
+                    Err(err) => log::error!("error al guardar: {err}"),
+                }
+            }
+            true
+        }
+        "file.close" => {
+            if !tabs.close(None) {
+                log::info!("la última pestaña no se cierra");
             }
             true
         }
         "edit.undo" => {
-            editor.undo();
+            tabs.active_mut().undo();
             true
         }
         "edit.redo" => {
-            editor.redo();
+            tabs.active_mut().redo();
             true
         }
         "edit.copy" => {
-            copy_selection(editor, clipboard);
+            copy_selection(tabs.active(), clipboard);
             true
         }
         "edit.cut" => {
-            cut_selection(editor, clipboard);
+            cut_selection(tabs.active_mut(), clipboard);
             true
         }
         "edit.paste" => {
-            paste_clipboard(editor, clipboard);
+            paste_clipboard(tabs.active_mut(), clipboard);
             true
         }
         "edit.select_all" => {
-            editor.select_all();
+            tabs.active_mut().select_all();
             true
         }
         "edit.select_next_occurrence" => {
-            editor.select_next_occurrence();
+            tabs.active_mut().select_next_occurrence();
             true
         }
         "edit.delete_line" => {
-            editor.delete_current_line();
+            tabs.active_mut().delete_current_line();
             true
         }
         "edit.duplicate_line" => {
-            editor.duplicate_current_line();
+            tabs.active_mut().duplicate_current_line();
             true
         }
         other => {
@@ -200,7 +287,7 @@ impl winit::application::ApplicationHandler for Application {
         }
 
         let attrs = Window::default_attributes()
-            .with_title(self.editor.title())
+            .with_title(self.tabs.active().title())
             .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
         let window = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
@@ -216,7 +303,7 @@ impl winit::application::ApplicationHandler for Application {
         gpu.set_ime_allowed(true);
         gpu.request_redraw();
         log::info!("ventana + GPU listos en {:?}", boot.elapsed());
-        self.last_title = self.editor.title();
+        self.last_title = self.tabs.active().title();
         self.gpu = Some(gpu);
     }
 
@@ -224,14 +311,14 @@ impl winit::application::ApplicationHandler for Application {
         if self.gpu.is_none() {
             return;
         }
-        if self.editor.focused() {
+        if self.tabs.active().focused() {
             let now = Instant::now();
             if now >= self.caret_blink_deadline {
                 // Si el caret está fuera de pantalla no hay nada que
                 // parpadear: se conserva el estado y se ahorra el repintar
                 // completo (escena + glifos + quads) cada 530 ms.
-                if self.editor.caret_in_view() {
-                    self.editor.toggle_caret();
+                if self.tabs.active().caret_in_view() {
+                    self.tabs.active_mut().toggle_caret();
                     if let Some(gpu) = &self.gpu {
                         gpu.request_redraw();
                     }
@@ -261,20 +348,27 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::ScaleFactorChanged { .. } => gpu.request_redraw(),
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => {
-                self.editor.set_focused(focused);
+                self.tabs.active_mut().set_focused(focused);
                 gpu.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 let frame = Instant::now();
                 let viewport = gpu.logical_size();
-                self.editor.set_viewport(viewport.0, viewport.1);
                 let advance = gpu.advance_ratio();
-                let mut scene = self.editor.build_scene(viewport, advance);
+                // El editor vive debajo de la barra de pestañas: su área es
+                // la ventana menos TAB_BAR_H y reserva ese hueco (inset).
+                let editor_size = (viewport.0, (viewport.1 - TAB_BAR_H).max(50.0));
+                let active = self.tabs.active_mut();
+                active.set_viewport(editor_size.0, editor_size.1);
+                active.set_top_inset(TAB_BAR_H);
+                let mut scene = active.build_scene(editor_size, advance);
+                self.tabs
+                    .render(&mut scene, viewport, editor::FONT_SIZE * advance);
                 self.search.render(
                     &mut scene,
                     viewport,
                     editor::FONT_SIZE * advance,
-                    &self.editor,
+                    self.tabs.active(),
                 );
                 self.palette
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
@@ -286,7 +380,7 @@ impl winit::application::ApplicationHandler for Application {
                 if cpu > Duration::from_millis(16) {
                     log::warn!("frame lenta (CPU): build={built:?} total={cpu:?}");
                 }
-                let title = self.editor.title();
+                let title = self.tabs.active().title();
                 if title != self.last_title {
                     gpu.set_title(&title);
                     self.last_title = title;
@@ -315,7 +409,7 @@ impl winit::application::ApplicationHandler for Application {
                             gpu.request_redraw();
                         }
                     } else if run_command(
-                        &mut self.editor,
+                        &mut self.tabs,
                         &mut self.clipboard,
                         &mut self.palette,
                         &mut self.search,
@@ -331,7 +425,7 @@ impl winit::application::ApplicationHandler for Application {
                         palette::Action::Run(id) => {
                             self.palette.close();
                             run_command(
-                                &mut self.editor,
+                                &mut self.tabs,
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
@@ -347,18 +441,32 @@ impl winit::application::ApplicationHandler for Application {
                     }
                     return;
                 }
+                // Ctrl+Tab / Ctrl+Shift+Tab: ciclar pestañas. Es una tecla
+                // Named (fuera del keymap de Character) y se resuelve ANTES
+                // que la barra de búsqueda, que se traga el resto.
+                if key_event.state == ElementState::Pressed
+                    && (self.modifiers.control_key() || self.modifiers.super_key())
+                    && !self.modifiers.alt_key()
+                    && matches!(key_event.logical_key, Key::Named(NamedKey::Tab))
+                {
+                    let focused = self.tabs.active().focused();
+                    self.tabs.cycle(self.modifiers.shift_key());
+                    self.tabs.active_mut().set_focused(focused);
+                    gpu.request_redraw();
+                    return;
+                }
                 // Barra de búsqueda abierta: su teclado manda (todo se traga;
                 // Enter/F3/flechas llegan aquí porque no son Character y los
                 // Ctrl+Enter caen fuera del keymap).
                 if self.search.is_open() {
                     if key_event.state == ElementState::Pressed {
                         self.search
-                            .on_key(&key_event, self.modifiers, &mut self.editor);
+                            .on_key(&key_event, self.modifiers, self.tabs.active_mut());
                         gpu.request_redraw();
                     }
                     return;
                 }
-                if self.editor.on_key(&key_event, self.modifiers) {
+                if self.tabs.active_mut().on_key(&key_event, self.modifiers) {
                     gpu.request_redraw();
                 }
             }
@@ -377,7 +485,9 @@ impl winit::application::ApplicationHandler for Application {
                     }
                     if self.drag_active {
                         let advance = editor::FONT_SIZE * gpu.advance_ratio();
-                        self.editor.select_to(self.cursor.x, self.cursor.y, advance);
+                        self.tabs
+                            .active_mut()
+                            .select_to(self.cursor.x, self.cursor.y, advance);
                         gpu.request_redraw();
                     }
                 }
@@ -394,7 +504,7 @@ impl winit::application::ApplicationHandler for Application {
                         palette::Click::Command(id) => {
                             self.palette.close();
                             run_command(
-                                &mut self.editor,
+                                &mut self.tabs,
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
@@ -416,10 +526,23 @@ impl winit::application::ApplicationHandler for Application {
                 // Barra de búsqueda: campos y botones consumen el click;
                 // fuera de la barra llega al editor (la barra se queda abierta).
                 if self.search.is_open()
-                    && self
-                        .search
-                        .handle_click(self.cursor.x, self.cursor.y, &mut self.editor)
+                    && self.search.handle_click(
+                        self.cursor.x,
+                        self.cursor.y,
+                        self.tabs.active_mut(),
+                    )
                 {
+                    gpu.request_redraw();
+                    return;
+                }
+                // Barra de pestañas: cambiar de pestaña. Sin arrastre ni
+                // caret: el click termina aquí.
+                if let Some(index) = self.tabs.click(self.cursor.x, self.cursor.y) {
+                    if index != self.tabs.active_index() {
+                        let focused = self.tabs.active().focused();
+                        self.tabs.set_active(index);
+                        self.tabs.active_mut().set_focused(focused);
+                    }
                     gpu.request_redraw();
                     return;
                 }
@@ -440,12 +563,11 @@ impl winit::application::ApplicationHandler for Application {
 
                 let advance = editor::FONT_SIZE * gpu.advance_ratio();
                 let shift = self.modifiers.shift_key();
+                let active = self.tabs.active_mut();
                 if self.modifiers.alt_key() && count == 1 {
-                    self.editor
-                        .add_cursor_at(self.cursor.x, self.cursor.y, advance);
+                    active.add_cursor_at(self.cursor.x, self.cursor.y, advance);
                 } else {
-                    self.editor
-                        .on_click(self.cursor.x, self.cursor.y, advance, count, shift);
+                    active.on_click(self.cursor.x, self.cursor.y, advance, count, shift);
                 }
                 gpu.request_redraw();
             }
@@ -463,20 +585,31 @@ impl winit::application::ApplicationHandler for Application {
                     MouseScrollDelta::LineDelta(_, y) => y * editor::LINE_HEIGHT * 3.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                self.editor.on_wheel(dy);
+                self.tabs.active_mut().on_wheel(dy);
                 gpu.request_redraw();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if self.palette.is_open() {
                     self.palette.push_text(&text);
                 } else if self.search.is_open() {
-                    self.search.push_text(&text, &mut self.editor);
+                    self.search.push_text(&text, self.tabs.active_mut());
                 } else {
-                    self.editor.insert_text(&text);
+                    self.tabs.active_mut().insert_text(&text);
                 }
                 gpu.request_redraw();
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_save_name;
+
+    #[test]
+    fn default_save_name_keeps_or_adds_extension() {
+        assert_eq!(default_save_name("foo.rs"), "foo.rs");
+        assert_eq!(default_save_name("sin título"), "sin título.txt");
     }
 }

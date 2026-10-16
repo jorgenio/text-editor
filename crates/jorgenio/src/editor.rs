@@ -87,6 +87,9 @@ pub struct Editor {
     viewport: (f32, f32),
     focused: bool,
     caret_on: bool,
+    /// Hueco superior (px) reservado a la barra de pestañas: todo el dibujo
+    /// y toda la geometría (clicks, scroll, visibles) se desplaza con él.
+    top_inset: f32,
     /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
     find: Vec<Range<usize>>,
     find_current: usize,
@@ -108,6 +111,7 @@ impl Default for Editor {
             viewport: (1200.0, 800.0),
             focused: true,
             caret_on: true,
+            top_inset: 0.0,
             find: Vec::new(),
             find_current: 0,
             find_query: String::new(),
@@ -118,10 +122,7 @@ impl Default for Editor {
 
 impl Editor {
     /// Abre `path` si existe; si no, buffer nuevo con esa ruta (se crea al guardar).
-    pub fn from_cli(path: Option<PathBuf>) -> Self {
-        let Some(path) = path else {
-            return Self::default();
-        };
+    pub fn from_cli(path: PathBuf) -> Self {
         let lang = SyntaxHighlighter::detect(&path);
         let buffer = match Buffer::load(&path) {
             Ok(buffer) => buffer,
@@ -138,14 +139,9 @@ impl Editor {
         }
     }
 
+    /// Título de la ventana: nombre del archivo + indicador de cambios.
     pub fn title(&self) -> String {
-        let name = match &self.path {
-            Some(path) => path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
-            None => "untitled".to_string(),
-        };
+        let name = self.tab_label();
         if self.buffer.dirty() {
             format!("\u{25cf} {name} \u{2014} Jorgenio Text")
         } else {
@@ -153,16 +149,50 @@ impl Editor {
         }
     }
 
+    /// Nombre corto para la barra de pestañas (sin la ruta completa).
+    pub fn tab_label(&self) -> String {
+        match &self.path {
+            Some(path) => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            None => "sin título".to_string(),
+        }
+    }
+
+    /// ¿Tiene ruta fija? (sin ella Ctrl+S abre el diálogo de guardar).
+    pub fn has_path(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// ¿Hay cambios sin guardar? (el "●" de la pestaña y del título).
+    pub fn dirty(&self) -> bool {
+        self.buffer.dirty()
+    }
+
     pub fn save(&mut self) -> std::io::Result<()> {
         let Some(path) = self.path.clone() else {
-            log::warn!("guardar sin ruta: el diálogo llega en M9");
+            log::warn!("guardar sin ruta: usa save_as con el diálogo");
             return Ok(());
         };
         self.buffer.save(&path)
     }
 
+    /// Guarda en una ruta nueva (lo decide el diálogo de "Guardar como…"):
+    /// fija la ruta, recalcula la resaltación por extensión y escribe.
+    pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.lang = SyntaxHighlighter::detect(&path);
+        self.path = Some(path.clone());
+        self.buffer.save(&path)
+    }
+
     pub fn set_viewport(&mut self, w: f32, h: f32) {
         self.viewport = (w, h);
+    }
+
+    /// Reserva los `px` superiores para la barra de pestañas (0 = sin barra).
+    pub fn set_top_inset(&mut self, px: f32) {
+        self.top_inset = px;
     }
 
     pub fn focused(&self) -> bool {
@@ -900,24 +930,26 @@ impl Editor {
 
     /// Escena de este frame: selecciones + gutter + líneas visibles + carets.
     /// Resalta lo que haga falta (cache) hasta la última línea visible.
+    /// `viewport` es el área del EDITOR (la ventana menos la barra de pestañas).
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
         let mut scene = Scene::new(srgb(BG.0, BG.1, BG.2));
         let advance = FONT_SIZE * advance_ratio;
         let line_count = self.buffer.line_count();
+        let inset = self.top_inset;
 
-        let visible_first = (((self.scroll_y - PADDING_TOP) / LINE_HEIGHT)
+        let visible_first = (((self.scroll_y - inset - PADDING_TOP) / LINE_HEIGHT)
             .floor()
             .max(0.0) as usize)
             .min(line_count - 1);
-        let visible_last = (((self.scroll_y + viewport.1 - PADDING_TOP) / LINE_HEIGHT).ceil()
-            as usize)
+        let visible_last = (((self.scroll_y + viewport.1 - inset - PADDING_TOP) / LINE_HEIGHT)
+            .ceil() as usize)
             .min(line_count - 1);
 
         self.syntax.set_extension(&self.lang);
         self.syntax.prepare(&mut self.buffer, visible_last);
         // La búsqueda se resincroniza si el buffer cambió (undo, edición…).
         self.find_sync();
-        let ctx = (visible_first, visible_last, self.scroll_y, advance);
+        let ctx = (inset, visible_first, visible_last, self.scroll_y, advance);
         for cursor in &self.cursors {
             let range = cursor.range();
             push_range_quad(&mut scene, &range, &self.buffer, ctx, SELECTION);
@@ -935,7 +967,7 @@ impl Editor {
 
         let caret_line = self.buffer.char_to_line(self.primary().caret);
         for line in visible_first..=visible_last {
-            let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
+            let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
             let color = if line == caret_line {
                 GUTTER_CURRENT
             } else {
@@ -985,7 +1017,7 @@ impl Editor {
                 if line < visible_first || line > visible_last {
                     continue;
                 }
-                let y = PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
+                let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
                 let col = cursor.caret - self.buffer.line_to_char(line);
                 let cells = movement::visual_column(&self.buffer.line_text(line), col, TAB_WIDTH);
                 scene.overlays.push(Quad::new(
@@ -1119,7 +1151,7 @@ impl Editor {
     /// Coordenadas lógicas → offset de char (columna visual, media celda).
     fn caret_at(&self, x: f32, y: f32, advance: f32) -> usize {
         let visual = ((x - CODE_X) / advance).floor().max(0.0) as usize;
-        let line_f = ((y - PADDING_TOP + self.scroll_y) / LINE_HEIGHT).floor();
+        let line_f = ((y - self.top_inset - PADDING_TOP + self.scroll_y) / LINE_HEIGHT).floor();
         let line = (line_f.max(0.0) as usize).min(self.buffer.line_count() - 1);
         let text = self.buffer.line_text(line);
         let char_col = movement::char_col_at_visual(&text, visual, TAB_WIDTH);
@@ -1138,7 +1170,7 @@ impl Editor {
     /// Garantiza que la posición `pos` (un offset de char) quede a la vista.
     fn scroll_position_into_view(&mut self, pos: usize) {
         let line = self.buffer.char_to_line(pos);
-        let top = PADDING_TOP + line as f32 * LINE_HEIGHT;
+        let top = self.top_inset + PADDING_TOP + line as f32 * LINE_HEIGHT;
         let bottom = top + LINE_HEIGHT;
         if top < self.scroll_y {
             self.scroll_y = top;
@@ -1152,13 +1184,16 @@ impl Editor {
     /// saltarse el repintar (el estado de blink se conserva).
     pub fn caret_in_view(&self) -> bool {
         let line = self.buffer.char_to_line(self.primary().caret);
-        let top = PADDING_TOP + line as f32 * LINE_HEIGHT;
+        let top = self.top_inset + PADDING_TOP + line as f32 * LINE_HEIGHT;
         let bottom = top + LINE_HEIGHT;
         bottom > self.scroll_y && top < self.scroll_y + self.viewport.1
     }
 
     fn clamp_scroll(&mut self) {
-        let content_h = PADDING_TOP + self.buffer.line_count() as f32 * LINE_HEIGHT + PADDING_TOP;
+        let content_h = self.top_inset
+            + PADDING_TOP
+            + self.buffer.line_count() as f32 * LINE_HEIGHT
+            + PADDING_TOP;
         self.scroll_y = self
             .scroll_y
             .clamp(0.0, (content_h - self.viewport.1).max(0.0));
@@ -1177,9 +1212,9 @@ fn visible_line_range(
     first.max(visible_first)..=last.min(visible_last)
 }
 
-/// Contexto de dibujo de un rango: (visible_first, visible_last, scroll_y,
-/// advance). En tupla como `quads3` para no pasar 8 argumentos sueltos.
-type RangeCtx = (usize, usize, f32, f32);
+/// Contexto de dibujo de un rango: (top_inset, visible_first, visible_last,
+/// scroll_y, advance). En tupla como `quads3` para no pasar 9 argumentos.
+type RangeCtx = (f32, usize, usize, f32, f32);
 
 /// Quad de selección/coincidencia para `range`, recortado a las líneas
 /// visibles: una sola implementación para selecciones y para la búsqueda.
@@ -1193,12 +1228,12 @@ fn push_range_quad(
     if range.is_empty() {
         return;
     }
-    let (visible_first, visible_last, scroll_y, advance) = ctx;
+    let (inset, visible_first, visible_last, scroll_y, advance) = ctx;
     let first = buffer.char_to_line(range.start);
     let last = buffer.char_to_line(range.end.saturating_sub(1));
     // Solo la intersección con lo visible: O(viewport), no O(rango).
     for line in visible_line_range(first, last, visible_first, visible_last) {
-        let y = PADDING_TOP + line as f32 * LINE_HEIGHT - scroll_y;
+        let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - scroll_y;
         let text = buffer.line_text(line);
         let line_start = buffer.line_to_char(line);
 
@@ -1281,9 +1316,9 @@ fn find_in_text(text: &str, from_col: usize, needle: &str) -> Option<usize> {
     Some(text[..start + rel].chars().count())
 }
 
-/// Ruta del archivo a abrir, si la pasaron por CLI (M9: args completos).
-pub fn cli_path() -> Option<PathBuf> {
-    std::env::args_os().nth(1).map(PathBuf::from)
+/// Archivos pasados por CLI (uno por pestaña); vacío → un editor en blanco.
+pub fn cli_paths() -> Vec<PathBuf> {
+    std::env::args_os().skip(1).map(PathBuf::from).collect()
 }
 
 #[cfg(test)]
@@ -1835,6 +1870,62 @@ mod tests {
         assert_eq!(scene.quads[0].color, SELECTION);
         assert_eq!(scene.quads[1].color, CURRENT_MATCH);
         assert_eq!(scene.quads[2].color, MATCH);
+    }
+
+    #[test]
+    fn top_inset_shifts_geometry_under_tab_bar() {
+        let mut editor = Editor::default();
+        editor.insert_text(&"pub fn f() {}\n".repeat(50));
+        editor.set_viewport(600.0, 200.0);
+        // Selección completa SIN select_all: eso no mueve el scroll (queda 0).
+        editor.cursors = vec![Cursor {
+            caret: editor.buffer.len_chars(),
+            anchor: 0,
+        }];
+        // insert_text dejó el scroll abajo del todo: fijarlo a 0 para medir
+        // el recorte de la barra sobre las primeras líneas.
+        editor.scroll_y = 0.0;
+
+        editor.set_top_inset(0.0);
+        let plain = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(plain.quads.len(), 11, "sin barra: líneas 0..=10 visibles");
+
+        editor.set_top_inset(32.0);
+        let scene = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(
+            scene.quads.len(),
+            9,
+            "con la barra de pestañas: sus 32px recortan ~1.6 líneas"
+        );
+
+        // El click en la línea 2 cae 32px más abajo (mismo offset que el dibujo).
+        let y_line2 = 32.0 + PADDING_TOP + 2.0 * LINE_HEIGHT;
+        let pos = editor.caret_at(CODE_X, y_line2, 10.0);
+        assert_eq!(
+            pos,
+            editor.buffer.line_to_char(2),
+            "caret_at compensa el inset"
+        );
+    }
+
+    #[test]
+    fn save_as_sets_path_and_writes_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuevo.rs");
+        let mut editor = Editor::default();
+        editor.insert_text("fn main() {}");
+        assert!(!editor.has_path());
+
+        editor.save_as(path.clone()).expect("guarda en disco");
+        assert!(editor.has_path(), "fija la ruta");
+        assert_eq!(editor.tab_label(), "nuevo.rs");
+        assert!(!editor.dirty(), "guardar limpia la marca de cambios");
+        let on_disk = std::fs::read_to_string(&path).expect("archivo en disco");
+        assert_eq!(on_disk, "fn main() {}");
+
+        // Sin ruta, el título usa el nombre genérico.
+        let blank = Editor::default();
+        assert_eq!(blank.tab_label(), "sin título");
     }
 
     /// Bench manual: `cargo test bench_build_scene -- --ignored --nocapture`.

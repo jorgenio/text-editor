@@ -26,5 +26,12 @@ pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# Texto y utilidades
+ropey = { version = "1.6", features = ["simd"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+bytemuck = "1"
+tempfile = "3"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"

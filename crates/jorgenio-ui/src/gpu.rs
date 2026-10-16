@@ -7,10 +7,11 @@ use wgpu::{
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
+use crate::quads::QuadRenderer;
 use crate::scene::Scene;
 use crate::text::TextLayer;
 
-/// Contexto gráfico: instancia wgpu, device/queue, surface y capa de texto.
+/// Contexto gráfico: instancia wgpu, device/queue, surface, capa de texto y quads.
 ///
 /// Invariante de drop: `window` va al final del struct para que se dropee
 /// *después* que la surface (bug conocido de wgpu: al revés crashea al cerrar).
@@ -21,6 +22,7 @@ pub struct GpuContext {
     surface: wgpu::Surface<'static>,
     config: SurfaceConfiguration,
     text: TextLayer,
+    quads: QuadRenderer,
     window: Arc<Window>,
 }
 
@@ -63,6 +65,7 @@ impl GpuContext {
             config.format,
             (config.width, config.height),
         );
+        let quads = QuadRenderer::new(&device, config.format);
 
         Self {
             instance,
@@ -71,6 +74,7 @@ impl GpuContext {
             surface,
             config,
             text,
+            quads,
             window,
         }
     }
@@ -92,7 +96,30 @@ impl GpuContext {
         self.window.request_redraw();
     }
 
-    /// Presenta un frame: clear color + textos de la [`Scene`].
+    /// Tamaño lógico actual de la ventana (px lógicos, no físicos).
+    pub fn logical_size(&self) -> (f32, f32) {
+        let size = self.window.inner_size();
+        let scale = self.scale_factor();
+        (
+            size.width as f32 / scale as f32,
+            size.height as f32 / scale as f32,
+        )
+    }
+
+    /// Avance (advance) de la fuente monoespaciada en emisiones.
+    pub fn advance_ratio(&self) -> f32 {
+        self.text.advance_ratio()
+    }
+
+    pub fn set_title(&self, title: &str) {
+        self.window.set_title(title);
+    }
+
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        self.window.set_ime_allowed(allowed);
+    }
+
+    /// Presenta un frame: clear color + quads bajo + textos + quads encima.
     pub fn render(&mut self, scene: &Scene) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -123,6 +150,14 @@ impl GpuContext {
         let resolution = (self.config.width, self.config.height);
         self.text
             .prepare(&self.device, &self.queue, scale, resolution, &scene.texts);
+        self.quads.prepare(
+            &self.device,
+            &self.queue,
+            &scene.quads,
+            &scene.overlays,
+            scale,
+            resolution,
+        );
 
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self
@@ -145,7 +180,11 @@ impl GpuContext {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let under = scene.quads.len() as u32;
+            let total = under + scene.overlays.len() as u32;
+            self.quads.draw(&mut pass, 0..under);
             self.text.render(&mut pass);
+            self.quads.draw(&mut pass, under..total);
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);

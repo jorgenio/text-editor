@@ -9,7 +9,7 @@
 
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use wgpu::{Device, MultisampleState, Queue, TextureFormat};
 
@@ -37,6 +37,8 @@ pub struct TextLayer {
     renderer: TextRenderer,
     buffers: Vec<SpanBuffer>,
     resolution: (u32, u32),
+    /// Avance (advance) de la fuente monoespaciada en emisiones (≈ 0.6).
+    advance_ratio: f32,
 }
 
 impl TextLayer {
@@ -50,6 +52,7 @@ impl TextLayer {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(FALLBACK_FONT.to_vec());
         font_system.db_mut().set_monospace_family(MONO_FAMILY);
+        let advance_ratio = probe_advance_ratio(&mut font_system);
 
         let cache = Cache::new(device);
         let mut viewport = Viewport::new(device, &cache);
@@ -73,7 +76,13 @@ impl TextLayer {
             renderer,
             buffers: Vec::new(),
             resolution,
+            advance_ratio,
         }
+    }
+
+    /// Avance por emisión de la fuente monoespaciada (JetBrains Mono ≈ 0.6).
+    pub fn advance_ratio(&self) -> f32 {
+        self.advance_ratio
     }
 
     /// Re-shapea lo stale y sube los glifos al atlas. Llamar antes del render pass.
@@ -111,6 +120,9 @@ impl TextLayer {
                 Metrics::new(size_px, size_px * LINE_HEIGHT_FACTOR),
             );
             buffer.set_size(Some(resolution.0 as f32), Some(resolution.1 as f32));
+            // Sin wrap: una línea = un span; los tabs usan el mismo ancho que el editor.
+            buffer.set_wrap(Wrap::None);
+            buffer.set_tab_width(TAB_WIDTH as u16);
             buffer.set_text(
                 &span.text,
                 &Attrs::new().family(Family::Monospace),
@@ -173,4 +185,25 @@ impl TextLayer {
     pub fn trim(&mut self) {
         self.atlas.trim();
     }
+}
+
+/// Tab width en celdas (debe coincidir con el editor; unificado en settings, M11).
+const TAB_WIDTH: usize = 4;
+
+/// Mide el advance de "M" a size 100 px y lo normaliza por emisión.
+fn probe_advance_ratio(font_system: &mut FontSystem) -> f32 {
+    let mut buffer = Buffer::new(font_system, Metrics::new(100.0, 140.0));
+    buffer.set_size(Some(400.0), Some(200.0));
+    buffer.set_text(
+        "M",
+        &Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+        .layout_runs()
+        .next()
+        .and_then(|run| run.glyphs.first())
+        .map_or(0.6, |glyph| glyph.w / 100.0)
 }

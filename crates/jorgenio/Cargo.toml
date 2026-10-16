@@ -10,6 +10,7 @@ name = "jorgenio"
 path = "src/main.rs"
 
 [dependencies]
+jorgenio-core.workspace = true
 jorgenio-ui.workspace = true
 winit.workspace = true
 pollster.workspace = true

@@ -1,19 +1,45 @@
 use std::sync::Arc;
 
 use jorgenio_ui::gpu::{self, GpuContext};
+use jorgenio_ui::scene::{Scene, TextSpan};
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::Window;
 
-/// Fondo tipo Monokai (el tema clásico de Sublime Text): #272822.
+/// Paleta Monokai (el tema clásico de Sublime Text).
 const BG: (u8, u8, u8) = (0x27, 0x28, 0x22);
+const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
+const GREEN: (u8, u8, u8) = (0xA6, 0xE2, 0x2E);
+const CYAN: (u8, u8, u8) = (0x66, 0xD9, 0xEF);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut Application::default())?;
     Ok(())
+}
+
+fn build_scene(scale: f64) -> Scene {
+    let mut scene = Scene::new(gpu::srgb(BG.0, BG.1, BG.2));
+    scene
+        .texts
+        .push(TextSpan::new("Jorgenio Text", 24.0, 24.0, 28.0, FG));
+    scene.texts.push(TextSpan::new(
+        "M1 — texto con glyphon: fuentes del sistema + JetBrains Mono embebida (OFL)",
+        24.0,
+        72.0,
+        14.0,
+        GREEN,
+    ));
+    scene.texts.push(TextSpan::new(
+        format!("scale_factor = {scale:.2} · la ventana mantiene el tamaño lógico"),
+        24.0,
+        98.0,
+        14.0,
+        CYAN,
+    ));
+    scene
 }
 
 #[derive(Default)]
@@ -56,7 +82,11 @@ impl winit::application::ApplicationHandler for Application {
 
         match event {
             WindowEvent::Resized(size) => gpu.resize(size),
-            WindowEvent::RedrawRequested => gpu.render(gpu::srgb(BG.0, BG.1, BG.2)),
+            WindowEvent::ScaleFactorChanged { .. } => gpu.request_redraw(),
+            WindowEvent::RedrawRequested => {
+                let scale = gpu.scale_factor();
+                gpu.render(&build_scene(scale));
+            }
             WindowEvent::CloseRequested => event_loop.exit(),
             _ => {}
         }

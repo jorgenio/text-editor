@@ -9,6 +9,7 @@ description = "Render (wgpu + glyphon) y widgets de chrome de Jorgenio Text"
 winit.workspace = true
 wgpu.workspace = true
 log.workspace = true
+glyphon = "0.12"
 
 [lints]
 workspace = true

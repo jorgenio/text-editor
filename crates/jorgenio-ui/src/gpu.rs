@@ -7,7 +7,10 @@ use wgpu::{
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
-/// Contexto gráfico: instancia wgpu, device/queue y surface de la ventana.
+use crate::scene::Scene;
+use crate::text::TextLayer;
+
+/// Contexto gráfico: instancia wgpu, device/queue, surface y capa de texto.
 ///
 /// Invariante de drop: `window` va al final del struct para que se dropee
 /// *después* que la surface (bug conocido de wgpu: al revés crashea al cerrar).
@@ -17,6 +20,7 @@ pub struct GpuContext {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: SurfaceConfiguration,
+    text: TextLayer,
     window: Arc<Window>,
 }
 
@@ -53,12 +57,20 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
+        let text = TextLayer::new(
+            &device,
+            &queue,
+            config.format,
+            (config.width, config.height),
+        );
+
         Self {
             instance,
             device,
             queue,
             surface,
             config,
+            text,
             window,
         }
     }
@@ -72,12 +84,16 @@ impl GpuContext {
         self.surface.configure(&self.device, &self.config);
     }
 
+    pub fn scale_factor(&self) -> f64 {
+        self.window.scale_factor()
+    }
+
     pub fn request_redraw(&self) {
         self.window.request_redraw();
     }
 
-    /// Presenta un frame con un color plano. En M1 aquí entra glyphon.
-    pub fn render(&mut self, clear: wgpu::Color) {
+    /// Presenta un frame: clear color + textos de la [`Scene`].
+    pub fn render(&mut self, scene: &Scene) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -103,20 +119,24 @@ impl GpuContext {
             }
         };
 
+        let scale = self.window.scale_factor();
+        let resolution = (self.config.width, self.config.height);
+        self.text
+            .prepare(&self.device, &self.queue, scale, resolution, &scene.texts);
+
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            // El clear lo ejecuta el LoadOp, sin draw calls.
-            let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(clear),
+                        load: LoadOp::Clear(scene.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -125,9 +145,11 @@ impl GpuContext {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.text.render(&mut pass);
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
+        self.text.trim();
     }
 }
 

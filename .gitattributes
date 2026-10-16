@@ -1,0 +1,2 @@
+# LF en todos los SO: `cargo fmt --check` debe pasar igual en Windows y Ubuntu.
+* text=auto eol=lf

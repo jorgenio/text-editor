@@ -23,7 +23,7 @@ use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::Window;
+use winit::window::{CursorIcon, Window};
 
 /// Ventana de doble/triple click (misma "tanda" de clicks).
 const CLICK_WINDOW: Duration = Duration::from_millis(450);
@@ -82,6 +82,10 @@ struct Application {
     mouse_down: bool,
     drag_origin: Option<LogicalPosition<f32>>,
     drag_active: bool,
+    /// Arrastre del divisor de paneles activo: Some(x) con la última x.
+    divider_drag: Option<f32>,
+    /// Icono actual del cursor (para no pisarlo en cada movimiento).
+    cursor_icon: CursorIcon,
 }
 
 impl Application {
@@ -109,6 +113,8 @@ impl Application {
             mouse_down: false,
             drag_origin: None,
             drag_active: false,
+            divider_drag: None,
+            cursor_icon: CursorIcon::Default,
         }
     }
 }
@@ -632,23 +638,22 @@ impl winit::application::ApplicationHandler for Application {
                 let advance = gpu.advance_ratio();
                 // Preferencias → glifos (no-op si el ancho no cambió).
                 gpu.set_tab_width(self.settings.tab_width as u16);
-                // Cada grupo ocupa una columna de ancho igual; su editor vive
-                // debajo de la barra (inset superior) y a la derecha de su
-                // origen horizontal (inset izquierdo).
+                // Cada grupo ocupa una columna; con split, el reparto lo
+                // decide el divisor arrastrable (`split_ratio`).
                 let group_count = self.tabs.group_count();
-                let gw = viewport.0 / group_count as f32;
+                let geometry = self.tabs.group_geometry(viewport.0);
                 let editor_h = (viewport.1 - TAB_BAR_H).max(50.0);
-                for g in 0..group_count {
-                    self.tabs.set_group_geometry(g, g as f32 * gw, gw, editor_h);
+                for (g, &(x, w)) in geometry.iter().enumerate() {
+                    self.tabs.set_group_geometry(g, x, w, editor_h);
                 }
                 // Une las escenas de todos los grupos: sus franjas en x son
                 // disjuntas, así que el orden entre paneles es indiferente.
                 let mut scene: Option<Scene> = None;
-                for g in 0..group_count {
+                for (g, &(_, w)) in geometry.iter().enumerate() {
                     let part = self
                         .tabs
                         .group_active_mut(g)
-                        .build_scene((gw, editor_h), advance);
+                        .build_scene((w, editor_h), advance);
                     match &mut scene {
                         Some(all) => all.append(part),
                         None => scene = Some(part),
@@ -660,6 +665,16 @@ impl winit::application::ApplicationHandler for Application {
                     viewport,
                     self.settings.font_size as f32 * advance,
                 );
+                // Divisor entre paneles: filete de 2 px a todo lo alto, por
+                // encima de los editores (el aviso y la paleta van después).
+                if group_count > 1 {
+                    let edge = Theme::from_name(&self.settings.theme).tab_edge;
+                    for &(x, _) in geometry.iter().skip(1) {
+                        scene
+                            .top_quads
+                            .push(Quad::new(x - 1.0, 0.0, 2.0, viewport.1, edge));
+                    }
+                }
                 self.search.render(
                     &mut scene,
                     viewport,
@@ -811,6 +826,31 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = gpu.scale_factor();
                 self.cursor = position.to_logical::<f32>(scale);
+                let width = gpu.logical_size().0;
+                if let Some(last_x) = self.divider_drag {
+                    // Arrastre del divisor: solo se mueve el filete.
+                    let dx = self.cursor.x - last_x;
+                    self.divider_drag = Some(self.cursor.x);
+                    self.tabs.drag_divider(dx, width);
+                    gpu.request_redraw();
+                    return;
+                }
+                // Flecha de resize al pasar por el divisor (con overlays
+                // cerrados; durante un arrastre de texto no se toca).
+                if !self.mouse_down {
+                    let icon = if self.tabs.over_divider(self.cursor.x, width)
+                        && !self.palette.is_open()
+                        && !self.search.is_open()
+                    {
+                        CursorIcon::EwResize
+                    } else {
+                        CursorIcon::Default
+                    };
+                    if icon != self.cursor_icon {
+                        gpu.window().set_cursor(icon);
+                        self.cursor_icon = icon;
+                    }
+                }
                 if self.mouse_down {
                     if !self.drag_active
                         && let Some(origin) = self.drag_origin
@@ -881,6 +921,17 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
+                // Divisor entre paneles: el click lo inicia; no llega ni a
+                // la barra ni al editor (el icono vuelve a flecha al soltar).
+                let width = gpu.logical_size().0;
+                if self.tabs.over_divider(self.cursor.x, width) {
+                    self.divider_drag = Some(self.cursor.x);
+                    self.mouse_down = false;
+                    gpu.window().set_cursor(CursorIcon::EwResize);
+                    self.cursor_icon = CursorIcon::EwResize;
+                    gpu.request_redraw();
+                    return;
+                }
                 // Barra de pestañas: cambiar de pestaña o de grupo (el click
                 // resuelve grupo+tab). Sin arrastre ni caret: termina aquí.
                 if let Some((group, tab)) = self.tabs.click(self.cursor.x, self.cursor.y) {
@@ -890,9 +941,7 @@ impl winit::application::ApplicationHandler for Application {
                 }
                 // Click en otro panel: ese grupo toma el foco (como Sublime)
                 // y su editor activo coloca el caret.
-                let group_count = self.tabs.group_count();
-                let gw = gpu.logical_size().0 / group_count as f32;
-                let group = ((self.cursor.x / gw).floor().max(0.0) as usize).min(group_count - 1);
+                let group = self.tabs.group_at_x(self.cursor.x, width);
                 focus_group(&mut self.tabs, group);
                 // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
                 let mut count = 1;
@@ -924,6 +973,10 @@ impl winit::application::ApplicationHandler for Application {
                 button: MouseButton::Left,
                 ..
             } => {
+                if self.divider_drag.take().is_some() {
+                    gpu.window().set_cursor(CursorIcon::Default);
+                    self.cursor_icon = CursorIcon::Default;
+                }
                 self.mouse_down = false;
                 self.drag_active = false;
                 self.drag_origin = None;
@@ -937,9 +990,7 @@ impl winit::application::ApplicationHandler for Application {
                 };
                 // Rueda sobre el panel bajo el cursor (sin robar el foco, como
                 // Sublime); si el cursor aún no se movió → grupo 0.
-                let group_count = self.tabs.group_count();
-                let gw = gpu.logical_size().0 / group_count as f32;
-                let group = ((self.cursor.x / gw).floor().max(0.0) as usize).min(group_count - 1);
+                let group = self.tabs.group_at_x(self.cursor.x, gpu.logical_size().0);
                 self.tabs.group_active_mut(group).on_wheel(dy);
                 gpu.request_redraw();
             }

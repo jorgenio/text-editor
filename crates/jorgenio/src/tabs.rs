@@ -18,6 +18,10 @@ const TAB_MIN_W: f32 = 96.0;
 const TAB_MAX_W: f32 = 220.0;
 /// Margen horizontal del texto dentro de la pestaña.
 const TAB_PAD: f32 = 14.0;
+/// Ancho mínimo de cada panel al arrastrar el divisor (px lógicos).
+const MIN_PANEL_W: f32 = 80.0;
+/// Margen de agarre del divisor alrededor de su eje (px lógicos).
+const DIVIDER_GRAB: f32 = 4.0;
 
 /// Un grupo (columna del split) con sus pestañas y su activa.
 struct Group {
@@ -41,6 +45,10 @@ pub struct Tabs {
     theme: Theme,
     /// Tamaño de la etiqueta de pestaña en px (lo fija `apply_prefs`).
     font_size: f32,
+    /// Fracción del ancho de ventana que ocupa el grupo izquierdo (0..1).
+    /// Solo importa con 2 grupos; se recuerda entre splits (lo mueve el
+    /// divisor arrastrable). Invariante: 0 < split_ratio < 1.
+    split_ratio: f32,
 }
 
 impl Tabs {
@@ -55,6 +63,7 @@ impl Tabs {
             layout: Vec::new(),
             theme: Theme::dark(),
             font_size: FONT_SIZE,
+            split_ratio: 0.5,
         }
     }
 
@@ -71,6 +80,7 @@ impl Tabs {
             layout: Vec::new(),
             theme: Theme::dark(),
             font_size: FONT_SIZE,
+            split_ratio: 0.5,
         }
     }
 
@@ -188,6 +198,40 @@ impl Tabs {
         editor.set_left_inset(x);
         editor.set_top_inset(TAB_BAR_H);
         editor.set_viewport(w, editor_h);
+    }
+
+    /// `(x, ancho)` de cada grupo para un `width` de ventana: un solo
+    /// grupo ocupa todo; con split, el reparto sale de `split_ratio`.
+    pub fn group_geometry(&self, width: f32) -> Vec<(f32, f32)> {
+        if self.groups.len() < 2 {
+            return vec![(0.0, width)];
+        }
+        let left = width * self.split_ratio;
+        vec![(0.0, left), (left, width - left)]
+    }
+
+    /// Índice del grupo bajo la coordenada `x` (para clicks y rueda).
+    pub fn group_at_x(&self, x: f32, width: f32) -> usize {
+        match self
+            .group_geometry(width)
+            .iter()
+            .position(|&(gx, gw)| x < gx + gw)
+        {
+            Some(group) => group,
+            None => self.groups.len() - 1,
+        }
+    }
+
+    /// ¿`x` cae sobre el divisor entre paneles (a cualquier altura)?
+    pub fn over_divider(&self, x: f32, width: f32) -> bool {
+        self.groups.len() >= 2 && (x - width * self.split_ratio).abs() <= DIVIDER_GRAB
+    }
+
+    /// Mueve el divisor `delta` px, recortando para que ningún panel baje
+    /// de [`MIN_PANEL_W`]. La proporción queda guardada en `split_ratio`.
+    pub fn drag_divider(&mut self, delta: f32, width: f32) {
+        let min = (MIN_PANEL_W / width).clamp(0.05, 0.45);
+        self.split_ratio = (self.split_ratio + delta / width).clamp(min, 1.0 - min);
     }
 
     /// Aplica preferencias a TODOS los editores abiertos (todos los grupos);
@@ -631,5 +675,75 @@ mod tests {
         tabs.render(&mut scene, (800.0, 600.0), 16.0);
         let label = scene.top_texts.first().expect("etiqueta dibujada");
         assert_eq!(label.size, 24.0, "tope por la altura de la barra");
+    }
+
+    #[test]
+    fn group_geometry_splits_by_ratio_and_divider_follows_it() {
+        let mut tabs = Tabs::new(Editor::default());
+        assert_eq!(
+            tabs.group_geometry(1000.0),
+            vec![(0.0, 1000.0)],
+            "un solo grupo ocupa todo el ancho"
+        );
+        assert_eq!(tabs.group_at_x(500.0, 1000.0), 0);
+        assert!(
+            !tabs.over_divider(500.0, 1000.0),
+            "sin split no hay divisor"
+        );
+
+        tabs.split();
+        assert_eq!(
+            tabs.group_geometry(1000.0),
+            vec![(0.0, 500.0), (500.0, 500.0)],
+            "reparto por defecto 50/50"
+        );
+        assert!(tabs.over_divider(500.0, 1000.0), "sobre el eje");
+        assert!(tabs.over_divider(503.0, 1000.0), "el agarre es de pocos px");
+        assert!(!tabs.over_divider(510.0, 1000.0), "fuera del agarre");
+        assert_eq!(tabs.group_at_x(501.0, 1000.0), 1, "click a la derecha");
+
+        // 0.5 + 125/1000 = 0.625 (exacto en binario): 625/375.
+        tabs.drag_divider(125.0, 1000.0);
+        assert_eq!(
+            tabs.group_geometry(1000.0),
+            vec![(0.0, 625.0), (625.0, 375.0)],
+            "el divisor sigue al arrastre"
+        );
+        assert!(tabs.over_divider(625.0, 1000.0), "el divisor se mueve");
+
+        tabs.drag_divider(-10_000.0, 1000.0);
+        let left = tabs.group_geometry(1000.0)[0].1;
+        assert!(
+            (left - 80.0).abs() < 0.01,
+            "ancho mínimo izquierdo, got {left}"
+        );
+        tabs.drag_divider(10_000.0, 1000.0);
+        let right = tabs.group_geometry(1000.0)[1].1;
+        assert!(
+            (right - 80.0).abs() < 0.01,
+            "ancho mínimo derecho, got {right}"
+        );
+    }
+
+    #[test]
+    fn unsplit_remembers_the_ratio_for_the_next_split() {
+        let mut tabs = Tabs::new(Editor::default());
+        tabs.split();
+        tabs.drag_divider(100.0, 1000.0); // 0.5 + 0.1 = 0.6
+
+        tabs.unsplit();
+        assert_eq!(
+            tabs.group_geometry(1200.0),
+            vec![(0.0, 1200.0)],
+            "sin split vuelve a un panel"
+        );
+        assert!(!tabs.over_divider(600.0, 1200.0));
+
+        tabs.split();
+        let left = tabs.group_geometry(1000.0)[0].1;
+        assert!(
+            (left - 600.0).abs() < 0.01,
+            "recuerda el reparto arrastrado"
+        );
     }
 }

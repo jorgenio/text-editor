@@ -121,6 +121,11 @@ impl GpuContext {
         self.window.set_title(title);
     }
 
+    /// La ventana subyacente (tamaño real, cursor…).
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
     pub fn set_ime_allowed(&self, allowed: bool) {
         self.window.set_ime_allowed(allowed);
     }

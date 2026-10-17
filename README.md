@@ -11,8 +11,9 @@ Linux (la CI compueba ambos).
   nativos) y aviso efímero al guardar.
 - Resaltado de sintaxis por gramática (Rust, Python, JS… + texto plano) con
   dos paletas: **Monokai** (oscuro, por defecto) e **InspiredGitHub** (claro).
-- Pestañas, división vertical de paneles (Ctrl+\\) y foco por panel con el
-  ratón.
+- Pestañas, división vertical de paneles (Ctrl+\\) con **divisor
+  arrastrable** (reparto a medida, mínimo 80 px por panel) y foco por
+  panel con el ratón.
 - Selección múltiple: Alt+click, Ctrl+D (siguiente coincidencia) y
   Ctrl+Alt+↑/↓ (cursores en columna).
 - Buscar/reemplazar con resaltado incremental (Enter/F3 navegan; Ctrl+Enter
@@ -21,7 +22,8 @@ Linux (la CI compueba ambos).
   con fuzzy matching.
 - Comentarios por lenguaje (Ctrl+/) y snippets con Tab (for, if, fn…).
 - Preferencias en `settings.json` con comentarios (JSONC) que se aplican al
-  guardar el archivo.
+  guardar el archivo; el tamaño de la ventana se recuerda en `session.json`
+  (estado, no preferencia).
 - Tema claro/oscuro con Ctrl+T (sesión) o persistente desde preferencias.
 
 ## Requisitos
@@ -117,6 +119,11 @@ los fuera de rango se recortan.
 El cambio de tema con Ctrl+T es **solo de sesión**: para que perviva,
 escribe `"theme": "light"` en el archivo y guárdalo. La paleta de comandos
 y los avisos se pintan siempre en tono oscuro por encima del tema activo.
+
+Con dos paneles, el **divisor** (filete vertical) se arrastra con el ratón
+para repartir el ancho; el reparto se recuerda para el siguiente Ctrl+\.
+Al cerrar la ventana se guarda su tamaño en `session.json` (junto a
+`settings.json`; es estado de sesión, no una preferencia editable).
 
 ## Desarrollo
 

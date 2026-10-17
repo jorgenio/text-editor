@@ -4,6 +4,7 @@ mod commands;
 mod editor;
 mod palette;
 mod search;
+mod session;
 mod settings;
 mod snippets;
 mod tabs;
@@ -550,9 +551,14 @@ impl winit::application::ApplicationHandler for Application {
             return;
         }
 
+        // Tamaño recordado de la sesión anterior (clampeado en Session::new).
+        let session = session::load();
         let attrs = Window::default_attributes()
             .with_title(self.tabs.active().title())
-            .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                session.window_width,
+                session.window_height,
+            ));
         let window = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -627,7 +633,18 @@ impl winit::application::ApplicationHandler for Application {
                 gpu.resize(size);
             }
             WindowEvent::ScaleFactorChanged { .. } => gpu.request_redraw(),
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Recuerda el tamaño lógico de la ventana para el próximo
+                // arranque (los errores solo se loguean: cerrar manda).
+                let size = gpu.window().inner_size();
+                let scale = gpu.scale_factor();
+                let session = session::Session::new(
+                    (size.width as f64 / scale).round() as u32,
+                    (size.height as f64 / scale).round() as u32,
+                );
+                session::save(&session);
+                event_loop.exit();
+            }
             WindowEvent::Focused(focused) => {
                 self.tabs.active_mut().set_focused(focused);
                 gpu.request_redraw();

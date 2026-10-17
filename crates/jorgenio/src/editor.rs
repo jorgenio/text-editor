@@ -2232,8 +2232,10 @@ mod tests {
 
     #[test]
     fn set_theme_recolors_syntax_tokens() {
-        let mut editor = Editor::default();
-        editor.lang = "rs".to_owned();
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
         editor.insert_text("fn x() {}");
         editor.cursors = vec![Cursor::new(0)];
 

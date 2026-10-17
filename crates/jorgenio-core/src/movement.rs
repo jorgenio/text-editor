@@ -198,6 +198,92 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Inicio de la palabra anterior (Ctrl+←): salta espacios hacia atrás y
+/// luego el run entero (palabra o puntuación). Cruza líneas; en el inicio
+/// del buffer devuelve 0.
+pub fn word_left(buffer: &Buffer, pos: usize) -> usize {
+    let len = buffer.len_chars();
+    let mut pos = pos.min(len);
+    if pos == 0 {
+        return 0;
+    }
+    loop {
+        let line = buffer.char_to_line(pos);
+        let line_start = buffer.line_to_char(line);
+        let chars: Vec<char> = buffer.line_text(line).chars().collect();
+        let mut col = (pos - line_start).min(chars.len());
+
+        // 1) Espacios hacia atrás (el \n se resuelve al bajar de línea).
+        while col > 0 && chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        // 2) Run actual (palabra o puntuación) hacia atrás → su inicio.
+        if col > 0 {
+            let word = is_word_char(chars[col - 1]);
+            while col > 0 && !chars[col - 1].is_whitespace() && is_word_char(chars[col - 1]) == word
+            {
+                col -= 1;
+            }
+            return line_start + col;
+        }
+        // 3) Inicio de línea: el \n de la anterior es un espacio más.
+        if line == 0 {
+            return 0;
+        }
+        pos = line_start - 1;
+    }
+}
+
+/// Inicio de la palabra siguiente (Ctrl+→): consume el run actual, salta
+/// los espacios (y líneas) y para en el primer char no-blanco.
+pub fn word_right(buffer: &Buffer, pos: usize) -> usize {
+    let len = buffer.len_chars();
+    let mut pos = pos.min(len);
+    if pos >= len {
+        return len;
+    }
+    loop {
+        let line = buffer.char_to_line(pos);
+        let line_start = buffer.line_to_char(line);
+        let chars: Vec<char> = buffer.line_text(line).chars().collect();
+        let mut col = (pos - line_start).min(chars.len());
+
+        // 1) Run actual (palabra o puntuación) hacia delante.
+        if col < chars.len() && !chars[col].is_whitespace() {
+            let word = is_word_char(chars[col]);
+            while col < chars.len()
+                && !chars[col].is_whitespace()
+                && is_word_char(chars[col]) == word
+            {
+                col += 1;
+            }
+        }
+        // 2) Espacios hacia delante dentro de la línea.
+        while col < chars.len() && chars[col].is_whitespace() {
+            col += 1;
+        }
+        if col < chars.len() {
+            return line_start + col;
+        }
+        // 3) Fin de línea: el \n es espacio; se pasa a la siguiente.
+        let next = line_start + chars.len() + 1;
+        if next >= len {
+            return len;
+        }
+        pos = next;
+        // Tras cruzar, si la línea empieza por run no-ws, AHÍ se para
+        // (una sola pulsación no salta dos palabras).
+        let next_line = buffer.char_to_line(pos);
+        let next_start = buffer.line_to_char(next_line);
+        let next_chars: Vec<char> = buffer.line_text(next_line).chars().collect();
+        let next_col = pos - next_start;
+        if next_col < next_chars.len() && !next_chars[next_col].is_whitespace() {
+            return pos;
+        }
+        // Si empieza por espacios (o está vacía), el bucle los salta.
+    }
+}
+
 /// Rango de la línea completa (incluye su `\n`; la última usa el fin del buffer).
 pub fn line_range(buffer: &Buffer, line: usize) -> std::ops::Range<usize> {
     let start = buffer.line_to_char(line);
@@ -310,5 +396,39 @@ mod tests {
     fn visual_columns_at_handles_empty_line_and_no_targets() {
         assert_eq!(visual_columns_at("", &[0, 3], 4), vec![0, 0]);
         assert!(visual_columns_at("hola", &[], 4).is_empty());
+    }
+
+    #[test]
+    fn word_motion_crosses_words_spaces_and_lines() {
+        // 0123456 7 89 0123456 → "foo bar\n  baz(qux" (len 17)
+        let buffer = Buffer::from_text("foo bar\n  baz(qux");
+        // word_right: run + espacios → inicio de la siguiente run.
+        assert_eq!(word_right(&buffer, 0), 4, "foo → bar");
+        assert_eq!(word_right(&buffer, 3), 4, "del espacio salta a bar");
+        assert_eq!(word_right(&buffer, 4), 10, "bar → cruza el \\n → baz");
+        assert_eq!(word_right(&buffer, 7), 10, "desde el \\n → baz");
+        assert_eq!(word_right(&buffer, 8), 10, "los espacios se saltan");
+        assert_eq!(word_right(&buffer, 10), 13, "baz → el paréntesis");
+        assert_eq!(word_right(&buffer, 13), 14, "( → qux");
+        assert_eq!(
+            word_right(&buffer, 14),
+            buffer.len_chars(),
+            "al final → len"
+        );
+
+        // word_left: espacios y luego el run entero hacia su inicio.
+        assert_eq!(word_left(&buffer, 4), 0, "bar → foo");
+        assert_eq!(word_left(&buffer, 2), 0, "en medio de foo → su inicio");
+        assert_eq!(word_left(&buffer, 10), 4, "baz → inicio de bar");
+        assert_eq!(word_left(&buffer, 7), 4, "desde el \\n → bar");
+        let buffer2 = Buffer::from_text("ab cd");
+        assert_eq!(word_left(&buffer2, 3), 0, "inicio de cd → inicio de ab");
+        assert_eq!(word_left(&buffer2, 0), 0, "ya en el inicio");
+        assert_eq!(word_right(&buffer2, 5), 5, "ya en el final");
+
+        // Línea vacía en medio: el salto la atraviesa.
+        let gaps = Buffer::from_text("a\n\nb");
+        assert_eq!(word_right(&gaps, 1), 3, "a → atraviesa la línea vacía → b");
+        assert_eq!(word_left(&gaps, 3), 0, "b → a");
     }
 }

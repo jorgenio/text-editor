@@ -353,8 +353,18 @@ impl Editor {
             return false;
         }
         let shift = modifiers.shift_key();
+        let ctrl = modifiers.control_key() || modifiers.super_key();
+        let alt = modifiers.alt_key();
 
         let handled = match key {
+            Key::Named(NamedKey::Backspace) if ctrl => {
+                self.delete_word_left();
+                true
+            }
+            Key::Named(NamedKey::Delete) if ctrl => {
+                self.delete_word_right();
+                true
+            }
             Key::Named(NamedKey::Backspace) => {
                 self.backspace();
                 true
@@ -377,6 +387,20 @@ impl Editor {
             }
             Key::Named(NamedKey::Escape) => {
                 self.collapse_to_primary();
+                true
+            }
+            Key::Named(NamedKey::ArrowLeft) if ctrl && !alt => {
+                self.move_cursors(
+                    |cursor, buffer| movement::word_left(buffer, cursor.caret),
+                    shift,
+                );
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) if ctrl && !alt => {
+                self.move_cursors(
+                    |cursor, buffer| movement::word_right(buffer, cursor.caret),
+                    shift,
+                );
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -434,10 +458,7 @@ impl Editor {
                 true
             }
             Key::Named(NamedKey::Home) => {
-                self.move_cursors(
-                    |cursor, buffer| movement::line_start(buffer, cursor.caret),
-                    shift,
-                );
+                self.smart_home(shift);
                 true
             }
             Key::Named(NamedKey::End) => {
@@ -569,6 +590,85 @@ impl Editor {
             }
         });
         self.reset_caret_blink();
+    }
+
+    /// Ctrl+Backspace: borra hacia atrás hasta el inicio de la palabra
+    /// (con selección se comporta como Backspace normal).
+    pub fn delete_word_left(&mut self) {
+        if self.cursors.iter().any(|cursor| cursor.has_selection()) {
+            self.backspace();
+            return;
+        }
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let caret = editor.cursors[i].caret;
+                let start = movement::word_left(&editor.buffer, caret);
+                if start == caret {
+                    continue;
+                }
+                editor.buffer.delete(start..caret);
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, start, caret, 0);
+                    other.anchor = shift_after(other.anchor, start, caret, 0);
+                }
+                editor.cursors[i].caret = start;
+                editor.cursors[i].anchor = start;
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Ctrl+Delete: borra hacia delante hasta el inicio de la palabra
+    /// siguiente (con selección se comporta como Delete normal).
+    pub fn delete_word_right(&mut self) {
+        if self.cursors.iter().any(|cursor| cursor.has_selection()) {
+            self.delete_forward();
+            return;
+        }
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let caret = editor.cursors[i].caret;
+                let end = movement::word_right(&editor.buffer, caret);
+                if end == caret {
+                    continue;
+                }
+                editor.buffer.delete(caret..end);
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, caret, end, 0);
+                    other.anchor = shift_after(other.anchor, caret, end, 0);
+                }
+                editor.cursors[i].caret = caret;
+                editor.cursors[i].anchor = caret;
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Home inteligente (Sublime): alterna entre la primera columna y el
+    /// primer carácter no-blanco de la línea.
+    fn smart_home(&mut self, shift: bool) {
+        self.move_cursors(
+            |cursor, buffer| {
+                let line = buffer.char_to_line(cursor.caret);
+                let line_start = buffer.line_to_char(line);
+                let first = buffer
+                    .line_text(line)
+                    .chars()
+                    .take_while(|c| c.is_whitespace() && *c != '\n')
+                    .count();
+                let target = line_start + first;
+                if cursor.caret == target {
+                    line_start
+                } else {
+                    target
+                }
+            },
+            shift,
+        );
     }
 
     /// Texto de TODAS las selecciones unidas con `\n` (portapapeles).
@@ -1749,6 +1849,64 @@ mod tests {
         assert_eq!(text_of(&editor), "a");
         assert!(editor.undo(), "los backspaces se deshacen juntos");
         assert_eq!(text_of(&editor), "abc");
+    }
+
+    #[test]
+    fn ctrl_arrow_moves_by_words_and_ctrl_backspace_deletes() {
+        let mut editor = Editor::default();
+        editor.insert_text("foo bar baz");
+        editor.cursors = vec![Cursor::new(0)];
+        let left = Key::Named(NamedKey::ArrowLeft);
+        let right = Key::Named(NamedKey::ArrowRight);
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        editor.handle_key(&right, ctrl);
+        assert_eq!(editor.primary().caret, 4, "inicio de bar");
+        editor.handle_key(&right, ctrl);
+        assert_eq!(editor.primary().caret, 8, "inicio de baz");
+        editor.handle_key(&right, ctrl);
+        assert_eq!(editor.primary().caret, 11, "al final del buffer");
+        editor.handle_key(&left, ctrl);
+        assert_eq!(editor.primary().caret, 8, "vuelve a baz");
+        editor.handle_key(&left, ctrl);
+        assert_eq!(editor.primary().caret, 4, "vuelve a bar");
+        editor.handle_key(&left, ctrl);
+        assert_eq!(editor.primary().caret, 0, "vuelve a foo");
+
+        // Con Shift la palabra queda seleccionada.
+        editor.handle_key(&right, ctrl_shift);
+        assert_eq!(editor.primary().range(), 0..4);
+
+        // Ctrl+Backspace con selección la borra como Backspace normal.
+        editor.handle_key(&Key::Named(NamedKey::Backspace), ctrl);
+        assert_eq!(text_of(&editor), "bar baz", "borra la selección 0..4");
+
+        // Sin selección borra hasta el inicio de la palabra anterior.
+        editor.handle_key(&right, ctrl); // al inicio de "baz"
+        editor.handle_key(&Key::Named(NamedKey::Backspace), ctrl);
+        assert_eq!(
+            text_of(&editor),
+            "baz",
+            "desde el inicio de baz borra 'bar ' entero"
+        );
+        // El historial fusiona deletes contiguos: el undo restaura el bloque.
+        assert!(editor.undo());
+        assert_eq!(text_of(&editor), "foo bar baz");
+    }
+
+    #[test]
+    fn home_toggles_between_column_zero_and_first_non_blank() {
+        let mut editor = Editor::default();
+        editor.insert_text("    código");
+        let home = Key::Named(NamedKey::Home);
+
+        editor.handle_key(&home, ModifiersState::empty());
+        assert_eq!(editor.primary().caret, 4, "al primer no-blanco");
+        editor.handle_key(&home, ModifiersState::empty());
+        assert_eq!(editor.primary().caret, 0, "de vuelta a la columna 0");
+        editor.handle_key(&home, ModifiersState::empty());
+        assert_eq!(editor.primary().caret, 4, "y otra vez al no-blanco");
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub struct Settings {
     pub show_line_numbers: bool,
     /// Parpadeo del caret en ms (50-10000).
     pub caret_blink_ms: u64,
+    /// Tema de colores: "dark" (Monokai, por defecto) o "light".
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -30,6 +32,7 @@ impl Default for Settings {
             tab_width: 4,
             show_line_numbers: true,
             caret_blink_ms: 530,
+            theme: "dark".to_owned(),
         }
     }
 }
@@ -160,12 +163,17 @@ pub fn jsonc_to_json(input: &str) -> String {
 }
 
 /// Parsea el contenido de `settings.json`; errores y valores fuera de rango
-/// se normalizan (tab 1-32, blink 50-10000 ms).
+/// se normalizan (tab 1-32, blink 50-10000 ms, tema → "dark"/"light").
 pub fn parse(text: &str) -> Result<Settings, String> {
     let json = jsonc_to_json(text);
     let mut settings: Settings = serde_json::from_str(&json).map_err(|err| err.to_string())?;
     settings.tab_width = settings.tab_width.clamp(1, 32);
     settings.caret_blink_ms = settings.caret_blink_ms.clamp(50, 10_000);
+    // Solo existen dos temas: cualquier valor desconocido vuelve al oscuro.
+    settings.theme = settings.theme.trim().to_lowercase();
+    if settings.theme != "light" {
+        settings.theme = "dark".to_owned();
+    }
     Ok(settings)
 }
 
@@ -204,6 +212,9 @@ pub fn default_template() -> &'static str {
 
     // Parpadeo del caret en milisegundos (50-10000).
     "caret_blink_ms": 530,
+
+    // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
+    "theme": "dark",
 }
 "#
 }
@@ -286,6 +297,27 @@ mod tests {
         let high = parse("{\"tab_width\": 999, \"caret_blink_ms\": 999999}").unwrap();
         assert_eq!(high.tab_width, 32);
         assert_eq!(high.caret_blink_ms, 10_000);
+    }
+
+    #[test]
+    fn parse_normalizes_theme_values() {
+        assert_eq!(parse("{}").unwrap().theme, "dark", "ausente → oscuro");
+        assert_eq!(
+            parse("{\"theme\": \"light\"}").unwrap().theme,
+            "light",
+            "light se acepta"
+        );
+        assert_eq!(
+            parse("{\"theme\": \"LIGHT\"}").unwrap().theme,
+            "light",
+            "sin importar mayúsculas"
+        );
+        assert_eq!(
+            parse("{\"theme\": \"azul\"}").unwrap().theme,
+            "dark",
+            "desconocido → oscuro"
+        );
+        assert_eq!(Settings::default().theme, "dark");
     }
 
     #[test]

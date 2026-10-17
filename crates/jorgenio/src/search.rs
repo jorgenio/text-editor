@@ -10,6 +10,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::editor::{Editor, FONT_SIZE};
+use crate::theme::Theme;
 
 /// Alto de cada fila (px lógicos).
 const ROW_H: f32 = 30.0;
@@ -17,15 +18,6 @@ const ROW_H: f32 = 30.0;
 const PAD: f32 = 8.0;
 /// Franja de borde superior de la barra.
 const EDGE: f32 = 1.0;
-
-const PANEL_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
-const PANEL_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
-const FIELD_BG: (u8, u8, u8, u8) = (0x14, 0x15, 0x12, 0xFF);
-const BUTTON_BG: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
-const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
-const DIM: (u8, u8, u8) = (0x75, 0x71, 0x5E);
-/// Caret de los campos (mismo blanco que FG, pero con alfa para los quads).
-const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
 
 /// Qué campo edita la barra (y a dónde van las teclas de texto).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +66,8 @@ pub struct SearchBar {
     field: Field,
     /// Caret del campo activo, en CHARS.
     caret: usize,
+    /// Tema de colores (lo fija `main` al arrancar y con Ctrl+T).
+    theme: Theme,
     last: Option<Layout>,
 }
 
@@ -86,6 +80,7 @@ impl Default for SearchBar {
             replacement: String::new(),
             field: Field::Query,
             caret: 0,
+            theme: Theme::dark(),
             last: None,
         }
     }
@@ -94,6 +89,17 @@ impl Default for SearchBar {
 impl SearchBar {
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Fija el tema de colores de la barra (se ve en el siguiente frame).
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Solo para tests (comprobar `theme.toggle`).
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Abre la barra (`replace` añade la fila de reemplazo) y sincroniza la
@@ -241,10 +247,14 @@ impl SearchBar {
         let bar = Rect::new(0.0, bar_y, viewport.0, bar_h);
         scene
             .top_quads
-            .push(Quad::new(bar.x, bar.y, bar.w, bar.h, PANEL_BG));
-        scene
-            .top_quads
-            .push(Quad::new(0.0, bar_y, viewport.0, EDGE, PANEL_EDGE));
+            .push(Quad::new(bar.x, bar.y, bar.w, bar.h, self.theme.panel_bg));
+        scene.top_quads.push(Quad::new(
+            0.0,
+            bar_y,
+            viewport.0,
+            EDGE,
+            self.theme.panel_edge,
+        ));
 
         // Fila de buscar: etiqueta + campo + contador "actual / total".
         let find_row_y = bar_y + EDGE;
@@ -264,16 +274,16 @@ impl SearchBar {
         let text_y = find_row_y + (ROW_H - FONT_SIZE) / 2.0;
         scene
             .top_texts
-            .push(TextSpan::new(label, PAD, text_y, FONT_SIZE, FG));
+            .push(TextSpan::new(label, PAD, text_y, FONT_SIZE, self.theme.fg));
         let caret = (self.field == Field::Query).then_some(self.caret);
-        push_field(scene, find_field, &self.query, caret, advance);
+        push_field(scene, find_field, &self.query, caret, advance, &self.theme);
         if !counter.is_empty() {
             scene.top_texts.push(TextSpan::new(
                 counter,
                 viewport.0 - PAD - counter_w,
                 text_y,
                 FONT_SIZE,
-                DIM,
+                self.theme.dim,
             ));
         }
 
@@ -304,12 +314,19 @@ impl SearchBar {
                 PAD,
                 row_y + (ROW_H - FONT_SIZE) / 2.0,
                 FONT_SIZE,
-                FG,
+                self.theme.fg,
             ));
             let caret = (self.field == Field::Replacement).then_some(self.caret);
-            push_field(scene, replace_field, &self.replacement, caret, advance);
-            push_button(scene, btn_replace, "Reemplazar", advance);
-            push_button(scene, btn_all, "Reemplazar todo", advance);
+            push_field(
+                scene,
+                replace_field,
+                &self.replacement,
+                caret,
+                advance,
+                &self.theme,
+            );
+            push_button(scene, btn_replace, "Reemplazar", advance, &self.theme);
+            push_button(scene, btn_all, "Reemplazar todo", advance, &self.theme);
         }
 
         self.last = Some(Layout {
@@ -390,10 +407,17 @@ impl SearchBar {
 
 /// Campo de texto con su caret (la consulta larga se muestra por la cola;
 /// el caret solo se dibuja si el campo está activo).
-fn push_field(scene: &mut Scene, rect: Rect, text: &str, caret: Option<usize>, advance: f32) {
+fn push_field(
+    scene: &mut Scene,
+    rect: Rect,
+    text: &str,
+    caret: Option<usize>,
+    advance: f32,
+    theme: &Theme,
+) {
     scene
         .top_quads
-        .push(Quad::new(rect.x, rect.y, rect.w, rect.h, FIELD_BG));
+        .push(Quad::new(rect.x, rect.y, rect.w, rect.h, theme.field_bg));
     let y = rect.y + (rect.h - FONT_SIZE) / 2.0;
     let capacity = ((rect.w - 12.0) / advance).floor().max(1.0) as usize;
     let total = text.chars().count();
@@ -401,7 +425,7 @@ fn push_field(scene: &mut Scene, rect: Rect, text: &str, caret: Option<usize>, a
     let shown: String = text.chars().skip(tail).collect();
     scene
         .top_texts
-        .push(TextSpan::new(shown, rect.x + 6.0, y, FONT_SIZE, FG));
+        .push(TextSpan::new(shown, rect.x + 6.0, y, FONT_SIZE, theme.fg));
     if let Some(caret) = caret {
         let caret_in = caret.saturating_sub(tail);
         scene.top_quads.push(Quad::new(
@@ -409,21 +433,21 @@ fn push_field(scene: &mut Scene, rect: Rect, text: &str, caret: Option<usize>, a
             rect.y + 3.0,
             2.0,
             rect.h - 6.0,
-            CARET,
+            theme.caret,
         ));
     }
 }
 
 /// Botón con la etiqueta centrada.
-fn push_button(scene: &mut Scene, rect: Rect, label: &str, advance: f32) {
+fn push_button(scene: &mut Scene, rect: Rect, label: &str, advance: f32, theme: &Theme) {
     scene
         .top_quads
-        .push(Quad::new(rect.x, rect.y, rect.w, rect.h, BUTTON_BG));
+        .push(Quad::new(rect.x, rect.y, rect.w, rect.h, theme.button_bg));
     let x = rect.x + (rect.w - label.chars().count() as f32 * advance) / 2.0;
     let y = rect.y + (rect.h - FONT_SIZE) / 2.0;
     scene
         .top_texts
-        .push(TextSpan::new(label, x, y, FONT_SIZE, FG));
+        .push(TextSpan::new(label, x, y, FONT_SIZE, theme.fg));
 }
 
 /// Posición (chars) más cercana para un x dentro del campo `rect`, teniendo
@@ -632,5 +656,36 @@ mod tests {
         search.handle_key(&key('h'), ModifiersState::CONTROL, &mut editor);
         assert!(search.query.is_empty(), "Ctrl+H no escribe 'h'");
         assert!(search.is_open(), "la barra no se cierra sola");
+    }
+
+    #[test]
+    fn set_theme_changes_bar_field_and_button_colors() {
+        let mut editor = Editor::default();
+        let mut search = SearchBar::default();
+        search.open(true, None, &mut editor);
+        search.insert_active("x");
+
+        let mut dark_scene = Scene::new(wgpu::Color::BLACK);
+        search.render(&mut dark_scene, (800.0, 600.0), 8.0, &editor);
+        assert_eq!(dark_scene.top_quads[0].color, Theme::dark().panel_bg);
+
+        search.set_theme(Theme::light());
+        let mut light_scene = Scene::new(wgpu::Color::BLACK);
+        search.render(&mut light_scene, (800.0, 600.0), 8.0, &editor);
+        assert_eq!(light_scene.top_quads[0].color, Theme::light().panel_bg);
+        assert!(
+            light_scene
+                .top_quads
+                .iter()
+                .any(|quad| quad.color == Theme::light().field_bg),
+            "el campo también cambia"
+        );
+        assert!(
+            light_scene
+                .top_quads
+                .iter()
+                .any(|quad| quad.color == Theme::light().button_bg),
+            "los botones también"
+        );
     }
 }

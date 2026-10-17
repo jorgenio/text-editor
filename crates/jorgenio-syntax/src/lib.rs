@@ -22,6 +22,14 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 /// Tema Monokai (paleta clásica de Sublime Text), escrito para este proyecto.
 const MONOKAI: &str = include_str!("../../../assets/themes/Monokai.tmTheme");
 
+/// Paleta de syntect: Monokai (oscuro, por defecto) o InspiredGitHub (claro,
+/// para fondo blanco). El cambio invalida los tokens cacheados.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxThemeKind {
+    Dark,
+    Light,
+}
+
 /// Una pieza coloreada de una línea, en **bytes** dentro de la línea sin EOL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -40,6 +48,8 @@ pub struct SyntaxHighlighter {
     /// Extensión actual ("" = sin gramática → texto plano).
     extension: String,
     plain: bool,
+    /// Paleta de colores activa (oscuro/claro).
+    kind: SyntaxThemeKind,
     /// Estado del parser al inicio de cada línea (states[0] = inicial).
     states: Vec<Checkpoint>,
     /// Tokens por línea; `tokens.len()` = cuántas líneas están resaltadas.
@@ -57,6 +67,7 @@ impl SyntaxHighlighter {
         let mut highlighter = Self {
             extension: String::new(),
             plain: true,
+            kind: SyntaxThemeKind::Dark,
             states: Vec::new(),
             tokens: Vec::new(),
         };
@@ -82,6 +93,15 @@ impl SyntaxHighlighter {
 
     pub fn extension(&self) -> &str {
         &self.extension
+    }
+
+    /// Cambia la paleta (oscuro/claro); invalida todo si realmente cambió.
+    pub fn set_theme(&mut self, kind: SyntaxThemeKind) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        self.reset();
     }
 
     /// Invalida los tokens desde `line` (edición reportada por el buffer).
@@ -118,7 +138,7 @@ impl SyntaxHighlighter {
         let syntax = Self::syntax_for(&self.extension);
         self.plain = syntax.is_none();
         let syntax = syntax.unwrap_or_else(|| syntax_set().find_syntax_plain_text());
-        self.states = vec![base_checkpoint(syntax)];
+        self.states = vec![base_checkpoint(syntax, self.kind)];
         self.tokens.clear();
     }
 
@@ -145,7 +165,7 @@ impl SyntaxHighlighter {
             .states
             .get(line)
             .cloned()
-            .unwrap_or_else(|| base_checkpoint(syntax));
+            .unwrap_or_else(|| base_checkpoint(syntax, self.kind));
         let (next, tokens) = self.tokenize(base, &text);
         self.tokens.push(tokens);
 
@@ -156,7 +176,7 @@ impl SyntaxHighlighter {
         } else {
             // No debería pasar (invariante states.len() ≥ tokens.len()+1).
             while self.states.len() <= line {
-                self.states.push(base_checkpoint(syntax));
+                self.states.push(base_checkpoint(syntax, self.kind));
             }
             self.states.push(next);
         }
@@ -164,7 +184,7 @@ impl SyntaxHighlighter {
 
     /// Resalta un texto (con su `\n` si aplica) y devuelve (estado siguiente, tokens).
     fn tokenize(&self, mut checkpoint: Checkpoint, text: &str) -> (Checkpoint, Vec<Token>) {
-        let highlighter = Highlighter::new(theme());
+        let highlighter = Highlighter::new(theme_for(self.kind));
         let Ok(ops) = checkpoint.parse.parse_line(text, syntax_set()) else {
             return (checkpoint, Vec::new());
         };
@@ -205,7 +225,14 @@ fn syntax_set() -> &'static SyntaxSet {
     SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn theme() -> &'static Theme {
+fn theme_for(kind: SyntaxThemeKind) -> &'static Theme {
+    match kind {
+        SyntaxThemeKind::Dark => dark_theme(),
+        SyntaxThemeKind::Light => light_theme(),
+    }
+}
+
+fn dark_theme() -> &'static Theme {
     static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
         ThemeSet::load_from_reader(&mut std::io::Cursor::new(MONOKAI))
@@ -213,8 +240,20 @@ fn theme() -> &'static Theme {
     })
 }
 
-fn base_checkpoint(syntax: &SyntaxReference) -> Checkpoint {
-    let highlighter = Highlighter::new(theme());
+/// Paleta clara incluida en syntect (diseñada para fondo blanco).
+fn light_theme() -> &'static Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        ThemeSet::load_defaults()
+            .themes
+            .get("InspiredGitHub")
+            .cloned()
+            .expect("syntect incluye el tema InspiredGitHub")
+    })
+}
+
+fn base_checkpoint(syntax: &SyntaxReference, kind: SyntaxThemeKind) -> Checkpoint {
+    let highlighter = Highlighter::new(theme_for(kind));
     Checkpoint {
         parse: ParseState::new(syntax),
         highlight: HighlightState::new(&highlighter, ScopeStack::new()),
@@ -314,5 +353,44 @@ mod tests {
         let first = colors(syntax.tokens(0));
         syntax.prepare(&mut buffer, 0);
         assert_eq!(first, colors(syntax.tokens(0)));
+    }
+
+    #[test]
+    fn set_theme_light_recolors_and_dark_restores() {
+        let mut syntax = SyntaxHighlighter::new();
+        syntax.set_extension("rs");
+        let mut buffer = Buffer::from_text("fn main() {}");
+        syntax.prepare(&mut buffer, 0);
+        let dark_colors = colors(syntax.tokens(0));
+        assert!(
+            dark_colors.contains(&(0xF9, 0x26, 0x72)),
+            "Monokai por defecto"
+        );
+
+        syntax.set_theme(SyntaxThemeKind::Light);
+        assert!(syntax.tokens(0).is_empty(), "el cambio invalida la cache");
+        syntax.prepare(&mut buffer, 0);
+        let light_colors = colors(syntax.tokens(0));
+        assert!(!light_colors.is_empty(), "la paleta clara resalta");
+        assert!(
+            !light_colors.contains(&(0xF9, 0x26, 0x72)),
+            "InspiredGitHub no usa el rosa Monokai: {light_colors:?}"
+        );
+
+        syntax.set_theme(SyntaxThemeKind::Dark);
+        syntax.prepare(&mut buffer, 0);
+        assert_eq!(colors(syntax.tokens(0)), dark_colors, "vuelve al Monokai");
+    }
+
+    #[test]
+    fn set_theme_same_kind_keeps_cache() {
+        let mut syntax = SyntaxHighlighter::new();
+        syntax.set_extension("rs");
+        let mut buffer = Buffer::from_text("let x = 1;");
+        syntax.prepare(&mut buffer, 0);
+        let cached = colors(syntax.tokens(0));
+
+        syntax.set_theme(SyntaxThemeKind::Dark);
+        assert_eq!(colors(syntax.tokens(0)), cached, "sin reset inútil");
     }
 }

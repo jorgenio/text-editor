@@ -7,6 +7,7 @@ mod search;
 mod settings;
 mod snippets;
 mod tabs;
+mod theme;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use palette::Palette;
 use search::SearchBar;
 use tabs::{TAB_BAR_H, Tabs};
+use theme::Theme;
 use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -87,11 +89,13 @@ impl Application {
         let settings = settings::load();
         let mut tabs = Tabs::from_paths(paths);
         tabs.apply_prefs(&settings);
+        let mut search = SearchBar::default();
+        search.set_theme(Theme::from_name(&settings.theme));
         let blink = blink_interval(&settings);
         Self {
             tabs,
             palette: Palette::default(),
-            search: SearchBar::default(),
+            search,
             settings,
             gpu: None,
             clipboard: None,
@@ -230,10 +234,11 @@ fn focus_tab(tabs: &mut Tabs, group: usize, tab: usize) {
 }
 
 /// Si se guardó el `settings.json`, recarga preferencias y las reaplica a
-/// TODOS los editores abiertos (tab/gutter/parpadeo se ven al instante).
+/// TODOS los editores abiertos (tab/gutter/parpadeo/tema se ven al instante).
 fn reload_settings_if_needed(
     settings: &mut settings::Settings,
     tabs: &mut Tabs,
+    search: &mut SearchBar,
     saved: &std::path::Path,
 ) {
     if saved != settings::path() {
@@ -241,6 +246,7 @@ fn reload_settings_if_needed(
     }
     *settings = settings::load();
     tabs.apply_prefs(settings);
+    search.set_theme(Theme::from_name(&settings.theme));
     log::info!("preferencias recargadas");
 }
 
@@ -400,7 +406,7 @@ fn run_command(
                 }
             };
             if let Some(saved) = &saved {
-                reload_settings_if_needed(settings, tabs, saved);
+                reload_settings_if_needed(settings, tabs, search, saved);
             }
             true
         }
@@ -430,7 +436,7 @@ fn run_command(
                 })
             };
             if let Some(saved) = &saved {
-                reload_settings_if_needed(settings, tabs, saved);
+                reload_settings_if_needed(settings, tabs, search, saved);
             }
             true
         }
@@ -509,6 +515,20 @@ fn run_command(
             // Aplica lo que ya estuviera en disco (ediciones externas).
             *settings = settings::load();
             tabs.apply_prefs(settings);
+            search.set_theme(Theme::from_name(&settings.theme));
+            true
+        }
+        "theme.toggle" => {
+            settings.theme = if settings.theme == "light" {
+                "dark".to_owned()
+            } else {
+                "light".to_owned()
+            };
+            tabs.apply_prefs(settings);
+            let theme = Theme::from_name(&settings.theme);
+            search.set_theme(theme);
+            // Solo sesión: para persistir, escríbelo en settings.json.
+            notify(notice, format!("Tema: {}", theme.label()));
             true
         }
         other => {
@@ -941,6 +961,7 @@ mod tests {
     use crate::search::SearchBar;
     use crate::settings;
     use crate::tabs::Tabs;
+    use crate::theme::Theme;
     use std::time::Instant;
 
     #[test]
@@ -1042,6 +1063,47 @@ mod tests {
         );
         let (text, _) = notice.take().expect("aviso de error");
         assert!(text.starts_with("Error al guardar"), "{text}");
+    }
+
+    #[test]
+    fn theme_toggle_flips_editor_bar_and_search() {
+        let mut tabs = Tabs::new(Editor::default());
+        let mut clipboard = None;
+        let mut palette = Palette::default();
+        let mut search = SearchBar::default();
+        let mut settings = settings::Settings::default();
+        let mut notice: Option<(String, Instant)> = None;
+        assert_eq!(tabs.active().theme(), Theme::dark(), "arranca oscuro");
+
+        run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut settings,
+            &mut notice,
+            "theme.toggle",
+        );
+        let (text, _) = notice.take().expect("aviso del tema");
+        assert_eq!(text, "Tema: claro");
+        assert_eq!(settings.theme, "light");
+        assert_eq!(tabs.active().theme(), Theme::light());
+        assert_eq!(search.theme(), Theme::light());
+
+        run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut settings,
+            &mut notice,
+            "theme.toggle",
+        );
+        let (text, _) = notice.take().expect("segundo aviso");
+        assert_eq!(text, "Tema: oscuro");
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(tabs.active().theme(), Theme::dark());
+        assert_eq!(search.theme(), Theme::dark());
     }
 
     #[test]

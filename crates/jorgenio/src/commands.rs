@@ -60,6 +60,7 @@ pub static KEYMAP: &[Binding] = &[
     bind("h", true, false, false, "replace.show"),
     bind("\\", true, false, false, "view.split"),
     bind("\\", true, true, false, "view.unsplit"),
+    bind("t", true, false, false, "theme.toggle"),
     bind(",", true, false, false, "settings.open"),
 ];
 
@@ -179,6 +180,11 @@ pub static COMMANDS: &[Command] = &[
     Command {
         id: "view.unsplit",
         name: "Unir paneles",
+        category: "Ver",
+    },
+    Command {
+        id: "theme.toggle",
+        name: "Cambiar tema claro/oscuro",
         category: "Ver",
     },
     Command {
@@ -316,6 +322,21 @@ mod tests {
         assert_eq!(keys_for("settings.open").as_deref(), Some("Ctrl+,"));
         assert_eq!(keys_for("quickopen.show").as_deref(), Some("Ctrl+P"));
         assert_eq!(keys_for("missing.command"), None);
+    }
+
+    #[test]
+    fn theme_toggle_binds_ctrl_t() {
+        assert_eq!(keys_for("theme.toggle").as_deref(), Some("Ctrl+T"));
+        assert_eq!(
+            command_for(mods(true, false, false), &key('t')),
+            Some("theme.toggle"),
+            "Ctrl+T (sin Shift/Alt) alterna el tema"
+        );
+        assert_eq!(
+            command_for(mods(true, true, false), &key('t')),
+            None,
+            "Ctrl+Shift+T no está atado"
+        );
     }
 
     #[test]

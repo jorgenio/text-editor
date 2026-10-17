@@ -20,6 +20,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::snippets;
+use crate::theme::Theme;
 
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 20.0;
@@ -34,17 +35,6 @@ const HIDDEN_GUTTER_X: f32 = 12.0;
 const GUTTER_RIGHT_X: f32 = 56.0;
 const PADDING_TOP: f32 = 8.0;
 const CARET_WIDTH: f32 = 2.0;
-
-const BG: (u8, u8, u8) = (0x27, 0x28, 0x22);
-const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
-const GUTTER_FG: (u8, u8, u8) = (0x75, 0x71, 0x5E);
-const GUTTER_CURRENT: (u8, u8, u8) = (0xFD, 0x97, 0x1F);
-const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
-const SELECTION: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
-/// Coincidencias de la búsqueda (tono apagado, debajo del texto).
-const MATCH: (u8, u8, u8, u8) = (0x5A, 0x57, 0x44, 0xB0);
-/// La coincidencia actual (encima de las demás).
-const CURRENT_MATCH: (u8, u8, u8, u8) = (0x9A, 0x91, 0x58, 0xFF);
 
 /// Un cursor con su selección (`anchor == caret` → sin selección).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +88,8 @@ pub struct Editor {
     tab_width: usize,
     /// ¿Dibujar los números de línea? (`show_line_numbers` de preferencias).
     show_line_numbers: bool,
+    /// Tema de colores activo (oscuro Monokai / claro); lo fija `main`.
+    theme: Theme,
     /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
     find: Vec<Range<usize>>,
     find_current: usize,
@@ -123,6 +115,7 @@ impl Default for Editor {
             left_inset: 0.0,
             tab_width: TAB_WIDTH,
             show_line_numbers: true,
+            theme: Theme::dark(),
             find: Vec::new(),
             find_current: 0,
             find_query: String::new(),
@@ -224,6 +217,21 @@ impl Editor {
 
     pub fn set_show_line_numbers(&mut self, show: bool) {
         self.show_line_numbers = show;
+    }
+
+    /// Fija el tema de colores; si cambia la paleta de syntect se invalida
+    /// el resaltado cacheado y el siguiente frame re-resalta en el nuevo tono.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if theme.syntax != self.theme.syntax {
+            self.syntax.set_theme(theme.syntax);
+        }
+        self.theme = theme;
+    }
+
+    /// Solo para tests (comprobar `apply_prefs` y `theme.toggle`).
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Inicio del área de código según el gutter (preferencias).
@@ -1199,7 +1207,8 @@ impl Editor {
     /// Resalta lo que haga falta (cache) hasta la última línea visible.
     /// `viewport` es el área del EDITOR (la ventana menos la barra de pestañas).
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
-        let mut scene = Scene::new(srgb(BG.0, BG.1, BG.2));
+        let bg = self.theme.editor_bg;
+        let mut scene = Scene::new(srgb(bg.0, bg.1, bg.2));
         let advance = FONT_SIZE * advance_ratio;
         let line_count = self.buffer.line_count();
         let inset = self.top_inset;
@@ -1230,15 +1239,15 @@ impl Editor {
         };
         for cursor in &self.cursors {
             let range = cursor.range();
-            push_range_quad(&mut scene, &range, &self.buffer, ctx, SELECTION);
+            push_range_quad(&mut scene, &range, &self.buffer, ctx, self.theme.selection);
         }
         // Coincidencias de la búsqueda (Ctrl+F): apagadas y, en su turno,
         // la actual por encima (no se solapan: rangos disjuntos).
         for (index, range) in self.find.iter().enumerate() {
             let color = if index == self.find_current {
-                CURRENT_MATCH
+                self.theme.current_match
             } else {
-                MATCH
+                self.theme.match_bg
             };
             push_range_quad(&mut scene, range, &self.buffer, ctx, color);
         }
@@ -1248,9 +1257,9 @@ impl Editor {
             let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
             if self.show_line_numbers {
                 let color = if line == caret_line {
-                    GUTTER_CURRENT
+                    self.theme.gutter_current
                 } else {
-                    GUTTER_FG
+                    self.theme.gutter_fg
                 };
                 let number = format!("{}", line + 1);
                 let number_x = xin + GUTTER_RIGHT_X - number.len() as f32 * advance;
@@ -1265,7 +1274,9 @@ impl Editor {
             }
             let tokens = self.syntax.tokens(line);
             if tokens.is_empty() {
-                scene.texts.push(TextSpan::new(text, cx, y, FONT_SIZE, FG));
+                scene
+                    .texts
+                    .push(TextSpan::new(text, cx, y, FONT_SIZE, self.theme.fg));
                 continue;
             }
             // Columnas de TODOS los tokens en un solo recorrido de la línea
@@ -1303,7 +1314,7 @@ impl Editor {
                     y,
                     CARET_WIDTH,
                     LINE_HEIGHT - 2.0,
-                    CARET,
+                    self.theme.caret,
                 ));
             }
         }
@@ -2171,8 +2182,16 @@ mod tests {
 
         let scene = editor.build_scene((600.0, 200.0), 1.0);
         assert_eq!(scene.quads.len(), 2, "una por coincidencia");
-        assert_eq!(scene.quads[0].color, CURRENT_MATCH, "la actual la última…");
-        assert_eq!(scene.quads[1].color, MATCH, "…y por encima de las demás");
+        assert_eq!(
+            scene.quads[0].color,
+            Theme::dark().current_match,
+            "la actual la última…"
+        );
+        assert_eq!(
+            scene.quads[1].color,
+            Theme::dark().match_bg,
+            "…y por encima de las demás"
+        );
 
         // Con la palabra seleccionada (prefill de Ctrl+F) el quad actual
         // tapa al de selección: se dibuja después.
@@ -2182,9 +2201,59 @@ mod tests {
         }];
         let scene = editor.build_scene((600.0, 200.0), 1.0);
         assert_eq!(scene.quads.len(), 3);
-        assert_eq!(scene.quads[0].color, SELECTION);
-        assert_eq!(scene.quads[1].color, CURRENT_MATCH);
-        assert_eq!(scene.quads[2].color, MATCH);
+        assert_eq!(scene.quads[0].color, Theme::dark().selection);
+        assert_eq!(scene.quads[1].color, Theme::dark().current_match);
+        assert_eq!(scene.quads[2].color, Theme::dark().match_bg);
+    }
+
+    #[test]
+    fn build_scene_follows_the_active_theme() {
+        let mut editor = Editor::default();
+        editor.insert_text("fn x() {}");
+        editor.cursors = vec![Cursor {
+            caret: 9,
+            anchor: 0,
+        }];
+
+        let dark = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(dark.clear, srgb(0x27, 0x28, 0x22), "fondo Monokai");
+        assert_eq!(dark.quads[0].color, Theme::dark().selection);
+
+        editor.set_theme(Theme::light());
+        let light = editor.build_scene((600.0, 200.0), 1.0);
+        assert_eq!(light.clear, srgb(0xFF, 0xFF, 0xFF), "fondo blanco");
+        assert_eq!(light.quads[0].color, Theme::light().selection);
+        assert_eq!(
+            light.texts[0].color,
+            Theme::light().gutter_current,
+            "los números de línea usan el tema claro (línea del caret)"
+        );
+    }
+
+    #[test]
+    fn set_theme_recolors_syntax_tokens() {
+        let mut editor = Editor::default();
+        editor.lang = "rs".to_owned();
+        editor.insert_text("fn x() {}");
+        editor.cursors = vec![Cursor::new(0)];
+
+        let dark_scene = editor.build_scene((600.0, 200.0), 1.0);
+        let has_pink = |scene: &Scene| {
+            scene
+                .texts
+                .iter()
+                .any(|text| text.color == (0xF9, 0x26, 0x72))
+        };
+        assert!(has_pink(&dark_scene), "Monokai pinta `fn` de rosa");
+        assert!(!editor.syntax.tokens(0).is_empty());
+
+        editor.set_theme(Theme::light());
+        assert!(
+            editor.syntax.tokens(0).is_empty(),
+            "cambiar de paleta invalida el resaltado"
+        );
+        let light_scene = editor.build_scene((600.0, 200.0), 1.0);
+        assert!(!has_pink(&light_scene), "InspiredGitHub no lleva rosa");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 
 use crate::editor::{Editor, FONT_SIZE};
+use crate::theme::Theme;
 
 /// Alto de la barra de pestañas (px lógicos). El área de cada editor es la
 /// ventana menos este valor.
@@ -17,14 +18,6 @@ const TAB_MIN_W: f32 = 96.0;
 const TAB_MAX_W: f32 = 220.0;
 /// Margen horizontal del texto dentro de la pestaña.
 const TAB_PAD: f32 = 14.0;
-
-const BAR_BG: (u8, u8, u8, u8) = (0x1A, 0x1B, 0x18, 0xFF);
-const TAB_BG: (u8, u8, u8, u8) = (0x22, 0x23, 0x1E, 0xFF);
-/// Pestaña activa: mismo tono que el fondo del editor (se funde con él).
-const TAB_ACTIVE_BG: (u8, u8, u8, u8) = (0x27, 0x28, 0x22, 0xFF);
-const TAB_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
-const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
-const DIM: (u8, u8, u8) = (0x75, 0x71, 0x5E);
 
 /// Un grupo (columna del split) con sus pestañas y su activa.
 struct Group {
@@ -44,6 +37,8 @@ pub struct Tabs {
     groups: Vec<Group>,
     active_group: usize,
     layout: Vec<GroupLayout>,
+    /// Tema de la barra y de todos los editores (lo fija `apply_prefs`).
+    theme: Theme,
 }
 
 impl Tabs {
@@ -56,6 +51,7 @@ impl Tabs {
             }],
             active_group: 0,
             layout: Vec::new(),
+            theme: Theme::dark(),
         }
     }
 
@@ -70,6 +66,7 @@ impl Tabs {
             groups: vec![Group { list, active: 0 }],
             active_group: 0,
             layout: Vec::new(),
+            theme: Theme::dark(),
         }
     }
 
@@ -191,11 +188,15 @@ impl Tabs {
 
     /// Aplica preferencias a TODOS los editores abiertos (todos los grupos);
     /// el cambio de tab/gutter es solo geométrico, se ve en el siguiente frame.
+    /// El tema (`"theme"` de settings) alcanza también a la barra y al split.
     pub fn apply_prefs(&mut self, prefs: &crate::settings::Settings) {
+        let theme = Theme::from_name(&prefs.theme);
+        self.theme = theme;
         for group in &mut self.groups {
             for editor in &mut group.list {
                 editor.set_tab_width(prefs.tab_width);
                 editor.set_show_line_numbers(prefs.show_line_numbers);
+                editor.set_theme(theme);
             }
         }
     }
@@ -255,15 +256,19 @@ impl Tabs {
             let bar_right = gx + gw;
             scene
                 .top_quads
-                .push(Quad::new(gx, 0.0, gw, TAB_BAR_H, BAR_BG));
+                .push(Quad::new(gx, 0.0, gw, TAB_BAR_H, self.theme.bar_bg));
             scene
                 .top_quads
-                .push(Quad::new(gx, TAB_BAR_H - 1.0, gw, 1.0, TAB_EDGE));
+                .push(Quad::new(gx, TAB_BAR_H - 1.0, gw, 1.0, self.theme.tab_edge));
             // Separación vertical con el panel vecino (altura entera).
             if gi > 0 {
-                scene
-                    .top_quads
-                    .push(Quad::new(gx - 1.0, 0.0, 1.0, viewport.1, TAB_EDGE));
+                scene.top_quads.push(Quad::new(
+                    gx - 1.0,
+                    0.0,
+                    1.0,
+                    viewport.1,
+                    self.theme.tab_edge,
+                ));
             }
 
             let mut gl = GroupLayout {
@@ -289,18 +294,30 @@ impl Tabs {
                     0.0,
                     w,
                     TAB_BAR_H,
-                    if is_active { TAB_ACTIVE_BG } else { TAB_BG },
+                    if is_active {
+                        self.theme.tab_active_bg
+                    } else {
+                        self.theme.tab_bg
+                    },
                 ));
                 // Sin borde inferior en la activa: se funde con su editor.
                 if !is_active {
-                    scene
-                        .top_quads
-                        .push(Quad::new(x, TAB_BAR_H - 1.0, w, 1.0, TAB_EDGE));
+                    scene.top_quads.push(Quad::new(
+                        x,
+                        TAB_BAR_H - 1.0,
+                        w,
+                        1.0,
+                        self.theme.tab_edge,
+                    ));
                 }
                 if index > 0 {
-                    scene
-                        .top_quads
-                        .push(Quad::new(x, 4.0, 1.0, TAB_BAR_H - 8.0, TAB_EDGE));
+                    scene.top_quads.push(Quad::new(
+                        x,
+                        4.0,
+                        1.0,
+                        TAB_BAR_H - 8.0,
+                        self.theme.tab_edge,
+                    ));
                 }
 
                 // Etiqueta: se trunca por la cola si no cabe ("muy_lar…").
@@ -314,7 +331,11 @@ impl Tabs {
                     x + TAB_PAD,
                     (TAB_BAR_H - FONT_SIZE) / 2.0,
                     FONT_SIZE,
-                    if is_active { FG } else { DIM },
+                    if is_active {
+                        self.theme.fg
+                    } else {
+                        self.theme.dim
+                    },
                 ));
 
                 gl.tabs.push((x, w));
@@ -536,5 +557,30 @@ mod tests {
             "la pestaña del grupo derecho"
         );
         assert_eq!(tabs.find_path(std::path::Path::new("no.rs")), None);
+    }
+
+    #[test]
+    fn apply_prefs_applies_the_theme_to_bar_and_editors() {
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.add(tab_named("b.rs"));
+        tabs.split();
+        assert_eq!(tabs.theme, Theme::dark(), "arranca oscuro");
+
+        let prefs = crate::settings::Settings {
+            theme: "light".to_owned(),
+            ..crate::settings::Settings::default()
+        };
+        tabs.apply_prefs(&prefs);
+        assert_eq!(tabs.theme, Theme::light(), "la barra sigue el tema");
+        assert_eq!(tabs.active().theme(), Theme::light());
+        assert_eq!(
+            tabs.group_active_mut(1).theme(),
+            Theme::light(),
+            "todos los grupos, no solo el activo"
+        );
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0);
+        assert_eq!(scene.top_quads[0].color, Theme::light().bar_bg);
     }
 }

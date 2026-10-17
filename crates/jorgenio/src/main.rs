@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use jorgenio_ui::gpu::GpuContext;
-use jorgenio_ui::scene::Scene;
+use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use palette::Palette;
 use search::SearchBar;
 use tabs::{TAB_BAR_H, Tabs};
@@ -29,6 +29,25 @@ const CLICK_WINDOW: Duration = Duration::from_millis(450);
 const CLICK_SLOP2: f32 = 16.0; // (4 px)^2
 /// Umbral de movimiento para que un click se convierta en arrastre.
 const DRAG_SLOP2: f32 = 16.0;
+/// Vida del aviso efímero (guardado, errores) en la esquina superior.
+const NOTICE_TTL: Duration = Duration::from_secs(3);
+const NOTICE_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
+const NOTICE_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
+const NOTICE_FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
+/// Tope de archivos recogidos por el Ctrl+P (un monorepo no debe colgar).
+const QUICK_OPEN_MAX: usize = 20_000;
+/// Directorios ignorados al recorrer el árbol del Ctrl+P.
+const QUICK_SKIP: [&str; 9] = [
+    ".git",
+    "target",
+    "node_modules",
+    ".vs",
+    ".vscode",
+    "build",
+    "dist",
+    "__pycache__",
+    ".idea",
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -53,6 +72,8 @@ struct Application {
     last_title: String,
     cursor: LogicalPosition<f32>,
     caret_blink_deadline: Instant,
+    /// Aviso efímero (texto + cuándo caduca).
+    notice: Option<(String, Instant)>,
     /// Clicks para doble/triple click.
     last_click: Option<(Instant, LogicalPosition<f32>)>,
     click_count: u32,
@@ -78,6 +99,7 @@ impl Application {
             last_title: String::new(),
             cursor: LogicalPosition::new(0.0, 0.0),
             caret_blink_deadline: Instant::now() + blink,
+            notice: None,
             last_click: None,
             click_count: 0,
             mouse_down: false,
@@ -222,6 +244,68 @@ fn reload_settings_if_needed(
     log::info!("preferencias recargadas");
 }
 
+/// Fija el aviso efímero que se pinta en la esquina superior derecha.
+fn notify(slot: &mut Option<(String, Instant)>, text: String) {
+    *slot = Some((text, Instant::now()));
+}
+
+/// Archivos del árbol de `root` para el Ctrl+P (sin directorios ruidosos
+/// y con tope: caminar un monorepo entero colgaría la interfaz).
+fn collect_files(root: &std::path::Path, max: usize) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= max {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if file_type.is_dir() {
+                // Sin symlinks no hay ciclos: file_type no sigue enlaces.
+                if name.to_str().is_some_and(|n| QUICK_SKIP.contains(&n)) {
+                    continue;
+                }
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Abre la búsqueda rápida (Ctrl+P) sobre el directorio de trabajo.
+fn open_quickopen(palette: &mut Palette) {
+    let root = std::env::current_dir().unwrap_or_default();
+    let files = collect_files(&root, QUICK_OPEN_MAX);
+    if files.is_empty() {
+        log::warn!("sin archivos bajo {}", root.display());
+    }
+    palette.open_files(root, files);
+}
+
+/// Abre `path` como pestaña nueva o enfoca la que ya lo tiene.
+/// (Un CLI con ruta relativa y el Ctrl+P con la absoluta pueden duplicar;
+/// se prefiere duplicar a fallar el foco.)
+fn open_path(tabs: &mut Tabs, settings: &mut settings::Settings, path: std::path::PathBuf) {
+    if let Some((group, tab)) = tabs.find_path(&path) {
+        focus_tab(tabs, group, tab);
+    } else {
+        tabs.add(Editor::from_cli(path));
+        tabs.apply_prefs(settings);
+    }
+}
+
 /// Ejecuta un comando por id (keymap o paleta de comandos).
 /// `true` = pide redraw.
 fn run_command(
@@ -230,6 +314,7 @@ fn run_command(
     palette: &mut Palette,
     search: &mut SearchBar,
     settings: &mut settings::Settings,
+    notice: &mut Option<(String, Instant)>,
     id: &str,
 ) -> bool {
     match id {
@@ -270,10 +355,23 @@ fn run_command(
                     match editor.save() {
                         Ok(()) => {
                             log::info!("guardado");
-                            editor.path().map(|p| p.to_path_buf())
+                            let path = editor.path().map(|p| p.to_path_buf());
+                            if let Some(path) = &path {
+                                notify(
+                                    notice,
+                                    format!(
+                                        "Guardado: {}",
+                                        path.file_name()
+                                            .unwrap_or(path.as_os_str())
+                                            .to_string_lossy()
+                                    ),
+                                );
+                            }
+                            path
                         }
                         Err(err) => {
                             log::error!("error al guardar: {err}");
+                            notify(notice, format!("Error al guardar: {err}"));
                             None
                         }
                     }
@@ -282,10 +380,20 @@ fn run_command(
                     save_dialog(&name).and_then(|path| match editor.save_as(path.clone()) {
                         Ok(()) => {
                             log::info!("guardado");
+                            notify(
+                                notice,
+                                format!(
+                                    "Guardado: {}",
+                                    path.file_name()
+                                        .unwrap_or(path.as_os_str())
+                                        .to_string_lossy()
+                                ),
+                            );
                             Some(path)
                         }
                         Err(err) => {
                             log::error!("error al guardar: {err}");
+                            notify(notice, format!("Error al guardar: {err}"));
                             None
                         }
                     })
@@ -303,10 +411,20 @@ fn run_command(
                 save_dialog(&name).and_then(|path| match editor.save_as(path.clone()) {
                     Ok(()) => {
                         log::info!("guardado");
+                        notify(
+                            notice,
+                            format!(
+                                "Guardado: {}",
+                                path.file_name()
+                                    .unwrap_or(path.as_os_str())
+                                    .to_string_lossy()
+                            ),
+                        );
                         Some(path)
                     }
                     Err(err) => {
                         log::error!("error al guardar: {err}");
+                        notify(notice, format!("Error al guardar: {err}"));
                         None
                     }
                 })
@@ -314,6 +432,10 @@ fn run_command(
             if let Some(saved) = &saved {
                 reload_settings_if_needed(settings, tabs, saved);
             }
+            true
+        }
+        "quickopen.show" => {
+            open_quickopen(palette);
             true
         }
         "file.close" => {
@@ -427,6 +549,19 @@ impl winit::application::ApplicationHandler for Application {
         if self.gpu.is_none() {
             return;
         }
+        // El aviso efímero caduca solo; al desaparecer pide repintar.
+        let mut wake: Option<Instant> = None;
+        let notice_deadline = self.notice.as_ref().map(|(_, at)| *at + NOTICE_TTL);
+        if let Some(deadline) = notice_deadline {
+            if Instant::now() >= deadline {
+                self.notice = None;
+                if let Some(gpu) = &self.gpu {
+                    gpu.request_redraw();
+                }
+            } else {
+                wake = Some(deadline);
+            }
+        }
         if self.tabs.active().focused() {
             let now = Instant::now();
             if now >= self.caret_blink_deadline {
@@ -441,9 +576,13 @@ impl winit::application::ApplicationHandler for Application {
                 }
                 self.caret_blink_deadline = now + blink_interval(&self.settings);
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.caret_blink_deadline));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            wake = Some(wake.map_or(self.caret_blink_deadline, |w| {
+                w.min(self.caret_blink_deadline)
+            }));
+        }
+        match wake {
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -504,6 +643,36 @@ impl winit::application::ApplicationHandler for Application {
                     editor::FONT_SIZE * advance,
                     self.tabs.active(),
                 );
+                // Aviso efímero en la esquina superior derecha (los de
+                // paleta se pintan después: mandan sobre él).
+                if let Some((text, at)) = &self.notice
+                    && at.elapsed() < NOTICE_TTL
+                {
+                    let char_w = editor::FONT_SIZE * advance;
+                    let max_chars = ((viewport.0 - 48.0) / char_w).floor().max(4.0) as usize;
+                    let mut text = text.clone();
+                    if text.chars().count() > max_chars {
+                        text.truncate(text.char_indices().nth(max_chars - 1).map_or(0, |(i, _)| i));
+                        text.push('…');
+                    }
+                    let width = text.chars().count() as f32 * char_w + 24.0;
+                    let height = 26.0;
+                    let x = viewport.0 - width - 12.0;
+                    let y = TAB_BAR_H + 8.0;
+                    scene
+                        .top_quads
+                        .push(Quad::new(x, y, width, height, NOTICE_BG));
+                    scene
+                        .top_quads
+                        .push(Quad::new(x, y, width, 1.0, NOTICE_EDGE));
+                    scene.top_texts.push(TextSpan::new(
+                        text,
+                        x + 12.0,
+                        y + (height - editor::FONT_SIZE) / 2.0,
+                        editor::FONT_SIZE,
+                        NOTICE_FG,
+                    ));
+                }
                 self.palette
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
                 let built = frame.elapsed();
@@ -536,10 +705,13 @@ impl winit::application::ApplicationHandler for Application {
                     && let Some(id) = commands::command_for(self.modifiers, &key_event.logical_key)
                 {
                     if self.palette.is_open() {
-                        // Con la paleta abierta solo actúa el toggle; el
+                        // Con la paleta abierta solo actúan los toggles; el
                         // resto de comandos se traga.
                         if id == "palette.show" {
                             self.palette.toggle();
+                            gpu.request_redraw();
+                        } else if id == "quickopen.show" {
+                            open_quickopen(&mut self.palette);
                             gpu.request_redraw();
                         }
                     } else if run_command(
@@ -548,6 +720,7 @@ impl winit::application::ApplicationHandler for Application {
                         &mut self.palette,
                         &mut self.search,
                         &mut self.settings,
+                        &mut self.notice,
                         id,
                     ) {
                         gpu.request_redraw();
@@ -565,8 +738,14 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.palette,
                                 &mut self.search,
                                 &mut self.settings,
+                                &mut self.notice,
                                 id,
                             );
+                            gpu.request_redraw();
+                        }
+                        palette::Action::Open(path) => {
+                            self.palette.close();
+                            open_path(&mut self.tabs, &mut self.settings, path);
                             gpu.request_redraw();
                         }
                         palette::Action::Close => {
@@ -645,8 +824,15 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.palette,
                                 &mut self.search,
                                 &mut self.settings,
+                                &mut self.notice,
                                 id,
                             );
+                            gpu.request_redraw();
+                            return;
+                        }
+                        palette::Click::File(path) => {
+                            self.palette.close();
+                            open_path(&mut self.tabs, &mut self.settings, path);
                             gpu.request_redraw();
                             return;
                         }
@@ -749,14 +935,113 @@ impl winit::application::ApplicationHandler for Application {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_save_name, focus_group, focus_tab};
+    use super::{collect_files, default_save_name, focus_group, focus_tab, open_path, run_command};
     use crate::editor::Editor;
+    use crate::palette::Palette;
+    use crate::search::SearchBar;
+    use crate::settings;
     use crate::tabs::Tabs;
+    use std::time::Instant;
 
     #[test]
     fn default_save_name_keeps_or_adds_extension() {
         assert_eq!(default_save_name("foo.rs"), "foo.rs");
         assert_eq!(default_save_name("sin título"), "sin título.txt");
+    }
+
+    #[test]
+    fn collect_files_walks_skipping_noise_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}").expect("a.rs");
+        std::fs::create_dir(dir.path().join("sub")).expect("sub");
+        std::fs::write(dir.path().join("sub").join("b.rs"), "").expect("b.rs");
+        std::fs::create_dir(dir.path().join(".git")).expect(".git");
+        std::fs::write(dir.path().join(".git").join("cfg"), "").expect("cfg");
+        std::fs::create_dir(dir.path().join("target")).expect("target");
+        std::fs::write(dir.path().join("target").join("gen.rs"), "").expect("gen");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("nm");
+        std::fs::write(dir.path().join("node_modules").join("x.js"), "").expect("x");
+
+        let names: Vec<String> = collect_files(dir.path(), 20_000)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(dir.path())
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(names, vec!["a.rs".to_string(), "sub/b.rs".to_string()]);
+        assert!(
+            !names.iter().any(|n| n.starts_with(".git")
+                || n.starts_with("target")
+                || n.starts_with("node_modules")),
+            "los directorios ruidosos quedan fuera: {names:?}"
+        );
+
+        // El tope corta el recorrido.
+        assert_eq!(collect_files(dir.path(), 1).len(), 1);
+    }
+
+    #[test]
+    fn open_path_focuses_existing_or_adds_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        let mut tabs = Tabs::new(Editor::from_cli(a.clone()));
+        let mut settings = settings::Settings::default();
+
+        open_path(&mut tabs, &mut settings, b.clone());
+        assert_eq!(tabs.len(), 2, "archivo nuevo → pestaña nueva");
+        assert_eq!(tabs.active().tab_label(), "b.rs", "la nueva queda activa");
+
+        open_path(&mut tabs, &mut settings, a.clone());
+        assert_eq!(tabs.len(), 2, "ya abierta → no duplica");
+        assert_eq!(tabs.active().tab_label(), "a.rs", "enfoca la existente");
+        assert!(tabs.active().focused(), "toma el foco");
+    }
+
+    #[test]
+    fn save_notifies_success_and_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.txt");
+        let mut tabs = Tabs::new(Editor::from_cli(path));
+        let mut clipboard = None;
+        let mut palette = Palette::default();
+        let mut search = SearchBar::default();
+        let mut settings = settings::Settings::default();
+        let mut notice: Option<(String, Instant)> = None;
+
+        tabs.active_mut().insert_text("hola");
+        run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut settings,
+            &mut notice,
+            "file.save",
+        );
+        let (text, _) = notice.take().expect("aviso de guardado");
+        assert!(text.starts_with("Guardado: a.txt"), "{text}");
+        assert!(!tabs.active().dirty(), "guardar limpia la marca");
+
+        // Error: la ruta no existe como directorio → no se puede escribir.
+        let mut broken = Tabs::new(Editor::from_cli(
+            dir.path().join("inexistente").join("x.txt"),
+        ));
+        notice = None;
+        run_command(
+            &mut broken,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut settings,
+            &mut notice,
+            "file.save",
+        );
+        let (text, _) = notice.take().expect("aviso de error");
+        assert!(text.starts_with("Error al guardar"), "{text}");
     }
 
     #[test]

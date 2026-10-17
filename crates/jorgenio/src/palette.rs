@@ -1,7 +1,11 @@
-//! Paleta de comandos (Ctrl+Shift+P): fuzzy matching con `nucleo-matcher`,
-//! dibujada en la capa superior de la [`Scene`] (tras todo el contenido).
+//! Paleta de comandos (Ctrl+Shift+P) y búsqueda rápida de archivos
+//! (Ctrl+P): fuzzy matching con `nucleo-matcher`, dibujada en la capa
+//! superior de la [`Scene`] (tras todo el contenido).
 //!
-//! La resuelve `main.rs`: [`Action::Run`] trae el id del comando ejecutable.
+//! La resuelve `main.rs`: [`Action::Run`] trae el id del comando ejecutable
+//! y [`Action::Open`] el archivo elegido en el modo de archivos.
+
+use std::path::{Path, PathBuf};
 
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -42,6 +46,8 @@ pub enum Action {
     Close,
     /// Ejecutar el comando con este id.
     Run(&'static str),
+    /// Abrir este archivo (modo rápido, Ctrl+P).
+    Open(PathBuf),
 }
 
 /// Qué toca el ratón dentro de la paleta abierta ([`Palette::click`]).
@@ -53,6 +59,15 @@ pub enum Click {
     Panel,
     /// Una fila de resultados: ejecutar este comando.
     Command(&'static str),
+    /// Una fila de archivos: abrir este archivo.
+    File(PathBuf),
+}
+
+/// Qué lista está puntuando la paleta.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Commands,
+    Files,
 }
 
 /// Geometría del panel del último render (para [`Palette::click`]).
@@ -71,13 +86,18 @@ struct PanelRect {
 pub struct Palette {
     open: bool,
     query: String,
-    /// Índice dentro de `matches` (no de `COMMANDS`).
+    /// Índice dentro de `matches` (no de la lista fuente).
     selected: usize,
     scroll: usize,
-    /// Índices de `COMMANDS` que puntúan, de mayor a menor.
+    /// Índices de la lista fuente que puntúan, de mayor a menor.
     matches: Vec<usize>,
     matcher: Matcher,
     panel: Option<PanelRect>,
+    /// Lista fuente: comandos (estáticos) o archivos (del último Ctrl+P).
+    mode: Mode,
+    /// Raíz del Ctrl+P (para rutas relativas en pantalla y en el match).
+    root: PathBuf,
+    files: Vec<PathBuf>,
 }
 
 impl Default for Palette {
@@ -90,6 +110,9 @@ impl Default for Palette {
             matches: (0..COMMANDS.len()).collect(),
             matcher: Matcher::new(Config::DEFAULT),
             panel: None,
+            mode: Mode::Commands,
+            root: PathBuf::new(),
+            files: Vec::new(),
         }
     }
 }
@@ -99,10 +122,23 @@ impl Palette {
         self.open
     }
 
-    /// Abre vacía (Ctrl+Shift+P): muestra todos los comandos.
+    /// Abre en modo comandos (Ctrl+Shift+P): muestra todos los comandos.
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
+        self.mode = Mode::Commands;
+        self.root.clear();
+        self.files.clear();
+        self.refilter();
+    }
+
+    /// Abre en modo archivos (Ctrl+P) sobre `root` con el árbol ya recogido.
+    pub fn open_files(&mut self, root: PathBuf, files: Vec<PathBuf>) {
+        self.open = true;
+        self.query.clear();
+        self.mode = Mode::Files;
+        self.root = root;
+        self.files = files;
         self.refilter();
     }
 
@@ -129,20 +165,40 @@ impl Palette {
     }
 
     /// Re-evalúa el fuzzy match sobre `query` y reordena por puntuación
-    /// (sort estable: los empates conservan el orden de `COMMANDS`).
+    /// (sort estable: los empates conservan el orden de la lista fuente).
     fn refilter(&mut self) {
         let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
-        let mut scored: Vec<(usize, u32)> = COMMANDS
-            .iter()
-            .enumerate()
-            .filter_map(|(index, command)| {
-                let hay = format!("{} {} {}", command.name, command.category, command.id);
-                let hay = Utf32String::from(hay.as_str());
-                pattern
-                    .score(hay.slice(..), &mut self.matcher)
-                    .map(|score| (index, score))
-            })
-            .collect();
+        let mut scored: Vec<(usize, u32)> = match self.mode {
+            Mode::Commands => COMMANDS
+                .iter()
+                .enumerate()
+                .filter_map(|(index, command)| {
+                    let hay = format!("{} {} {}", command.name, command.category, command.id);
+                    let hay = Utf32String::from(hay.as_str());
+                    pattern
+                        .score(hay.slice(..), &mut self.matcher)
+                        .map(|score| (index, score))
+                })
+                .collect(),
+            Mode::Files => {
+                // Las etiquetas se materializan antes: `matcher` pide &mut.
+                let labels: Vec<String> = self
+                    .files
+                    .iter()
+                    .map(|path| rel_label(&self.root, path))
+                    .collect();
+                labels
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, hay)| {
+                        let hay = Utf32String::from(hay.as_str());
+                        pattern
+                            .score(hay.slice(..), &mut self.matcher)
+                            .map(|score| (index, score))
+                    })
+                    .collect()
+            }
+        };
         scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
         self.matches = scored.into_iter().map(|(index, _)| index).collect();
         self.selected = 0;
@@ -173,13 +229,13 @@ impl Palette {
         }
         match key {
             Key::Named(NamedKey::Escape) => Action::Close,
-            Key::Named(NamedKey::Enter) => {
-                if let Some(&index) = self.matches.get(self.selected) {
-                    Action::Run(COMMANDS[index].id)
-                } else {
-                    Action::Close
-                }
-            }
+            Key::Named(NamedKey::Enter) => match self.matches.get(self.selected) {
+                Some(&index) => match self.mode {
+                    Mode::Commands => Action::Run(COMMANDS[index].id),
+                    Mode::Files => Action::Open(self.files[index].clone()),
+                },
+                None => Action::Close,
+            },
             Key::Named(NamedKey::Backspace) => {
                 if self.query.pop().is_some() {
                     self.refilter();
@@ -221,7 +277,10 @@ impl Palette {
         let row = ((y - panel.rows_y) / ROW_H).floor() as usize;
         let index = row + self.scroll;
         if row < panel.rows && index < self.matches.len() {
-            Click::Command(COMMANDS[self.matches[index]].id)
+            match self.mode {
+                Mode::Commands => Click::Command(COMMANDS[self.matches[index]].id),
+                Mode::Files => Click::File(self.files[self.matches[index]].clone()),
+            }
         } else {
             Click::Panel
         }
@@ -300,25 +359,53 @@ impl Palette {
             .push(Quad::new(x, highlight_y, width, ROW_H, HIGHLIGHT));
 
         for (visible, &index) in self.matches.iter().skip(self.scroll).take(rows).enumerate() {
-            let command = &COMMANDS[index];
             let y = TOP + PROMPT_H + 1.0 + visible as f32 * ROW_H + (ROW_H - FONT_SIZE) / 2.0;
-            scene
-                .top_texts
-                .push(TextSpan::new(command.name, x + 8.0, y, FONT_SIZE, FG));
-            // Categoría + atajo, alineados a la derecha; se omiten si pisan
-            // el nombre (viewport muy estrecho).
-            let right = match commands::keys_for(command.id) {
-                Some(keys) => format!("{}  {keys}", command.category),
-                None => command.category.to_string(),
-            };
-            let right_x = x + width - 8.0 - right.chars().count() as f32 * advance;
-            if right_x > x + 8.0 + command.name.chars().count() as f32 * advance + 4.0 {
-                scene
-                    .top_texts
-                    .push(TextSpan::new(right, right_x, y, FONT_SIZE, DIM));
+            match self.mode {
+                Mode::Commands => {
+                    let command = &COMMANDS[index];
+                    scene
+                        .top_texts
+                        .push(TextSpan::new(command.name, x + 8.0, y, FONT_SIZE, FG));
+                    // Categoría + atajo, alineados a la derecha; se omiten si pisan
+                    // el nombre (viewport muy estrecho).
+                    let right = match commands::keys_for(command.id) {
+                        Some(keys) => format!("{}  {keys}", command.category),
+                        None => command.category.to_string(),
+                    };
+                    let right_x = x + width - 8.0 - right.chars().count() as f32 * advance;
+                    if right_x > x + 8.0 + command.name.chars().count() as f32 * advance + 4.0 {
+                        scene
+                            .top_texts
+                            .push(TextSpan::new(right, right_x, y, FONT_SIZE, DIM));
+                    }
+                }
+                Mode::Files => {
+                    // Ruta relativa; si no cabe, se corta por la izquierda
+                    // (conservando el nombre del archivo).
+                    let label = rel_label(&self.root, &self.files[index]);
+                    let max_chars = ((width - 16.0) / advance).floor().max(1.0) as usize;
+                    let label = if label.chars().count() > max_chars {
+                        let skip = label.chars().count() - max_chars + 1;
+                        format!("…{}", label.chars().skip(skip).collect::<String>())
+                    } else {
+                        label
+                    };
+                    scene
+                        .top_texts
+                        .push(TextSpan::new(label, x + 8.0, y, FONT_SIZE, FG));
+                }
             }
         }
     }
+}
+
+/// Ruta relativa a `root` con `/` (para mostrarla y puntuarla igual que
+/// la teclea el usuario). Fuera de `root` se queda con la ruta completa.
+fn rel_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -501,6 +588,73 @@ mod tests {
         assert_eq!(
             palette.click(panel.x + 10.0, panel.rows_y + 5.0),
             Click::Miss
+        );
+    }
+
+    #[test]
+    fn open_files_matches_relative_paths_with_slashes() {
+        let mut palette = Palette::default();
+        palette.open_files(
+            std::path::PathBuf::from("D:\\p"),
+            vec![
+                std::path::PathBuf::from("D:\\p\\src\\main.rs"),
+                std::path::PathBuf::from("D:\\p\\README.md"),
+                std::path::PathBuf::from("D:\\p\\target\\gen.rs"),
+            ],
+        );
+        assert!(palette.is_open());
+        assert_eq!(palette.matches.len(), 3, "query vacía: todos");
+
+        // La etiqueta usa '/', así que se teclea con '/'.
+        palette.push_text("src/ma");
+        assert_eq!(palette.matches.len(), 1, "solo el fuente");
+        let action = palette.handle_key(&Key::Named(NamedKey::Enter), mods());
+        assert_eq!(
+            action,
+            Action::Open(std::path::PathBuf::from("D:\\p\\src\\main.rs")),
+            "Enter abre el archivo elegido"
+        );
+
+        // Abrir en modo comandos reactiva la lista de comandos.
+        palette.open();
+        assert_eq!(palette.matches.len(), COMMANDS.len());
+        assert_eq!(palette.files.len(), 0);
+    }
+
+    #[test]
+    fn files_mode_click_returns_the_path() {
+        let mut palette = Palette::default();
+        palette.open_files(
+            std::path::PathBuf::from("D:\\p"),
+            vec![std::path::PathBuf::from("D:\\p\\a.rs")],
+        );
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        let panel = palette.panel.expect("render guarda el panel");
+        assert_eq!(
+            palette.click(panel.x + 10.0, panel.rows_y + 5.0),
+            Click::File(std::path::PathBuf::from("D:\\p\\a.rs"))
+        );
+        // La fila pinta la ruta relativa, con '/' y sin el prefijo del root.
+        assert!(scene.top_texts.iter().any(|span| span.text == "a.rs"));
+    }
+
+    #[test]
+    fn open_files_with_no_candidates_shows_the_empty_hint() {
+        let mut palette = Palette::default();
+        palette.open_files(std::path::PathBuf::from("D:\\p"), Vec::new());
+        assert!(palette.matches.is_empty());
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        assert!(
+            scene
+                .top_texts
+                .iter()
+                .any(|span| span.text.contains("sin coincidencias"))
+        );
+        assert_eq!(
+            palette.handle_key(&Key::Named(NamedKey::Enter), mods()),
+            Action::Close
         );
     }
 }

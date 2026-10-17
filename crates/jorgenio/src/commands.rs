@@ -34,6 +34,7 @@ pub const fn bind(
 
 pub static KEYMAP: &[Binding] = &[
     bind("p", true, true, false, "palette.show"),
+    bind("p", true, false, false, "quickopen.show"),
     bind("n", true, false, false, "file.new"),
     bind("o", true, false, false, "file.open"),
     bind("s", true, false, false, "file.save"),
@@ -98,6 +99,11 @@ pub static COMMANDS: &[Command] = &[
     Command {
         id: "file.close",
         name: "Cerrar pestaña",
+        category: "Archivo",
+    },
+    Command {
+        id: "quickopen.show",
+        name: "Búsqueda rápida de archivos",
         category: "Archivo",
     },
     Command {
@@ -308,6 +314,7 @@ mod tests {
         assert_eq!(keys_for("view.split").as_deref(), Some("Ctrl+\\"));
         assert_eq!(keys_for("view.unsplit").as_deref(), Some("Ctrl+Shift+\\"));
         assert_eq!(keys_for("settings.open").as_deref(), Some("Ctrl+,"));
+        assert_eq!(keys_for("quickopen.show").as_deref(), Some("Ctrl+P"));
         assert_eq!(keys_for("missing.command"), None);
     }
 

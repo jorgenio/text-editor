@@ -39,6 +39,8 @@ pub struct Tabs {
     layout: Vec<GroupLayout>,
     /// Tema de la barra y de todos los editores (lo fija `apply_prefs`).
     theme: Theme,
+    /// Tamaño de la etiqueta de pestaña en px (lo fija `apply_prefs`).
+    font_size: f32,
 }
 
 impl Tabs {
@@ -52,6 +54,7 @@ impl Tabs {
             active_group: 0,
             layout: Vec::new(),
             theme: Theme::dark(),
+            font_size: FONT_SIZE,
         }
     }
 
@@ -67,6 +70,7 @@ impl Tabs {
             active_group: 0,
             layout: Vec::new(),
             theme: Theme::dark(),
+            font_size: FONT_SIZE,
         }
     }
 
@@ -192,10 +196,12 @@ impl Tabs {
     pub fn apply_prefs(&mut self, prefs: &crate::settings::Settings) {
         let theme = Theme::from_name(&prefs.theme);
         self.theme = theme;
+        self.font_size = prefs.font_size as f32;
         for group in &mut self.groups {
             for editor in &mut group.list {
                 editor.set_tab_width(prefs.tab_width);
                 editor.set_show_line_numbers(prefs.show_line_numbers);
+                editor.set_font_size(prefs.font_size);
                 editor.set_theme(theme);
             }
         }
@@ -321,7 +327,11 @@ impl Tabs {
                 }
 
                 // Etiqueta: se trunca por la cola si no cabe ("muy_lar…").
-                let capacity = ((w - 2.0 * TAB_PAD) / advance).floor().max(1.0) as usize;
+                // La etiqueta se limita a 24 px para no salirse de la barra
+                // de 32 px; el advance se reescala para truncar con exactitud.
+                let font = self.font_size.min(24.0);
+                let label_advance = advance * font / self.font_size;
+                let capacity = ((w - 2.0 * TAB_PAD) / label_advance).floor().max(1.0) as usize;
                 if label.chars().count() > capacity {
                     let head: String = label.chars().take(capacity.saturating_sub(1)).collect();
                     label = format!("{head}\u{2026}");
@@ -329,8 +339,8 @@ impl Tabs {
                 scene.top_texts.push(TextSpan::new(
                     label,
                     x + TAB_PAD,
-                    (TAB_BAR_H - FONT_SIZE) / 2.0,
-                    FONT_SIZE,
+                    (TAB_BAR_H - font) / 2.0,
+                    font,
                     if is_active {
                         self.theme.fg
                     } else {
@@ -582,5 +592,44 @@ mod tests {
         let mut scene = Scene::new(wgpu::Color::BLACK);
         tabs.render(&mut scene, (800.0, 600.0), 8.0);
         assert_eq!(scene.top_quads[0].color, Theme::light().bar_bg);
+    }
+
+    #[test]
+    fn apply_prefs_sets_the_font_size_on_bar_and_editors() {
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.add(tab_named("b.rs"));
+        tabs.split();
+        assert_eq!(tabs.font_size, FONT_SIZE, "arranca con el default");
+
+        let prefs = crate::settings::Settings {
+            font_size: 24,
+            ..crate::settings::Settings::default()
+        };
+        tabs.apply_prefs(&prefs);
+        assert_eq!(tabs.font_size, 24.0, "la etiqueta de la barra");
+        assert_eq!(tabs.active().font_size(), 24.0, "editor activo");
+        assert_eq!(
+            tabs.group_active_mut(1).font_size(),
+            24.0,
+            "todos los grupos, no solo el activo"
+        );
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 12.0);
+        let label = scene.top_texts.first().expect("etiqueta dibujada");
+        assert_eq!(label.size, 24.0, "la etiqueta usa el tamaño pedido");
+        assert_eq!(label.y, (TAB_BAR_H - 24.0) / 2.0, "centrada en la barra");
+
+        // Por encima de 24 px la etiqueta se limita para no salirse de
+        // la barra de 32 px.
+        let big = crate::settings::Settings {
+            font_size: 40,
+            ..crate::settings::Settings::default()
+        };
+        tabs.apply_prefs(&big);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 16.0);
+        let label = scene.top_texts.first().expect("etiqueta dibujada");
+        assert_eq!(label.size, 24.0, "tope por la altura de la barra");
     }
 }

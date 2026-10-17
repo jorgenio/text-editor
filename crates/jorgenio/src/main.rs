@@ -655,8 +655,11 @@ impl winit::application::ApplicationHandler for Application {
                     }
                 }
                 let mut scene = scene.expect("siempre hay al menos un grupo");
-                self.tabs
-                    .render(&mut scene, viewport, editor::FONT_SIZE * advance);
+                self.tabs.render(
+                    &mut scene,
+                    viewport,
+                    self.settings.font_size as f32 * advance,
+                );
                 self.search.render(
                     &mut scene,
                     viewport,
@@ -819,7 +822,7 @@ impl winit::application::ApplicationHandler for Application {
                         }
                     }
                     if self.drag_active {
-                        let advance = editor::FONT_SIZE * gpu.advance_ratio();
+                        let advance = self.settings.font_size as f32 * gpu.advance_ratio();
                         self.tabs
                             .active_mut()
                             .select_to(self.cursor.x, self.cursor.y, advance);
@@ -906,7 +909,7 @@ impl winit::application::ApplicationHandler for Application {
                 self.drag_origin = Some(self.cursor);
                 self.drag_active = false;
 
-                let advance = editor::FONT_SIZE * gpu.advance_ratio();
+                let advance = self.settings.font_size as f32 * gpu.advance_ratio();
                 let shift = self.modifiers.shift_key();
                 let active = self.tabs.active_mut();
                 if self.modifiers.alt_key() && count == 1 {
@@ -927,7 +930,9 @@ impl winit::application::ApplicationHandler for Application {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * editor::LINE_HEIGHT * 3.0,
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        y * editor::line_height_for(self.settings.font_size as f32) * 3.0
+                    }
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
                 // Rueda sobre el panel bajo el cursor (sin robar el foco, como

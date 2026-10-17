@@ -22,10 +22,18 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::snippets;
 use crate::theme::Theme;
 
+/// Tamaño de fuente por defecto en px (`font_size` de settings lo cambia).
 pub const FONT_SIZE: f32 = 14.0;
+/// Altura de línea por defecto en px (10/7 del tamaño por defecto: 14 → 20).
 pub const LINE_HEIGHT: f32 = 20.0;
 /// Ancho de tabulador por defecto (el `settings.json` lo sobrescribe).
 pub const TAB_WIDTH: usize = 4;
+
+/// Altura de línea en px para un tamaño de fuente dado, con la misma
+/// proporción que los defaults (14 px → 20 px exactos).
+pub fn line_height_for(font_size: f32) -> f32 {
+    font_size * LINE_HEIGHT / FONT_SIZE
+}
 
 /// Inicio del área de código (tras el gutter).
 const CODE_X: f32 = 64.0;
@@ -88,6 +96,9 @@ pub struct Editor {
     tab_width: usize,
     /// ¿Dibujar los números de línea? (`show_line_numbers` de preferencias).
     show_line_numbers: bool,
+    /// Tamaño de la fuente en px (preferencias; ver [`FONT_SIZE`]). El
+    /// advance, la altura de línea y el gutter se derivan de él.
+    font_size: f32,
     /// Tema de colores activo (oscuro Monokai / claro); lo fija `main`.
     theme: Theme,
     /// Buscar (Ctrl+F): rangos de `find_query` en orden, y el actual.
@@ -115,6 +126,7 @@ impl Default for Editor {
             left_inset: 0.0,
             tab_width: TAB_WIDTH,
             show_line_numbers: true,
+            font_size: FONT_SIZE,
             theme: Theme::dark(),
             find: Vec::new(),
             find_current: 0,
@@ -219,6 +231,22 @@ impl Editor {
         self.show_line_numbers = show;
     }
 
+    /// Tamaño de la fuente en px (recortado a 8-72). La altura de línea,
+    /// el advance del código y el ancho del gutter se derivan solos.
+    pub fn set_font_size(&mut self, px: u32) {
+        self.font_size = px.clamp(8, 72) as f32;
+    }
+
+    /// Altura de línea actual en px (derivada del tamaño de la fuente).
+    fn line_height(&self) -> f32 {
+        line_height_for(self.font_size)
+    }
+
+    /// Proporción de tamaño frente al default (1.0 = sin cambiar).
+    fn font_ratio(&self) -> f32 {
+        self.font_size / FONT_SIZE
+    }
+
     /// Fija el tema de colores; si cambia la paleta de syntect se invalida
     /// el resaltado cacheado y el siguiente frame re-resalta en el nuevo tono.
     pub fn set_theme(&mut self, theme: Theme) {
@@ -234,13 +262,20 @@ impl Editor {
         self.theme
     }
 
-    /// Inicio del área de código según el gutter (preferencias).
+    /// Inicio del área de código según el gutter (preferencias); escala
+    /// con el tamaño de fuente para que los números no pisen el código.
     fn code_offset(&self) -> f32 {
         if self.show_line_numbers {
-            CODE_X
+            CODE_X * self.font_ratio()
         } else {
             HIDDEN_GUTTER_X
         }
+    }
+
+    /// Derecha de los números de línea (alineados hacia ella); escala con
+    /// el tamaño de fuente (14 px → 56 px exactos).
+    fn gutter_right(&self) -> f32 {
+        GUTTER_RIGHT_X * self.font_ratio()
     }
 
     /// Solo para tests (comprobar la geometría de un split).
@@ -259,6 +294,12 @@ impl Editor {
     #[cfg(test)]
     pub fn show_line_numbers(&self) -> bool {
         self.show_line_numbers
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn font_size(&self) -> f32 {
+        self.font_size
     }
 
     pub fn focused(&self) -> bool {
@@ -1209,19 +1250,22 @@ impl Editor {
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
         let bg = self.theme.editor_bg;
         let mut scene = Scene::new(srgb(bg.0, bg.1, bg.2));
-        let advance = FONT_SIZE * advance_ratio;
+        let advance = self.font_size * advance_ratio;
+        let line_h = self.line_height();
+        let font = self.font_size;
         let line_count = self.buffer.line_count();
         let inset = self.top_inset;
         let xin = self.left_inset;
         let cx = xin + self.code_offset();
+        let gutter_right = xin + self.gutter_right();
         let tab_width = self.tab_width;
 
-        let visible_first = (((self.scroll_y - inset - PADDING_TOP) / LINE_HEIGHT)
+        let visible_first = (((self.scroll_y - inset - PADDING_TOP) / line_h)
             .floor()
             .max(0.0) as usize)
             .min(line_count - 1);
-        let visible_last = (((self.scroll_y + viewport.1 - inset - PADDING_TOP) / LINE_HEIGHT)
-            .ceil() as usize)
+        let visible_last = (((self.scroll_y + viewport.1 - inset - PADDING_TOP) / line_h).ceil()
+            as usize)
             .min(line_count - 1);
 
         self.syntax.set_extension(&self.lang);
@@ -1236,6 +1280,7 @@ impl Editor {
             scroll_y: self.scroll_y,
             advance,
             tab_width,
+            line_height: line_h,
         };
         for cursor in &self.cursors {
             let range = cursor.range();
@@ -1254,7 +1299,7 @@ impl Editor {
 
         let caret_line = self.buffer.char_to_line(self.primary().caret);
         for line in visible_first..=visible_last {
-            let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
+            let y = inset + PADDING_TOP + line as f32 * line_h - self.scroll_y;
             if self.show_line_numbers {
                 let color = if line == caret_line {
                     self.theme.gutter_current
@@ -1262,10 +1307,10 @@ impl Editor {
                     self.theme.gutter_fg
                 };
                 let number = format!("{}", line + 1);
-                let number_x = xin + GUTTER_RIGHT_X - number.len() as f32 * advance;
+                let number_x = gutter_right - number.len() as f32 * advance;
                 scene
                     .texts
-                    .push(TextSpan::new(number, number_x, y, FONT_SIZE, color));
+                    .push(TextSpan::new(number, number_x, y, font, color));
             }
 
             let text = self.buffer.line_text(line);
@@ -1276,7 +1321,7 @@ impl Editor {
             if tokens.is_empty() {
                 scene
                     .texts
-                    .push(TextSpan::new(text, cx, y, FONT_SIZE, self.theme.fg));
+                    .push(TextSpan::new(text, cx, y, font, self.theme.fg));
                 continue;
             }
             // Columnas de TODOS los tokens en un solo recorrido de la línea
@@ -1294,7 +1339,7 @@ impl Editor {
                     piece,
                     cx + cells as f32 * advance,
                     y,
-                    FONT_SIZE,
+                    font,
                     token.color,
                 ));
             }
@@ -1306,14 +1351,14 @@ impl Editor {
                 if line < visible_first || line > visible_last {
                     continue;
                 }
-                let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - self.scroll_y;
+                let y = inset + PADDING_TOP + line as f32 * line_h - self.scroll_y;
                 let col = cursor.caret - self.buffer.line_to_char(line);
                 let cells = movement::visual_column(&self.buffer.line_text(line), col, tab_width);
                 scene.overlays.push(Quad::new(
                     cx + cells as f32 * advance,
                     y,
                     CARET_WIDTH,
-                    LINE_HEIGHT - 2.0,
+                    line_h - 2.0,
                     self.theme.caret,
                 ));
             }
@@ -1442,7 +1487,8 @@ impl Editor {
         let visual = ((x - self.left_inset - self.code_offset()) / advance)
             .floor()
             .max(0.0) as usize;
-        let line_f = ((y - self.top_inset - PADDING_TOP + self.scroll_y) / LINE_HEIGHT).floor();
+        let line_f =
+            ((y - self.top_inset - PADDING_TOP + self.scroll_y) / self.line_height()).floor();
         let line = (line_f.max(0.0) as usize).min(self.buffer.line_count() - 1);
         let text = self.buffer.line_text(line);
         let char_col = movement::char_col_at_visual(&text, visual, self.tab_width);
@@ -1450,7 +1496,7 @@ impl Editor {
     }
 
     fn page_lines(&self) -> isize {
-        ((self.viewport.1 / LINE_HEIGHT) as isize).max(1)
+        ((self.viewport.1 / self.line_height()) as isize).max(1)
     }
 
     fn scroll_into_view(&mut self) {
@@ -1461,8 +1507,9 @@ impl Editor {
     /// Garantiza que la posición `pos` (un offset de char) quede a la vista.
     fn scroll_position_into_view(&mut self, pos: usize) {
         let line = self.buffer.char_to_line(pos);
-        let top = self.top_inset + PADDING_TOP + line as f32 * LINE_HEIGHT;
-        let bottom = top + LINE_HEIGHT;
+        let line_h = self.line_height();
+        let top = self.top_inset + PADDING_TOP + line as f32 * line_h;
+        let bottom = top + line_h;
         if top < self.scroll_y {
             self.scroll_y = top;
         } else if bottom > self.scroll_y + self.viewport.1 {
@@ -1475,15 +1522,16 @@ impl Editor {
     /// saltarse el repintar (el estado de blink se conserva).
     pub fn caret_in_view(&self) -> bool {
         let line = self.buffer.char_to_line(self.primary().caret);
-        let top = self.top_inset + PADDING_TOP + line as f32 * LINE_HEIGHT;
-        let bottom = top + LINE_HEIGHT;
+        let line_h = self.line_height();
+        let top = self.top_inset + PADDING_TOP + line as f32 * line_h;
+        let bottom = top + line_h;
         bottom > self.scroll_y && top < self.scroll_y + self.viewport.1
     }
 
     fn clamp_scroll(&mut self) {
         let content_h = self.top_inset
             + PADDING_TOP
-            + self.buffer.line_count() as f32 * LINE_HEIGHT
+            + self.buffer.line_count() as f32 * self.line_height()
             + PADDING_TOP;
         self.scroll_y = self
             .scroll_y
@@ -1515,6 +1563,7 @@ struct RangeCtx {
     scroll_y: f32,
     advance: f32,
     tab_width: usize,
+    line_height: f32,
 }
 
 /// Quad de selección/coincidencia para `range`, recortado a las líneas
@@ -1537,12 +1586,13 @@ fn push_range_quad(
         scroll_y,
         advance,
         tab_width,
+        line_height,
     } = ctx;
     let first = buffer.char_to_line(range.start);
     let last = buffer.char_to_line(range.end.saturating_sub(1));
     // Solo la intersección con lo visible: O(viewport), no O(rango).
     for line in visible_line_range(first, last, visible_first, visible_last) {
-        let y = inset + PADDING_TOP + line as f32 * LINE_HEIGHT - scroll_y;
+        let y = inset + PADDING_TOP + line as f32 * line_height - scroll_y;
         let text = buffer.line_text(line);
         let line_start = buffer.line_to_char(line);
 
@@ -1567,7 +1617,7 @@ fn push_range_quad(
         let x = code_x + start_cells as f32 * advance;
         let w = (end_cells.saturating_sub(start_cells)) as f32 * advance;
         if w > 0.0 {
-            scene.quads.push(Quad::new(x, y, w, LINE_HEIGHT, color));
+            scene.quads.push(Quad::new(x, y, w, line_height, color));
         }
     }
 }
@@ -2256,6 +2306,60 @@ mod tests {
         );
         let light_scene = editor.build_scene((600.0, 200.0), 1.0);
         assert!(!has_pink(&light_scene), "InspiredGitHub no lleva rosa");
+    }
+
+    #[test]
+    fn font_size_scales_line_height_advance_and_gutter() {
+        let mut editor = Editor::default();
+        assert_eq!(editor.line_height(), LINE_HEIGHT, "14 px → 20 px exactos");
+        assert_eq!(editor.code_offset(), CODE_X, "gutter por defecto");
+        assert_eq!(editor.gutter_right(), GUTTER_RIGHT_X);
+
+        editor.set_font_size(28);
+        assert_eq!(editor.line_height(), 40.0, "misma proporción 10/7");
+        assert_eq!(editor.code_offset(), CODE_X * 2.0, "el código se desplaza");
+        assert_eq!(editor.gutter_right(), GUTTER_RIGHT_X * 2.0);
+
+        editor.set_font_size(1);
+        assert_eq!(editor.font_size, 8.0, "suelo de 8 px");
+        editor.set_font_size(999);
+        assert_eq!(editor.font_size, 72.0, "techo de 72 px");
+    }
+
+    #[test]
+    fn build_scene_uses_the_configured_font_size() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola\nmundo");
+
+        let small = editor.build_scene((600.0, 200.0), 1.0);
+        let small_line2 = small
+            .texts
+            .iter()
+            .find(|span| span.text == "mundo")
+            .expect("la segunda línea está a la vista");
+        assert_eq!(small_line2.y, PADDING_TOP + LINE_HEIGHT);
+        assert_eq!(small_line2.size, FONT_SIZE);
+
+        editor.set_font_size(28);
+        let big = editor.build_scene((600.0, 200.0), 1.0);
+        let big_line2 = big
+            .texts
+            .iter()
+            .find(|span| span.text == "mundo")
+            .expect("la segunda línea sigue a la vista");
+        assert_eq!(big_line2.y, PADDING_TOP + 40.0, "línea a 40 px");
+        assert_eq!(big_line2.size, 28.0, "texto en el tamaño pedido");
+        assert_eq!(big.overlays[0].h, 40.0 - 2.0, "caret = línea − 2 px");
+        let number = big
+            .texts
+            .iter()
+            .find(|span| span.text == "1")
+            .expect("número de línea");
+        assert_eq!(
+            number.x,
+            GUTTER_RIGHT_X * 2.0 - 28.0,
+            "una cifra alineada a la derecha del gutter escalado"
+        );
     }
 
     #[test]

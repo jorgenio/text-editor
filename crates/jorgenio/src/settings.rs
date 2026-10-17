@@ -22,6 +22,8 @@ pub struct Settings {
     pub show_line_numbers: bool,
     /// Parpadeo del caret en ms (50-10000).
     pub caret_blink_ms: u64,
+    /// Tamaño de la fuente en px del editor y la barra (8-72).
+    pub font_size: u32,
     /// Tema de colores: "dark" (Monokai, por defecto) o "light".
     pub theme: String,
 }
@@ -32,6 +34,7 @@ impl Default for Settings {
             tab_width: 4,
             show_line_numbers: true,
             caret_blink_ms: 530,
+            font_size: 14,
             theme: "dark".to_owned(),
         }
     }
@@ -163,12 +166,14 @@ pub fn jsonc_to_json(input: &str) -> String {
 }
 
 /// Parsea el contenido de `settings.json`; errores y valores fuera de rango
-/// se normalizan (tab 1-32, blink 50-10000 ms, tema → "dark"/"light").
+/// se normalizan (tab 1-32, blink 50-10000 ms, fuente 8-72 px, tema →
+/// "dark"/"light").
 pub fn parse(text: &str) -> Result<Settings, String> {
     let json = jsonc_to_json(text);
     let mut settings: Settings = serde_json::from_str(&json).map_err(|err| err.to_string())?;
     settings.tab_width = settings.tab_width.clamp(1, 32);
     settings.caret_blink_ms = settings.caret_blink_ms.clamp(50, 10_000);
+    settings.font_size = settings.font_size.clamp(8, 72);
     // Solo existen dos temas: cualquier valor desconocido vuelve al oscuro.
     settings.theme = settings.theme.trim().to_lowercase();
     if settings.theme != "light" {
@@ -212,6 +217,9 @@ pub fn default_template() -> &'static str {
 
     // Parpadeo del caret en milisegundos (50-10000).
     "caret_blink_ms": 530,
+
+    // Tamaño de la fuente en píxeles del editor (8-72).
+    "font_size": 14,
 
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
     "theme": "dark",
@@ -282,6 +290,7 @@ mod tests {
         assert_eq!(partial.tab_width, 8);
         assert!(partial.show_line_numbers, "los ausentes son default");
         assert_eq!(partial.caret_blink_ms, 530);
+        assert_eq!(partial.font_size, 14, "ausente → tamaño por defecto");
         // Campo desconocido: se ignora (archivos de versiones futuras).
         assert!(parse("{\"no_existe\": true}").is_ok());
         // Contenido que no es JSON → error, no pánic.
@@ -291,12 +300,15 @@ mod tests {
 
     #[test]
     fn parse_normalizes_out_of_range_values() {
-        let low = parse("{\"tab_width\": 0, \"caret_blink_ms\": 1}").unwrap();
+        let low = parse("{\"tab_width\": 0, \"caret_blink_ms\": 1, \"font_size\": 1}").unwrap();
         assert_eq!(low.tab_width, 1, "0 partiría la aritmética de columnas");
         assert_eq!(low.caret_blink_ms, 50, "parpadeo con suelo");
-        let high = parse("{\"tab_width\": 999, \"caret_blink_ms\": 999999}").unwrap();
+        assert_eq!(low.font_size, 8, "fuente con suelo");
+        let high =
+            parse("{\"tab_width\": 999, \"caret_blink_ms\": 999999, \"font_size\": 999}").unwrap();
         assert_eq!(high.tab_width, 32);
         assert_eq!(high.caret_blink_ms, 10_000);
+        assert_eq!(high.font_size, 72, "fuente con techo");
     }
 
     #[test]

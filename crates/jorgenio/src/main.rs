@@ -21,7 +21,7 @@ use jorgenio_ui::gpu::GpuContext;
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use palette::Palette;
 use search::SearchBar;
-use tabs::{TAB_BAR_H, Tabs};
+use tabs::{Divider, TAB_BAR_H, Tabs};
 use theme::Theme;
 use title::TitleBar;
 use winit::dpi::LogicalPosition;
@@ -97,8 +97,8 @@ struct Application {
     mouse_down: bool,
     drag_origin: Option<LogicalPosition<f32>>,
     drag_active: bool,
-    /// Arrastre del divisor de paneles activo: Some(x) con la última x.
-    divider_drag: Option<f32>,
+    /// Arrastre del divisor activo: Some(eje, última coordenada en ese eje).
+    divider_drag: Option<(Divider, f32)>,
     /// Icono actual del cursor (para no pisarlo en cada movimiento).
     cursor_icon: CursorIcon,
     /// Barra de título propia con menú embebido (M21, sin decoraciones).
@@ -361,8 +361,22 @@ fn apply_menu_action(
             );
             true
         }
+        title::Action::Layout(columns, rows) => {
+            tabs.set_layout(columns, rows);
+            notify(notice, format!("layout {columns}×{rows}"));
+            true
+        }
         title::Action::Separator => false,
     }
+}
+
+/// Área de contenido entre la barra de título y la barra de estado, donde se
+/// reparten las celdas de los paneles (M24): `(content_top, content_h)`. La
+/// altura incluye las barras de pestañas de cada fila.
+fn content_area(viewport_h: f32) -> (f32, f32) {
+    let top = title::TITLE_H;
+    let editor_h = (viewport_h - title::TITLE_H - TAB_BAR_H - STATUS_H).max(50.0);
+    (top, editor_h + TAB_BAR_H)
 }
 
 /// "archivo.rs:12" → Some(12) (goto de línea del Ctrl+P); sin sufijo
@@ -826,19 +840,18 @@ impl winit::application::ApplicationHandler for Application {
                 let advance = gpu.advance_ratio();
                 // Preferencias → glifos (no-op si el ancho no cambió).
                 gpu.set_tab_width(self.settings.tab_width as u16);
-                // Cada grupo ocupa una columna; con split, el reparto lo
-                // decide el divisor arrastrable (`split_ratio`).
-                let group_count = self.tabs.group_count();
-                let geometry = self.tabs.group_geometry(viewport.0);
-                let editor_h = (viewport.1 - title::TITLE_H - TAB_BAR_H - STATUS_H).max(50.0);
-                self.tabs.set_top(title::TITLE_H);
-                for (g, &(x, w)) in geometry.iter().enumerate() {
-                    self.tabs.set_group_geometry(g, x, w, editor_h);
+                // Cada celda es un grupo de pestañas; el reparto (columnas y
+                // filas) lo deciden los divisores arrastrables.
+                let (content_top, content_h) = content_area(viewport.1);
+                let geometry = self.tabs.group_geometry(viewport.0, content_top, content_h);
+                for (g, &(x, y, w, h)) in geometry.iter().enumerate() {
+                    self.tabs.set_group_geometry(g, x, y, w, h);
                 }
-                // Une las escenas de todos los grupos: sus franjas en x son
+                // Une las escenas de todos los grupos: sus celdas son
                 // disjuntas, así que el orden entre paneles es indiferente.
                 let mut scene: Option<Scene> = None;
-                for (g, &(_, w)) in geometry.iter().enumerate() {
+                for (g, &(_, _, w, h)) in geometry.iter().enumerate() {
+                    let editor_h = (h - TAB_BAR_H).max(50.0);
                     let part = self
                         .tabs
                         .group_active_mut(g)
@@ -849,21 +862,14 @@ impl winit::application::ApplicationHandler for Application {
                     }
                 }
                 let mut scene = scene.expect("siempre hay al menos un grupo");
+                // Barras de pestañas y divisores entre celdas (M24).
                 self.tabs.render(
                     &mut scene,
                     viewport,
                     self.settings.font_size as f32 * advance,
+                    content_top,
+                    content_h,
                 );
-                // Divisor entre paneles: filete de 2 px a todo lo alto, por
-                // encima de los editores (el aviso y la paleta van después).
-                if group_count > 1 {
-                    let edge = Theme::from_name(&self.settings.theme).tab_edge;
-                    for &(x, _) in geometry.iter().skip(1) {
-                        scene
-                            .top_quads
-                            .push(Quad::new(x - 1.0, 0.0, 2.0, viewport.1, edge));
-                    }
-                }
                 // Barra de estado inferior: Ln/Col, selección, tabulado,
                 // lenguaje y archivo; se pinta PRIMERO para que la barra de
                 // búsqueda y el panel de resultados floten sobre ella.
@@ -944,6 +950,7 @@ impl winit::application::ApplicationHandler for Application {
                         &theme,
                         &title,
                         &self.settings,
+                        self.tabs.layout(),
                     );
                 }
                 self.palette
@@ -1107,11 +1114,16 @@ impl winit::application::ApplicationHandler for Application {
                 self.cursor = position.to_logical::<f32>(scale);
                 let width = gpu.logical_size().0;
                 let height = gpu.logical_size().1;
-                if let Some(last_x) = self.divider_drag {
-                    // Arrastre del divisor: solo se mueve el filete.
-                    let dx = self.cursor.x - last_x;
-                    self.divider_drag = Some(self.cursor.x);
-                    self.tabs.drag_divider(dx, width);
+                if let Some((axis, last)) = self.divider_drag {
+                    // Arrastre del divisor: solo se mueve el filete en SU eje.
+                    let (delta, next, extent) = match axis {
+                        Divider::Vertical => (self.cursor.x - last, self.cursor.x, width),
+                        Divider::Horizontal => {
+                            (self.cursor.y - last, self.cursor.y, content_area(height).1)
+                        }
+                    };
+                    self.divider_drag = Some((axis, next));
+                    self.tabs.drag_divider(axis, delta, extent);
                     gpu.request_redraw();
                     return;
                 }
@@ -1121,6 +1133,7 @@ impl winit::application::ApplicationHandler for Application {
                     self.titlebar.hover_at(self.cursor.x, self.cursor.y);
                     let edge = title::resize_edge(self.cursor.x, self.cursor.y, width, height)
                         .map(CursorIcon::from);
+                    let (ct, ch) = content_area(height);
                     let icon = if self.palette.is_open()
                         || self.search.is_open()
                         || self.findfiles.is_open()
@@ -1128,8 +1141,14 @@ impl winit::application::ApplicationHandler for Application {
                         CursorIcon::Default
                     } else if let Some(icon) = edge {
                         icon
-                    } else if self.tabs.over_divider(self.cursor.x, width) {
-                        CursorIcon::EwResize
+                    } else if let Some(divider) =
+                        self.tabs
+                            .over_divider(self.cursor.x, self.cursor.y, width, ct, ch)
+                    {
+                        match divider {
+                            Divider::Vertical => CursorIcon::EwResize,
+                            Divider::Horizontal => CursorIcon::NsResize,
+                        }
                     } else {
                         CursorIcon::Default
                     };
@@ -1318,11 +1337,23 @@ impl winit::application::ApplicationHandler for Application {
                 // Divisor entre paneles: el click lo inicia; no llega ni a
                 // la barra ni al editor (el icono vuelve a flecha al soltar).
                 let width = gpu.logical_size().0;
-                if self.tabs.over_divider(self.cursor.x, width) {
-                    self.divider_drag = Some(self.cursor.x);
+                let (ct, ch) = content_area(gpu.logical_size().1);
+                if let Some(axis) =
+                    self.tabs
+                        .over_divider(self.cursor.x, self.cursor.y, width, ct, ch)
+                {
+                    let coord = match axis {
+                        Divider::Vertical => self.cursor.x,
+                        Divider::Horizontal => self.cursor.y,
+                    };
+                    self.divider_drag = Some((axis, coord));
                     self.mouse_down = false;
-                    gpu.window().set_cursor(CursorIcon::EwResize);
-                    self.cursor_icon = CursorIcon::EwResize;
+                    let icon = match axis {
+                        Divider::Vertical => CursorIcon::EwResize,
+                        Divider::Horizontal => CursorIcon::NsResize,
+                    };
+                    gpu.window().set_cursor(icon);
+                    self.cursor_icon = icon;
                     gpu.request_redraw();
                     return;
                 }
@@ -1335,7 +1366,9 @@ impl winit::application::ApplicationHandler for Application {
                 }
                 // Click en otro panel: ese grupo toma el foco (como Sublime)
                 // y su editor activo coloca el caret.
-                let group = self.tabs.group_at_x(self.cursor.x, width);
+                let group = self
+                    .tabs
+                    .group_at(self.cursor.x, self.cursor.y, width, ct, ch);
                 focus_group(&mut self.tabs, group);
                 // Doble/triple click: mismo punto dentro de CLICK_WINDOW.
                 let mut count = 1;
@@ -1384,7 +1417,9 @@ impl winit::application::ApplicationHandler for Application {
                 };
                 // Rueda sobre el panel bajo el cursor (sin robar el foco, como
                 // Sublime); si el cursor aún no se movió → grupo 0.
-                let group = self.tabs.group_at_x(self.cursor.x, gpu.logical_size().0);
+                let (vw, vh) = gpu.logical_size();
+                let (ct, ch) = content_area(vh);
+                let group = self.tabs.group_at(self.cursor.x, self.cursor.y, vw, ct, ch);
                 self.tabs.group_active_mut(group).on_wheel(dy);
                 gpu.request_redraw();
             }

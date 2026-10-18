@@ -1,9 +1,9 @@
-//! Pestañas y paneles (M9/M10): hasta DOS grupos (columnas) de pestañas,
-//! conmutación con Ctrl+Tab dentro del grupo activo y cierre con Ctrl+W.
-//! Cada grupo dibuja su propia barra sobre su franja horizontal y el editor
-//! activo reserva la barra con [`Editor::set_top_inset`] y su columna con
-//! [`Editor::set_left_inset`], para que ni el texto ni los clicks queden
-//! debajo ni encima de otro panel.
+//! Pestañas y paneles (M9/M10/M24): rejilla de hasta 2×2 grupos de pestañas
+//! (una columna, dos columnas, dos filas o rejilla), conmutación con Ctrl+Tab
+//! dentro del grupo activo y cierre con Ctrl+W. Cada grupo (celda) dibuja su
+//! propia barra sobre su franja y el editor activo reserva la barra con
+//! [`Editor::set_top_inset`] y su celda con [`Editor::set_left_inset`], para
+//! que ni el texto ni los clicks queden debajo ni encima de otro panel.
 
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 
@@ -22,6 +22,53 @@ const TAB_PAD: f32 = 14.0;
 const MIN_PANEL_W: f32 = 80.0;
 /// Margen de agarre del divisor alrededor de su eje (px lógicos).
 const DIVIDER_GRAB: f32 = 4.0;
+/// Alto mínimo de una fila al arrastrar el divisor horizontal (barra de
+/// pestañas + un editor usable).
+const MIN_ROW_H: f32 = TAB_BAR_H + 30.0;
+
+/// Reparto de la ventana entre celdas (M24). Cada variante fija el número de
+/// grupos: `groups.len()` siempre igual al número de celdas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Un grupo a pantalla completa.
+    Single,
+    /// Dos columnas separadas por el divisor vertical (`split_ratio`).
+    Columns,
+    /// Dos filas separadas por el divisor horizontal (`v_ratio`).
+    Rows,
+    /// Rejilla 2×2: ambos divisores.
+    Grid,
+}
+
+impl Layout {
+    /// Número de celdas (y por tanto de grupos) del reparto.
+    fn cells(self) -> usize {
+        match self {
+            Layout::Single => 1,
+            Layout::Columns | Layout::Rows => 2,
+            Layout::Grid => 4,
+        }
+    }
+
+    /// `(columnas, filas)` del reparto.
+    fn dims(self) -> (usize, usize) {
+        match self {
+            Layout::Single => (1, 1),
+            Layout::Columns => (2, 1),
+            Layout::Rows => (1, 2),
+            Layout::Grid => (2, 2),
+        }
+    }
+}
+
+/// Eje de un divisor arrastrable (M24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divider {
+    /// Entre columnas (se mueve en X).
+    Vertical,
+    /// Entre filas (se mueve en Y).
+    Horizontal,
+}
 
 /// Un grupo (columna del split) con sus pestañas y su activa.
 struct Group {
@@ -29,9 +76,11 @@ struct Group {
     active: usize,
 }
 
-/// Franja horizontal de un grupo en el último render (para [`Tabs::click`]).
+/// Franja de un grupo en el último render (para [`Tabs::click`]).
 struct GroupLayout {
     x: f32,
+    /// Origen vertical de la barra de pestañas del grupo (0 en la fila 0).
+    y: f32,
     w: f32,
     /// (x, ancho) de cada pestaña dibujada del grupo.
     tabs: Vec<(f32, f32)>,
@@ -41,20 +90,22 @@ pub struct Tabs {
     groups: Vec<Group>,
     active_group: usize,
     layout: Vec<GroupLayout>,
+    /// Reparto de la ventana entre celdas (M24).
+    panes: Layout,
     /// Tema de la barra y de todos los editores (lo fija `apply_prefs`).
     theme: Theme,
     /// Tamaño de la etiqueta de pestaña en px (lo fija `apply_prefs`).
     font_size: f32,
-    /// Fracción del ancho de ventana que ocupa el grupo izquierdo (0..1).
-    /// Solo importa con 2 grupos; se recuerda entre splits (lo mueve el
+    /// Fracción del ancho de ventana que ocupa la columna izquierda (0..1).
+    /// Solo importa con 2 columnas; se recuerda entre splits (lo mueve el
     /// divisor arrastrable). Invariante: 0 < split_ratio < 1.
     split_ratio: f32,
+    /// Fracción de la altura de contenido que ocupa la fila superior (0..1).
+    /// Solo importa con 2 filas; igual que `split_ratio` pero en el eje Y.
+    v_ratio: f32,
     /// Rutas de las últimas pestañas cerradas (la más reciente al final),
     /// para Ctrl+Shift+T. Solo paths: el contenido no se conserva.
     closed: Vec<std::path::PathBuf>,
-    /// Desplazamiento vertical de las barras de pestañas (barra de título
-    /// propia en M21; 0 antes de pintarla).
-    top: f32,
 }
 
 /// Tope de pestañas cerradas que se recuerdan (como Sublime).
@@ -70,11 +121,12 @@ impl Tabs {
             }],
             active_group: 0,
             layout: Vec::new(),
+            panes: Layout::Single,
             theme: Theme::dark(),
             font_size: FONT_SIZE,
             split_ratio: 0.5,
+            v_ratio: 0.5,
             closed: Vec::new(),
-            top: 0.0,
         }
     }
 
@@ -88,11 +140,12 @@ impl Tabs {
             groups: vec![Group { list, active: 0 }],
             active_group: 0,
             layout: Vec::new(),
+            panes: Layout::Single,
             theme: Theme::dark(),
             font_size: FONT_SIZE,
             split_ratio: 0.5,
+            v_ratio: 0.5,
             closed: Vec::new(),
-            top: 0.0,
         }
     }
 
@@ -128,8 +181,16 @@ impl Tabs {
         self.active_group
     }
 
+    /// Número de grupos (celdas con pestañas); solo lo usan los tests — la
+    /// geometría trabaja con [`Tabs::layout`] y las celdas.
+    #[cfg(test)]
     pub fn group_count(&self) -> usize {
         self.groups.len()
+    }
+
+    /// Reparto actual `(columnas, filas)` (para el menú Ver y su checkmark).
+    pub fn layout(&self) -> (usize, usize) {
+        self.panes.dims()
     }
 
     /// Pestañas del grupo activo.
@@ -172,90 +233,209 @@ impl Tabs {
         }
     }
 
-    /// Divide en dos columnas; el nuevo grupo empieza con un archivo en
-    /// blanco y toma el foco (máximo 2 paneles). El flag de `focused` de la
-    /// ventana se transfiere: el grupo que pierde el foco se apaga.
+    /// Divide añadiendo una columna: una sola celda pasa a dos columnas (o
+    /// dos filas a rejilla). El grupo nuevo (columna derecha) empieza en
+    /// blanco y toma el foco. El flag de `focused` de la ventana se transfiere.
     pub fn split(&mut self) {
-        if self.groups.len() >= 2 {
-            return;
-        }
+        let new = match self.panes {
+            Layout::Single => Layout::Columns,
+            Layout::Rows => Layout::Grid,
+            // Ya hay 2 columnas: no hay columna que añadir.
+            Layout::Columns | Layout::Grid => return,
+        };
         let focused = self.active().focused();
         self.active_mut().set_focused(false);
-        self.groups.push(Group {
-            list: vec![Editor::default()],
-            active: 0,
-        });
+        while self.groups.len() < new.cells() {
+            self.groups.push(Group {
+                list: vec![Editor::default()],
+                active: 0,
+            });
+        }
+        self.panes = new;
         self.active_group = self.groups.len() - 1;
         self.active_mut().set_focused(focused);
     }
 
-    /// Quita el split: las pestañas del grupo derecho se mueven al grupo
-    /// izquierdo (nunca se pierde trabajo) y el foco sigue en el archivo que
-    /// estaba activo.
+    /// Quita la columna derecha (una columna pasa a celda única o rejilla a
+    /// dos filas): las pestañas de esa columna se funden con las de su fila
+    /// (nunca se pierde trabajo) y el foco sigue en el archivo que estaba
+    /// activo.
     pub fn unsplit(&mut self) {
-        if self.groups.len() < 2 {
-            return;
-        }
+        let new = match self.panes {
+            Layout::Columns => Layout::Single,
+            Layout::Grid => Layout::Rows,
+            // Sin columna derecha que quitar.
+            Layout::Single | Layout::Rows => return,
+        };
+        let (cols_before, rows_before) = self.panes.dims();
         let focused = self.active().focused();
-        let right = self.groups.remove(1);
-        if self.active_group == 1 {
-            let new_active = self.groups[0].list.len() + right.active;
-            self.groups[0].list.extend(right.list);
-            self.groups[0].active = new_active;
-        } else {
-            self.groups[0].list.extend(right.list);
+        let was_active = self.active_group;
+        let was_row = was_active / cols_before;
+        let was_right = was_active % cols_before == 1;
+
+        // Reconstruye: funde la columna derecha de cada fila en la izquierda.
+        let mut old = std::mem::take(&mut self.groups).into_iter();
+        let mut kept: Vec<Group> = Vec::with_capacity(rows_before);
+        let mut new_active = 0;
+        for r in 0..rows_before {
+            let mut left = old.next().expect("columna izquierda de la fila");
+            let right = old.next().expect("columna derecha de la fila");
+            let offset = left.list.len();
+            left.list.extend(right.list);
+            if r == was_row {
+                new_active = r;
+                if was_right {
+                    left.active = offset + right.active;
+                }
+            }
+            kept.push(left);
         }
-        self.active_group = 0;
+        self.groups = kept;
+        self.panes = new;
+        self.active_group = new_active;
         self.active_mut().set_focused(focused);
     }
 
-    /// Desplaza verticalmente las barras de pestañas (barra de título M21).
-    pub fn set_top(&mut self, top: f32) {
-        self.top = top;
+    /// Cambia a un reparto `columns`×`rows`, conservando las pestañas: las
+    /// celdas nuevas empiezan en blanco y, si se reducen, las celdas que
+    /// sobran se funden en la primera (nunca se pierde trabajo).
+    pub fn set_layout(&mut self, columns: usize, rows: usize) {
+        let new = match (columns.clamp(1, 2), rows.clamp(1, 2)) {
+            (1, 1) => Layout::Single,
+            (2, 1) => Layout::Columns,
+            (1, 2) => Layout::Rows,
+            _ => Layout::Grid,
+        };
+        if new == self.panes {
+            return;
+        }
+        let target = new.cells();
+        if target > self.groups.len() {
+            while self.groups.len() < target {
+                self.groups.push(Group {
+                    list: vec![Editor::default()],
+                    active: 0,
+                });
+            }
+        } else if target < self.groups.len() {
+            let focused = self.active().focused();
+            let extra: Vec<Group> = self.groups.drain(target..).collect();
+            for g in extra {
+                self.groups[0].list.extend(g.list);
+            }
+            if self.groups[0].active >= self.groups[0].list.len() {
+                self.groups[0].active = self.groups[0].list.len() - 1;
+            }
+            self.active_group = 0;
+            self.active_mut().set_focused(focused);
+        }
+        self.panes = new;
+        if self.active_group >= self.groups.len() {
+            self.active_group = self.groups.len() - 1;
+        }
     }
 
     /// Fija insets y viewport del editor activo del grupo `index` para este
-    /// frame (`x` = origen horizontal de la columna).
-    pub fn set_group_geometry(&mut self, index: usize, x: f32, w: f32, editor_h: f32) {
-        let top = self.top + TAB_BAR_H;
+    /// frame. `(x, y, w, h)` es la celda COMPLETA (barra de pestañas
+    /// incluida): el editor queda bajo la barra, `TAB_BAR_H` más abajo.
+    pub fn set_group_geometry(&mut self, index: usize, x: f32, y: f32, w: f32, h: f32) {
         let editor = self.group_active_mut(index);
         editor.set_left_inset(x);
-        editor.set_top_inset(top);
-        editor.set_viewport(w, editor_h);
+        editor.set_top_inset(y + TAB_BAR_H);
+        editor.set_viewport(w, (h - TAB_BAR_H).max(50.0));
     }
 
-    /// `(x, ancho)` de cada grupo para un `width` de ventana: un solo
-    /// grupo ocupa todo; con split, el reparto sale de `split_ratio`.
-    pub fn group_geometry(&self, width: f32) -> Vec<(f32, f32)> {
-        if self.groups.len() < 2 {
-            return vec![(0.0, width)];
+    /// Celdas `(x, y, w, h)` de cada grupo para una ventana de `width` y un
+    /// área de contenido `(content_top, content_h)` (barra de título arriba,
+    /// barra de estado abajo). Las celdas INCLUYEN la barra de pestañas.
+    pub fn group_geometry(
+        &self,
+        width: f32,
+        content_top: f32,
+        content_h: f32,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        match self.panes {
+            Layout::Single => vec![(0.0, content_top, width, content_h)],
+            Layout::Columns => {
+                let left = width * self.split_ratio;
+                vec![
+                    (0.0, content_top, left, content_h),
+                    (left, content_top, width - left, content_h),
+                ]
+            }
+            Layout::Rows => {
+                let top_h = content_h * self.v_ratio;
+                vec![
+                    (0.0, content_top, width, top_h),
+                    (0.0, content_top + top_h, width, content_h - top_h),
+                ]
+            }
+            Layout::Grid => {
+                let left = width * self.split_ratio;
+                let top_h = content_h * self.v_ratio;
+                vec![
+                    (0.0, content_top, left, top_h),
+                    (left, content_top, width - left, top_h),
+                    (0.0, content_top + top_h, left, content_h - top_h),
+                    (left, content_top + top_h, width - left, content_h - top_h),
+                ]
+            }
         }
-        let left = width * self.split_ratio;
-        vec![(0.0, left), (left, width - left)]
     }
 
-    /// Índice del grupo bajo la coordenada `x` (para clicks y rueda).
-    pub fn group_at_x(&self, x: f32, width: f32) -> usize {
-        match self
-            .group_geometry(width)
+    /// Índice del grupo bajo `(x, y)` (para clicks y rueda).
+    pub fn group_at(&self, x: f32, y: f32, width: f32, content_top: f32, content_h: f32) -> usize {
+        self.group_geometry(width, content_top, content_h)
             .iter()
-            .position(|&(gx, gw)| x < gx + gw)
-        {
-            Some(group) => group,
-            None => self.groups.len() - 1,
+            .position(|&(cx, cy, cw, ch)| x >= cx && x < cx + cw && y >= cy && y < cy + ch)
+            .unwrap_or(0)
+    }
+
+    /// ¿`(x, y)` cae sobre algún divisor? Devuelve el eje (para el icono de
+    /// ratón y para saber qué razón arrastrar).
+    pub fn over_divider(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        content_top: f32,
+        content_h: f32,
+    ) -> Option<Divider> {
+        match self.panes {
+            Layout::Single => None,
+            Layout::Columns => {
+                ((x - width * self.split_ratio).abs() <= DIVIDER_GRAB).then_some(Divider::Vertical)
+            }
+            Layout::Rows => ((y - (content_top + content_h * self.v_ratio)).abs() <= DIVIDER_GRAB)
+                .then_some(Divider::Horizontal),
+            Layout::Grid => {
+                if (x - width * self.split_ratio).abs() <= DIVIDER_GRAB {
+                    Some(Divider::Vertical)
+                } else if (y - (content_top + content_h * self.v_ratio)).abs() <= DIVIDER_GRAB {
+                    Some(Divider::Horizontal)
+                } else {
+                    None
+                }
+            }
         }
     }
 
-    /// ¿`x` cae sobre el divisor entre paneles (a cualquier altura)?
-    pub fn over_divider(&self, x: f32, width: f32) -> bool {
-        self.groups.len() >= 2 && (x - width * self.split_ratio).abs() <= DIVIDER_GRAB
-    }
-
-    /// Mueve el divisor `delta` px, recortando para que ningún panel baje
-    /// de [`MIN_PANEL_W`]. La proporción queda guardada en `split_ratio`.
-    pub fn drag_divider(&mut self, delta: f32, width: f32) {
-        let min = (MIN_PANEL_W / width).clamp(0.05, 0.45);
-        self.split_ratio = (self.split_ratio + delta / width).clamp(min, 1.0 - min);
+    /// Mueve el divisor `divider` `delta` px sobre `extent` (el ancho de la
+    /// ventana para el vertical, la altura de contenido para el horizontal),
+    /// recortando para que ninguna celda baje de su mínimo. Las proporciones
+    /// quedan guardadas en `split_ratio`/`v_ratio`.
+    pub fn drag_divider(&mut self, divider: Divider, delta: f32, extent: f32) {
+        let min = (MIN_PANEL_W / extent).clamp(0.05, 0.45);
+        match divider {
+            Divider::Vertical => {
+                self.split_ratio = (self.split_ratio + delta / extent).clamp(min, 1.0 - min)
+            }
+            Divider::Horizontal => {
+                // La fila necesita sitio para su barra de pestañas además del editor.
+                let min_row = ((MIN_ROW_H / extent).clamp(0.05, 0.45)).max(min);
+                self.v_ratio = (self.v_ratio + delta / extent).clamp(min_row, 1.0 - min_row);
+            }
+        }
     }
 
     /// Aplica preferencias a TODOS los editores abiertos (todos los grupos);
@@ -304,10 +484,25 @@ impl Tabs {
             if self.groups.len() == 1 {
                 return false;
             }
+            // En rejilla la celda no puede desaparecer (rompería el reparto):
+            // se queda con un editor en blanco. En un split de 2 paneles sí
+            // se quita el grupo y se vuelve a una celda única.
+            if self.panes == Layout::Grid {
+                let mut blank = Editor::default();
+                blank.set_focused(true);
+                self.groups[gi] = Group {
+                    list: vec![blank],
+                    active: 0,
+                };
+                self.remember_closed(closed_path);
+                return true;
+            }
             self.groups.remove(gi);
             if self.active_group >= self.groups.len() {
                 self.active_group = self.groups.len() - 1;
             }
+            self.panes = Layout::Single;
+            self.active_mut().set_focused(true);
             self.remember_closed(closed_path);
             return true;
         }
@@ -339,18 +534,24 @@ impl Tabs {
         self.closed.pop()
     }
 
-    /// Barras de pestañas (una por grupo) en la capa superior, más la
-    /// separación vertical entre paneles; guarda el layout para
-    /// [`Tabs::click`]. Las que no caben no se dibujan ni se clican.
-    pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32) {
-        let group_count = self.groups.len();
-        let gw = viewport.0 / group_count as f32;
+    /// Barras de pestañas (una por celda) en la capa superior, más los
+    /// divisores entre celdas; guarda el layout para [`Tabs::click`]. Las que
+    /// no caben no se dibujan ni se clican.
+    pub fn render(
+        &mut self,
+        scene: &mut Scene,
+        viewport: (f32, f32),
+        advance: f32,
+        content_top: f32,
+        content_h: f32,
+    ) {
+        let cells = self.group_geometry(viewport.0, content_top, content_h);
         self.layout.clear();
 
         for (gi, group) in self.groups.iter().enumerate() {
-            let gx = gi as f32 * gw;
+            let (gx, gy, gw, _gh) = cells[gi];
             let bar_right = gx + gw;
-            let top = self.top;
+            let top = gy;
             scene
                 .top_quads
                 .push(Quad::new(gx, top, gw, TAB_BAR_H, self.theme.bar_bg));
@@ -361,19 +562,10 @@ impl Tabs {
                 1.0,
                 self.theme.tab_edge,
             ));
-            // Separación vertical con el panel vecino (altura entera).
-            if gi > 0 {
-                scene.top_quads.push(Quad::new(
-                    gx - 1.0,
-                    0.0,
-                    1.0,
-                    viewport.1,
-                    self.theme.tab_edge,
-                ));
-            }
 
             let mut gl = GroupLayout {
                 x: gx,
+                y: gy,
                 w: gw,
                 tabs: Vec::new(),
             };
@@ -448,18 +640,41 @@ impl Tabs {
             }
             self.layout.push(gl);
         }
+
+        // Divisores entre celdas, por ENCIMA de las barras: verticales entre
+        // columnas (a todo lo alto) y horizontales entre filas (a todo el
+        // ancho). Solo hay una frontera por eje: las columnas comparten
+        // `split_ratio` y las filas `v_ratio`.
+        let (cols, rows) = self.panes.dims();
+        if cols > 1 {
+            let bx = viewport.0 * self.split_ratio;
+            scene.top_quads.push(Quad::new(
+                bx - 1.0,
+                0.0,
+                1.0,
+                viewport.1,
+                self.theme.tab_edge,
+            ));
+        }
+        if rows > 1 {
+            let by = content_top + content_h * self.v_ratio;
+            scene.top_quads.push(Quad::new(
+                0.0,
+                by - 1.0,
+                viewport.0,
+                1.0,
+                self.theme.tab_edge,
+            ));
+        }
     }
 
     /// Click en alguna barra: grupo y pestaña tocadas, o `None` si no fue
-    /// dentro de la barra o de una pestaña dibujada.
+    /// dentro de la barra de SU celda o de una pestaña dibujada.
     pub fn click(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        if y < self.top || y >= self.top + TAB_BAR_H {
-            return None;
-        }
         let group = self
             .layout
             .iter()
-            .position(|gl| x >= gl.x && x < gl.x + gl.w)?;
+            .position(|gl| y >= gl.y && y < gl.y + TAB_BAR_H && x >= gl.x && x < gl.x + gl.w)?;
         let tab = self.layout[group]
             .tabs
             .iter()
@@ -552,7 +767,7 @@ mod tests {
         tabs.add(tab_with("dos"));
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (800.0, 600.0), 8.0);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
         // Fondo + borde inferior + (bg + borde + separador + bg + separador).
         assert!(
             scene.top_quads.len() >= 6,
@@ -579,7 +794,7 @@ mod tests {
             tabs.add(tab_with(&format!("archivo_{i}")));
         }
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (300.0, 600.0), 8.0);
+        tabs.render(&mut scene, (300.0, 600.0), 8.0, 0.0, 600.0);
         assert!(tabs.layout[0].tabs.len() < 40, "solo caben unas pocas");
         assert!(tabs.layout[0].tabs.iter().all(|&(x, w)| x + w <= 300.0));
     }
@@ -619,11 +834,11 @@ mod tests {
         let mut tabs = Tabs::new(tab_named("uno.rs"));
         tabs.split();
 
-        tabs.set_group_geometry(1, 500.0, 500.0, 568.0);
+        tabs.set_group_geometry(1, 500.0, 0.0, 500.0, 600.0);
         assert_eq!(tabs.group_active_mut(1).left_inset(), 500.0);
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (1000.0, 600.0), 8.0);
+        tabs.render(&mut scene, (1000.0, 600.0), 8.0, 0.0, 600.0);
         assert_eq!(tabs.layout.len(), 2, "una franja por grupo");
         assert_eq!(tabs.layout[0].x, 0.0);
         assert_eq!(tabs.layout[1].x, 500.0, "la segunda columna empieza a 500");
@@ -706,7 +921,7 @@ mod tests {
         );
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (800.0, 600.0), 8.0);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
         assert_eq!(scene.top_quads[0].color, Theme::light().bar_bg);
     }
 
@@ -731,7 +946,7 @@ mod tests {
         );
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (800.0, 600.0), 12.0);
+        tabs.render(&mut scene, (800.0, 600.0), 12.0, 0.0, 600.0);
         let label = scene.top_texts.first().expect("etiqueta dibujada");
         assert_eq!(label.size, 24.0, "la etiqueta usa el tamaño pedido");
         assert_eq!(label.y, (TAB_BAR_H - 24.0) / 2.0, "centrada en la barra");
@@ -744,7 +959,7 @@ mod tests {
         };
         tabs.apply_prefs(&big);
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        tabs.render(&mut scene, (800.0, 600.0), 16.0);
+        tabs.render(&mut scene, (800.0, 600.0), 16.0, 0.0, 600.0);
         let label = scene.top_texts.first().expect("etiqueta dibujada");
         assert_eq!(label.size, 24.0, "tope por la altura de la barra");
     }
@@ -752,45 +967,66 @@ mod tests {
     #[test]
     fn group_geometry_splits_by_ratio_and_divider_follows_it() {
         let mut tabs = Tabs::new(Editor::default());
+        let (ct, ch) = (0.0, 600.0);
         assert_eq!(
-            tabs.group_geometry(1000.0),
-            vec![(0.0, 1000.0)],
+            tabs.group_geometry(1000.0, ct, ch),
+            vec![(0.0, 0.0, 1000.0, 600.0)],
             "un solo grupo ocupa todo el ancho"
         );
-        assert_eq!(tabs.group_at_x(500.0, 1000.0), 0);
+        assert_eq!(tabs.group_at(500.0, 300.0, 1000.0, ct, ch), 0);
         assert!(
-            !tabs.over_divider(500.0, 1000.0),
+            tabs.over_divider(500.0, 300.0, 1000.0, ct, ch).is_none(),
             "sin split no hay divisor"
         );
 
         tabs.split();
         assert_eq!(
-            tabs.group_geometry(1000.0),
-            vec![(0.0, 500.0), (500.0, 500.0)],
+            tabs.group_geometry(1000.0, ct, ch),
+            vec![(0.0, 0.0, 500.0, 600.0), (500.0, 0.0, 500.0, 600.0)],
             "reparto por defecto 50/50"
         );
-        assert!(tabs.over_divider(500.0, 1000.0), "sobre el eje");
-        assert!(tabs.over_divider(503.0, 1000.0), "el agarre es de pocos px");
-        assert!(!tabs.over_divider(510.0, 1000.0), "fuera del agarre");
-        assert_eq!(tabs.group_at_x(501.0, 1000.0), 1, "click a la derecha");
+        assert_eq!(
+            tabs.over_divider(500.0, 300.0, 1000.0, ct, ch),
+            Some(Divider::Vertical),
+            "sobre el eje"
+        );
+        assert_eq!(
+            tabs.over_divider(503.0, 300.0, 1000.0, ct, ch),
+            Some(Divider::Vertical),
+            "el agarre es de pocos px"
+        );
+        assert_eq!(
+            tabs.over_divider(510.0, 300.0, 1000.0, ct, ch),
+            None,
+            "fuera del agarre"
+        );
+        assert_eq!(
+            tabs.group_at(501.0, 300.0, 1000.0, ct, ch),
+            1,
+            "click a la derecha"
+        );
 
         // 0.5 + 125/1000 = 0.625 (exacto en binario): 625/375.
-        tabs.drag_divider(125.0, 1000.0);
+        tabs.drag_divider(Divider::Vertical, 125.0, 1000.0);
         assert_eq!(
-            tabs.group_geometry(1000.0),
-            vec![(0.0, 625.0), (625.0, 375.0)],
+            tabs.group_geometry(1000.0, ct, ch),
+            vec![(0.0, 0.0, 625.0, 600.0), (625.0, 0.0, 375.0, 600.0)],
             "el divisor sigue al arrastre"
         );
-        assert!(tabs.over_divider(625.0, 1000.0), "el divisor se mueve");
+        assert_eq!(
+            tabs.over_divider(625.0, 300.0, 1000.0, ct, ch),
+            Some(Divider::Vertical),
+            "el divisor se mueve"
+        );
 
-        tabs.drag_divider(-10_000.0, 1000.0);
-        let left = tabs.group_geometry(1000.0)[0].1;
+        tabs.drag_divider(Divider::Vertical, -10_000.0, 1000.0);
+        let left = tabs.group_geometry(1000.0, ct, ch)[0].2;
         assert!(
             (left - 80.0).abs() < 0.01,
             "ancho mínimo izquierdo, got {left}"
         );
-        tabs.drag_divider(10_000.0, 1000.0);
-        let right = tabs.group_geometry(1000.0)[1].1;
+        tabs.drag_divider(Divider::Vertical, 10_000.0, 1000.0);
+        let right = tabs.group_geometry(1000.0, ct, ch)[1].2;
         assert!(
             (right - 80.0).abs() < 0.01,
             "ancho mínimo derecho, got {right}"
@@ -800,22 +1036,94 @@ mod tests {
     #[test]
     fn unsplit_remembers_the_ratio_for_the_next_split() {
         let mut tabs = Tabs::new(Editor::default());
+        let (ct, ch) = (0.0, 600.0);
         tabs.split();
-        tabs.drag_divider(100.0, 1000.0); // 0.5 + 0.1 = 0.6
+        tabs.drag_divider(Divider::Vertical, 100.0, 1000.0); // 0.5 + 0.1 = 0.6
 
         tabs.unsplit();
         assert_eq!(
-            tabs.group_geometry(1200.0),
-            vec![(0.0, 1200.0)],
+            tabs.group_geometry(1200.0, ct, ch),
+            vec![(0.0, 0.0, 1200.0, 600.0)],
             "sin split vuelve a un panel"
         );
-        assert!(!tabs.over_divider(600.0, 1200.0));
+        assert!(tabs.over_divider(600.0, 300.0, 1200.0, ct, ch).is_none());
 
         tabs.split();
-        let left = tabs.group_geometry(1000.0)[0].1;
+        let left = tabs.group_geometry(1000.0, ct, ch)[0].2;
         assert!(
             (left - 600.0).abs() < 0.01,
             "recuerda el reparto arrastrado"
         );
+    }
+
+    #[test]
+    fn rows_and_grid_layouts_split_on_both_axes() {
+        let mut tabs = Tabs::new(tab_with("uno"));
+        let (ct, ch) = (0.0, 600.0);
+
+        // Dos filas: división vertical (eje Y) por `v_ratio`.
+        tabs.set_layout(1, 2);
+        assert_eq!(tabs.layout(), (1, 2));
+        assert_eq!(tabs.group_count(), 2);
+        let cells = tabs.group_geometry(1000.0, ct, ch);
+        assert_eq!(cells[0], (0.0, 0.0, 1000.0, 300.0), "fila superior 50%");
+        assert_eq!(cells[1], (0.0, 300.0, 1000.0, 300.0), "fila inferior");
+        assert_eq!(
+            tabs.over_divider(500.0, 300.0, 1000.0, ct, ch),
+            Some(Divider::Horizontal),
+            "divisor horizontal sobre el eje Y"
+        );
+        assert_eq!(
+            tabs.group_at(500.0, 350.0, 1000.0, ct, ch),
+            1,
+            "click en la fila inferior"
+        );
+
+        // Rejilla 2×2: cuatro celdas, ambos ejos.
+        tabs.set_layout(2, 2);
+        assert_eq!(tabs.layout(), (2, 2));
+        assert_eq!(
+            tabs.group_count(),
+            4,
+            "las celdas nuevas empiezan en blanco"
+        );
+        let cells = tabs.group_geometry(1000.0, ct, ch);
+        assert_eq!(cells[0], (0.0, 0.0, 500.0, 300.0));
+        assert_eq!(cells[3], (500.0, 300.0, 500.0, 300.0));
+        assert_eq!(
+            tabs.over_divider(500.0, 100.0, 1000.0, ct, ch),
+            Some(Divider::Vertical),
+            "frontera de columnas"
+        );
+        assert_eq!(
+            tabs.over_divider(200.0, 300.0, 1000.0, ct, ch),
+            Some(Divider::Horizontal),
+            "frontera de filas"
+        );
+
+        // Volver a una celda fusiona sin perder pestañas.
+        tabs.set_layout(1, 1);
+        assert_eq!(tabs.layout(), (1, 1));
+        assert_eq!(tabs.group_count(), 1);
+        assert!(tabs.len() >= 1, "las pestañas se conservan");
+    }
+
+    #[test]
+    fn grid_close_keeps_the_cell_but_column_close_drops_it() {
+        let mut tabs = Tabs::new(tab_named("uno.rs"));
+        tabs.split();
+        assert_eq!(tabs.group_count(), 2);
+        assert!(tabs.close(None), "cierra la única pestaña del grupo");
+        assert_eq!(tabs.group_count(), 1, "el grupo derecho desaparece");
+        assert_eq!(tabs.layout(), (1, 1), "volvemos a una celda única");
+
+        // En rejilla la celda no puede desaparecer: queda en blanco.
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.set_layout(2, 2);
+        tabs.set_active_group(3);
+        assert!(tabs.close(None), "cierra la pestaña de la celda");
+        assert_eq!(tabs.group_count(), 4, "la celda sigue ahí");
+        assert_eq!(tabs.layout(), (2, 2));
+        assert!(!tabs.active().has_path(), "la celda queda en blanco");
     }
 }

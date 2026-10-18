@@ -37,6 +37,8 @@ pub enum Action {
     Command(&'static str),
     /// Alternar una preferencia booleana.
     Toggle(&'static str),
+    /// Cambiar el reparto de paneles a `columnas`×`filas` (M24).
+    Layout(usize, usize),
     /// Línea separadora (no clickable).
     Separator,
 }
@@ -96,6 +98,11 @@ const MENUS: &[(&str, &[MenuItem])] = &[
         &[
             item("Dividir panel", Action::Command("view.split")),
             item("Unir paneles", Action::Command("view.unsplit")),
+            item("", Action::Separator),
+            item("Una columna", Action::Layout(1, 1)),
+            item("Dos columnas", Action::Layout(2, 1)),
+            item("Dos filas", Action::Layout(1, 2)),
+            item("Rejilla 2×2", Action::Layout(2, 2)),
             item("", Action::Separator),
             item("Acercar fuente", Action::Command("view.zoom_in")),
             item("Alejar fuente", Action::Command("view.zoom_out")),
@@ -207,6 +214,7 @@ impl TitleBar {
 
     /// Dibuja la barra completa (fondo, menús, título, botones y, si está
     /// abierto, el desplegado). Guarda el layout para [`TitleBar::click`].
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         scene: &mut Scene,
@@ -215,6 +223,7 @@ impl TitleBar {
         theme: &Theme,
         title: &str,
         settings: &Settings,
+        layout: (usize, usize),
     ) {
         let font = (settings.font_size as f32).min(16.0);
         let text_h = font;
@@ -305,9 +314,7 @@ impl TitleBar {
                     continue;
                 }
                 let mut label = it.label.to_string();
-                if let Action::Toggle(field) = it.action
-                    && toggle_on(settings, field)
-                {
+                if item_checked(it.action, settings, layout) {
                     label = format!("\u{2713} {label}");
                 }
                 drop_w = drop_w.max(label.chars().count() as f32 * advance + 2.0 * ITEM_PAD_X);
@@ -342,12 +349,18 @@ impl TitleBar {
                 }
                 let mut label = it.label.to_string();
                 let mut color = DROP_FG;
-                if let Action::Toggle(field) = it.action {
-                    if toggle_on(settings, field) {
-                        label = format!("\u{2713} {label}");
-                    } else {
-                        color = DROP_DIM;
+                match it.action {
+                    Action::Toggle(field) => {
+                        if toggle_on(settings, field) {
+                            label = format!("\u{2713} {label}");
+                        } else {
+                            color = DROP_DIM;
+                        }
                     }
+                    Action::Layout(c, r) if layout == (c, r) => {
+                        label = format!("\u{2713} {label}");
+                    }
+                    _ => {}
                 }
                 scene.top_texts.push(TextSpan::new(
                     label,
@@ -417,6 +430,16 @@ fn toggle_on(settings: &Settings, field: &str) -> bool {
     }
 }
 
+/// ¿El item debe mostrarse marcado con ✓? (Toggle encendido o el layout de
+/// paneles actual.)
+fn item_checked(action: Action, settings: &Settings, layout: (usize, usize)) -> bool {
+    match action {
+        Action::Toggle(field) => toggle_on(settings, field),
+        Action::Layout(c, r) => layout == (c, r),
+        _ => false,
+    }
+}
+
 /// ¿`(x, y)` cae en el borde exterior de una ventana `w`×`h` (para el
 /// resize sin decoraciones nativas)? Esquinas > lados.
 pub fn resize_edge(x: f32, y: f32, w: f32, h: f32) -> Option<ResizeDirection> {
@@ -450,7 +473,27 @@ mod tests {
     }
 
     fn render_into(b: &mut TitleBar, s: &mut Scene, settings: &Settings) {
-        b.render(s, (800.0, 600.0), 8.0, &Theme::dark(), "foo.rs", settings);
+        b.render(
+            s,
+            (800.0, 600.0),
+            8.0,
+            &Theme::dark(),
+            "foo.rs",
+            settings,
+            (1, 1),
+        );
+    }
+
+    fn render_layout(b: &mut TitleBar, s: &mut Scene, settings: &Settings, layout: (usize, usize)) {
+        b.render(
+            s,
+            (800.0, 600.0),
+            8.0,
+            &Theme::dark(),
+            "foo.rs",
+            settings,
+            layout,
+        );
     }
 
     #[test]
@@ -527,6 +570,31 @@ mod tests {
         assert!(
             checks.iter().any(|c| c.contains("Auto-match")),
             "auto_match marcado"
+        );
+    }
+
+    #[test]
+    fn layout_menu_marks_the_current_layout_and_click_returns_it() {
+        let mut b = bar();
+        let mut s = scene();
+        render_layout(&mut b, &mut s, &Settings::default(), (2, 2));
+        b.open = Some(2); // Ver
+        let mut s = scene();
+        render_layout(&mut b, &mut s, &Settings::default(), (2, 2));
+        let checks: Vec<String> = s
+            .top_texts
+            .iter()
+            .filter(|t| t.text.starts_with('\u{2713}'))
+            .map(|t| t.text.clone())
+            .collect();
+        assert_eq!(checks.len(), 1, "solo la rejilla activa: {checks:?}");
+        assert!(checks[0].contains("Rejilla"), "marca la rejilla 2×2");
+
+        // "Rejilla 2×2" es la fila 6 del menú Ver y devuelve su layout.
+        let (rx, ry, _, _) = b.rows[6].expect("fila de Rejilla");
+        assert_eq!(
+            b.click(rx + 5.0, ry + 2.0, 800.0, 600.0),
+            Click::Action(Action::Layout(2, 2))
         );
     }
 

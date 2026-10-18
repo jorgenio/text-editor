@@ -246,6 +246,7 @@ impl Tabs {
                 editor.set_tab_width(prefs.tab_width);
                 editor.set_show_line_numbers(prefs.show_line_numbers);
                 editor.set_font_size(prefs.font_size);
+                editor.set_translate_tabs_to_spaces(prefs.translate_tabs_to_spaces);
                 editor.set_theme(theme);
             }
         }
@@ -590,6 +591,7 @@ mod tests {
         let prefs = crate::settings::Settings {
             tab_width: 8,
             show_line_numbers: false,
+            translate_tabs_to_spaces: true,
             ..crate::settings::Settings::default()
         };
         tabs.apply_prefs(&prefs);
@@ -598,6 +600,7 @@ mod tests {
             let editor = tabs.group_active_mut(gi);
             assert_eq!(editor.tab_width(), 8, "grupo {gi} actualizado");
             assert!(!editor.show_line_numbers(), "grupo {gi} sin gutter");
+            assert!(editor.translate_tabs_to_spaces(), "grupo {gi} con espacios");
         }
 
         assert_eq!(

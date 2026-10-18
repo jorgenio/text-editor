@@ -447,19 +447,23 @@ mod tests {
 
         palette.push_text("línea");
         let ids = match_ids(&palette);
-        assert_eq!(ids.len(), 2, "solo comandos de línea: {ids:?}");
+        assert_eq!(ids.len(), 6, "solo comandos de línea: {ids:?}");
         assert!(ids.contains(&"edit.delete_line"));
         assert!(ids.contains(&"edit.duplicate_line"));
+        assert!(ids.contains(&"edit.join_lines"));
+        assert!(ids.contains(&"edit.expand_selection_line"));
+        assert!(ids.contains(&"edit.move_line_up"));
+        assert!(ids.contains(&"edit.move_line_down"));
 
         palette.push_text("xyz");
         assert!(palette.matches.is_empty(), "query imposible");
 
-        // Backspace hasta "línea" otra vez: re-filtra y recuperan los 2.
+        // Backspace hasta "línea" otra vez: re-filtra y recuperan los 6.
         for _ in 0..3 {
             palette.handle_key(&Key::Named(NamedKey::Backspace), mods());
         }
         assert_eq!(palette.query, "línea");
-        assert_eq!(palette.matches.len(), 2, "backspace re-filtra");
+        assert_eq!(palette.matches.len(), 6, "backspace re-filtra");
     }
 
     #[test]

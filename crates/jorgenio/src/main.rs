@@ -493,6 +493,24 @@ fn run_command(
             tabs.active_mut().duplicate_current_line();
             true
         }
+        "edit.expand_selection_line" => {
+            tabs.active_mut().expand_to_line();
+            true
+        }
+        "edit.join_lines" => {
+            tabs.active_mut().join_lines();
+            true
+        }
+        // Sin binding de tecla (flechas Named no entran al keymap): el
+        // atajo Ctrl+Shift+↑/↓ vive en `editor.handle_key`.
+        "edit.move_line_up" => {
+            tabs.active_mut().move_line_up();
+            true
+        }
+        "edit.move_line_down" => {
+            tabs.active_mut().move_line_down();
+            true
+        }
         "edit.comment" => {
             tabs.active_mut().toggle_line_comment();
             true
@@ -756,7 +774,11 @@ impl winit::application::ApplicationHandler for Application {
                 // con alt coincide.
                 if key_event.state == ElementState::Pressed
                     && (self.modifiers.control_key() || self.modifiers.super_key())
-                    && matches!(key_event.logical_key, Key::Character(_))
+                    && (matches!(key_event.logical_key, Key::Character(_))
+                        || matches!(
+                            key_event.logical_key,
+                            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)
+                        ))
                     && let Some(id) = commands::command_for(self.modifiers, &key_event.logical_key)
                 {
                     if self.palette.is_open() {

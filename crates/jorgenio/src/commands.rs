@@ -4,7 +4,7 @@
 //! ejecuta con `run_command`; la paleta de comandos (Ctrl+Shift+P) lista
 //! [`COMMANDS`] y muestra el atajo de cada uno con [`keys_for`].
 
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Una tecla del keymap: `key` en minúsculas (solo `Key::Character`).
 pub struct Binding {
@@ -50,6 +50,10 @@ pub static KEYMAP: &[Binding] = &[
     bind("d", true, false, false, "edit.select_next_occurrence"),
     bind("k", true, true, false, "edit.delete_line"),
     bind("d", true, true, false, "edit.duplicate_line"),
+    bind("l", true, false, false, "edit.expand_selection_line"),
+    bind("j", true, false, false, "edit.join_lines"),
+    bind("up", true, true, false, "edit.move_line_up"),
+    bind("down", true, true, false, "edit.move_line_down"),
     // Ctrl+/ con y sin Shift: en teclados ES "/" nace con Shift y en US sin él;
     // ambos eventos ('/' con ctrl) alternan comentarios de línea.
     bind("/", true, false, false, "edit.comment"),
@@ -183,6 +187,26 @@ pub static COMMANDS: &[Command] = &[
         category: "Ver",
     },
     Command {
+        id: "edit.join_lines",
+        name: "Unir con la línea siguiente",
+        category: "Editar",
+    },
+    Command {
+        id: "edit.expand_selection_line",
+        name: "Expandir selección a la línea",
+        category: "Editar",
+    },
+    Command {
+        id: "edit.move_line_up",
+        name: "Mover línea arriba (Ctrl+Shift+↑)",
+        category: "Editar",
+    },
+    Command {
+        id: "edit.move_line_down",
+        name: "Mover línea abajo (Ctrl+Shift+↓)",
+        category: "Editar",
+    },
+    Command {
         id: "theme.toggle",
         name: "Cambiar tema claro/oscuro",
         category: "Ver",
@@ -195,10 +219,13 @@ pub static COMMANDS: &[Command] = &[
 ];
 
 /// Normaliza la tecla lógica a la forma del keymap (minúsculas).
-/// Solo `Key::Character`; los `Named` no tienen atajos.
+/// `Key::Character` y las flechas (usadas por Ctrl+Shift+↑/↓); el resto de
+/// `Named` no tienen atajos.
 fn normalize_key(key: &Key) -> Option<String> {
     match key {
         Key::Character(text) => Some(text.to_lowercase()),
+        Key::Named(NamedKey::ArrowUp) => Some("up".to_owned()),
+        Key::Named(NamedKey::ArrowDown) => Some("down".to_owned()),
         _ => None,
     }
 }
@@ -235,7 +262,12 @@ pub fn keys_for(command: &str) -> Option<String> {
     if binding.shift {
         out.push_str("Shift+");
     }
-    out.push_str(&binding.key.to_uppercase());
+    let label = match binding.key {
+        "up" => "↑".to_owned(),
+        "down" => "↓".to_owned(),
+        other => other.to_uppercase(),
+    };
+    out.push_str(&label);
     Some(out)
 }
 
@@ -344,5 +376,31 @@ mod tests {
         for command in COMMANDS {
             assert!(keys_for(command.id).is_some(), "sin atajo: {}", command.id);
         }
+    }
+
+    #[test]
+    fn line_editing_bindings_resolve() {
+        assert_eq!(
+            command_for(mods(true, false, false), &key('l')),
+            Some("edit.expand_selection_line")
+        );
+        assert_eq!(
+            command_for(mods(true, false, false), &key('j')),
+            Some("edit.join_lines")
+        );
+        assert_eq!(
+            command_for(mods(true, true, false), &Key::Named(NamedKey::ArrowUp)),
+            Some("edit.move_line_up"),
+            "las flechas Named sí resuelven para mover línea"
+        );
+        assert_eq!(
+            command_for(mods(true, false, false), &Key::Named(NamedKey::ArrowUp)),
+            None,
+            "Ctrl+↑ sin Shift no está atado"
+        );
+        assert_eq!(
+            keys_for("edit.move_line_up").as_deref(),
+            Some("Ctrl+Shift+↑")
+        );
     }
 }

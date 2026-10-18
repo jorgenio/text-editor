@@ -24,6 +24,9 @@ pub struct Settings {
     pub caret_blink_ms: u64,
     /// Tamaño de la fuente en px del editor y la barra (8-72).
     pub font_size: u32,
+    /// ¿Tabulador escribe espacios en vez de `\t`? (también afecta al
+    /// indentar/desindentar selecciones).
+    pub translate_tabs_to_spaces: bool,
     /// Tema de colores: "dark" (Monokai, por defecto) o "light".
     pub theme: String,
 }
@@ -35,6 +38,7 @@ impl Default for Settings {
             show_line_numbers: true,
             caret_blink_ms: 530,
             font_size: 14,
+            translate_tabs_to_spaces: false,
             theme: "dark".to_owned(),
         }
     }
@@ -221,6 +225,9 @@ pub fn default_template() -> &'static str {
     // Tamaño de la fuente en píxeles del editor (8-72).
     "font_size": 14,
 
+    // ¿Tabulador escribe espacios (true) o carácter de tabulación (false)?
+    "translate_tabs_to_spaces": false,
+
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
     "theme": "dark",
 }
@@ -309,6 +316,20 @@ mod tests {
         assert_eq!(high.tab_width, 32);
         assert_eq!(high.caret_blink_ms, 10_000);
         assert_eq!(high.font_size, 72, "fuente con techo");
+    }
+
+    #[test]
+    fn translate_tabs_to_spaces_defaults_off_and_parses() {
+        assert!(
+            !Settings::default().translate_tabs_to_spaces,
+            "por defecto Tab escribe \\t"
+        );
+        assert!(
+            parse("{\"translate_tabs_to_spaces\": true}")
+                .unwrap()
+                .translate_tabs_to_spaces,
+            "se puede activar"
+        );
     }
 
     #[test]

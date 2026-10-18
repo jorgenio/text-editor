@@ -96,6 +96,8 @@ pub struct Editor {
     tab_width: usize,
     /// ¿Dibujar los números de línea? (`show_line_numbers` de preferencias).
     show_line_numbers: bool,
+    /// ¿Tabulador escribe espacios? (`translate_tabs_to_spaces` de prefs).
+    translate_tabs_to_spaces: bool,
     /// Tamaño de la fuente en px (preferencias; ver [`FONT_SIZE`]). El
     /// advance, la altura de línea y el gutter se derivan de él.
     font_size: f32,
@@ -126,6 +128,7 @@ impl Default for Editor {
             left_inset: 0.0,
             tab_width: TAB_WIDTH,
             show_line_numbers: true,
+            translate_tabs_to_spaces: false,
             font_size: FONT_SIZE,
             theme: Theme::dark(),
             find: Vec::new(),
@@ -231,6 +234,10 @@ impl Editor {
         self.show_line_numbers = show;
     }
 
+    pub fn set_translate_tabs_to_spaces(&mut self, translate: bool) {
+        self.translate_tabs_to_spaces = translate;
+    }
+
     /// Tamaño de la fuente en px (recortado a 8-72). La altura de línea,
     /// el advance del código y el ancho del gutter se derivan solos.
     pub fn set_font_size(&mut self, px: u32) {
@@ -300,6 +307,12 @@ impl Editor {
     #[cfg(test)]
     pub fn font_size(&self) -> f32 {
         self.font_size
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn translate_tabs_to_spaces(&self) -> bool {
+        self.translate_tabs_to_spaces
     }
 
     pub fn focused(&self) -> bool {
@@ -374,14 +387,22 @@ impl Editor {
                 true
             }
             Key::Named(NamedKey::Enter) => {
-                self.insert_text("\n");
+                self.insert_newline_indented();
+                true
+            }
+            Key::Named(NamedKey::Tab) if shift => {
+                self.unindent_selection();
                 true
             }
             Key::Named(NamedKey::Tab) => {
                 if self.try_expand_snippet() {
                     true
+                } else if self.cursors.iter().any(|cursor| cursor.has_selection()) {
+                    self.indent_selection();
+                    true
                 } else {
-                    self.insert_text("\t");
+                    let unit = self.indent_unit();
+                    self.insert_text(&unit);
                     true
                 }
             }
@@ -669,6 +690,262 @@ impl Editor {
             },
             shift,
         );
+    }
+
+    /// Unidad de indentación: `\t` o `tab_width` espacios.
+    fn indent_unit(&self) -> String {
+        if self.translate_tabs_to_spaces {
+            " ".repeat(self.tab_width)
+        } else {
+            "\t".to_owned()
+        }
+    }
+
+    /// Líneas únicas (sin repetir) que abarcan las selecciones actuales; una
+    /// selección que termina justo al inicio de una línea no la incluye.
+    fn selected_lines(&self) -> Vec<usize> {
+        let mut lines = Vec::new();
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            let first = self.buffer.char_to_line(range.start);
+            let mut last = self.buffer.char_to_line(if range.end > range.start {
+                range.end - 1
+            } else {
+                range.start
+            });
+            if last > first && range.end == self.buffer.line_to_char(last) {
+                last -= 1;
+            }
+            lines.extend(first..=last);
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    /// Indenta (Tab con selección) cada línea abarcada, sin cambiar la
+    /// columna del texto.
+    pub fn indent_selection(&mut self) {
+        let lines = self.selected_lines();
+        let unit = self.indent_unit();
+        self.with_transaction(|editor| {
+            for &line in lines.iter().rev() {
+                let at = editor.buffer.line_to_char(line);
+                let len = unit.chars().count();
+                editor.buffer.insert(at, &unit);
+                for cursor in &mut editor.cursors {
+                    cursor.caret = shift_after(cursor.caret, at, at, len);
+                    cursor.anchor = shift_after(cursor.anchor, at, at, len);
+                }
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Desindenta (Shift+Tab) quitando hasta un nivel de espacios o un `\t`.
+    pub fn unindent_selection(&mut self) {
+        let lines = self.selected_lines();
+        let width = self.tab_width;
+        self.with_transaction(|editor| {
+            for &line in lines.iter().rev() {
+                let at = editor.buffer.line_to_char(line);
+                let text = editor.buffer.line_text(line);
+                let ws = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                if ws == 0 {
+                    continue;
+                }
+                let remove = if text.starts_with('\t') {
+                    1
+                } else {
+                    ws.min(width)
+                };
+                editor.buffer.delete(at..at + remove);
+                for cursor in &mut editor.cursors {
+                    cursor.caret = shift_after(cursor.caret, at, at + remove, 0);
+                    cursor.anchor = shift_after(cursor.anchor, at, at + remove, 0);
+                }
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Ctrl+L: selección a la línea completa (repetir extiende a la
+    /// siguiente); el `\n` final queda dentro de la selección.
+    pub fn expand_to_line(&mut self) {
+        let len = self.buffer.len_chars();
+        let mut cursors = Vec::with_capacity(self.cursors.len());
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            let (start, end) = (range.start, range.end);
+            let line = self.buffer.char_to_line(start);
+            let line_start = self.buffer.line_to_char(line);
+            let end_line = self
+                .buffer
+                .char_to_line(if end > start { end - 1 } else { start });
+            let end_line_start = self.buffer.line_to_char(end_line);
+            let end_line_chars = self.buffer.line_text(end_line).chars().count();
+            let end_line_full = (end_line_start + end_line_chars + 1).min(len);
+            let caret = if end == end_line_full && end < len {
+                // Ya cubre la línea entera: extiende a la siguiente.
+                let next_chars = self.buffer.line_text(end_line + 1).chars().count();
+                (end + next_chars + 1).min(len)
+            } else {
+                end_line_full
+            };
+            cursors.push(Cursor {
+                anchor: line_start,
+                caret,
+            });
+        }
+        self.cursors = cursors;
+        self.sort_and_merge();
+        self.reset_caret_blink();
+        self.scroll_into_view();
+    }
+
+    /// Ctrl+J: une la línea actual con la siguiente (quita el `\n` y el
+    /// sangrado de la siguiente; pone un espacio si ambas tienen texto).
+    pub fn join_lines(&mut self) {
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let caret = editor.cursors[i].caret;
+                let len = editor.buffer.len_chars();
+                let line = editor.buffer.char_to_line(caret);
+                let line_start = editor.buffer.line_to_char(line);
+                let cur_chars = editor.buffer.line_text(line).chars().count();
+                let nl = line_start + cur_chars;
+                if nl >= len {
+                    continue; // última línea sin \n: no hay nada que unir
+                }
+                let next_start = editor.buffer.line_to_char(line + 1);
+                let next_text = editor.buffer.line_text(line + 1);
+                let next_chars = next_text.chars().count();
+                let next_indent = next_text
+                    .chars()
+                    .take_while(|c| c.is_whitespace() && *c != '\n')
+                    .count();
+                let end = if next_indent == next_chars {
+                    next_start + next_chars
+                } else {
+                    next_start + next_indent
+                };
+                let cur_text = editor.buffer.line_text(line);
+                let cur_blank =
+                    cur_chars == 0 || cur_text.chars().last().is_some_and(|c| c.is_whitespace());
+                let next_blank = next_indent == next_chars;
+                let space = if cur_blank || next_blank { "" } else { " " };
+                let inserted = space.chars().count();
+                editor.buffer.delete(nl..end);
+                if inserted > 0 {
+                    editor.buffer.insert(nl, space);
+                }
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, nl, end, inserted);
+                    other.anchor = shift_after(other.anchor, nl, end, inserted);
+                }
+                editor.cursors[i].caret = nl + inserted;
+                editor.cursors[i].anchor = nl + inserted;
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Ctrl+Shift+↑/↓: mueve la línea actual intercambiándola con la
+    /// contigua; el caret conserva su columna dentro de la línea.
+    pub fn move_line_up(&mut self) {
+        self.move_line(-1);
+    }
+
+    pub fn move_line_down(&mut self) {
+        self.move_line(1);
+    }
+
+    fn move_line(&mut self, dir: i32) {
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let caret = editor.cursors[i].caret;
+                let line = editor.buffer.char_to_line(caret);
+                let col = caret - editor.buffer.line_to_char(line);
+                let last_line = editor.buffer.char_to_line(editor.buffer.len_chars());
+                let target = if dir < 0 {
+                    line.checked_sub(1)
+                } else if line < last_line {
+                    Some(line + 1)
+                } else {
+                    None
+                };
+                let Some(target) = target else { continue };
+                let (low_line, high_line) = if dir < 0 {
+                    (target, line)
+                } else {
+                    (line, target)
+                };
+                let low_start = editor.buffer.line_to_char(low_line);
+                let high_start = editor.buffer.line_to_char(high_line);
+                let low_text = editor.buffer.line_text(low_line).to_owned();
+                let high_text = editor.buffer.line_text(high_line).to_owned();
+                let high_chars = high_text.chars().count();
+                let has_nl = high_start + high_chars < editor.buffer.len_chars();
+                let block_end = high_start + high_chars + usize::from(has_nl);
+                let new_block = if has_nl {
+                    format!("{high_text}\n{low_text}\n")
+                } else {
+                    format!("{high_text}\n{low_text}")
+                };
+                let new_len = new_block.chars().count();
+                editor.buffer.delete(low_start..block_end);
+                editor.buffer.insert(low_start, &new_block);
+                let new_line_start = if dir < 0 {
+                    low_start
+                } else {
+                    low_start + high_chars + 1
+                };
+                let new_caret = new_line_start + col;
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, low_start, block_end, new_len);
+                    other.anchor = shift_after(other.anchor, low_start, block_end, new_len);
+                }
+                editor.cursors[i].caret = new_caret;
+                editor.cursors[i].anchor = new_caret;
+            }
+        });
+        self.reset_caret_blink();
+    }
+
+    /// Enter: además del `\n`, arrastra el sangrado de la línea actual.
+    fn insert_newline_indented(&mut self) {
+        if self.cursors.iter().any(|cursor| cursor.has_selection()) {
+            self.insert_text("\n");
+            return;
+        }
+        self.with_transaction(|editor| {
+            let mut i = editor.cursors.len();
+            while i > 0 {
+                i -= 1;
+                let caret = editor.cursors[i].caret;
+                let line = editor.buffer.char_to_line(caret);
+                let indent: String = editor
+                    .buffer
+                    .line_text(line)
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                let text = format!("\n{indent}");
+                let len = text.chars().count();
+                editor.buffer.insert(caret, &text);
+                for other in &mut editor.cursors[i + 1..] {
+                    other.caret = shift_after(other.caret, caret, caret, len);
+                    other.anchor = shift_after(other.anchor, caret, caret, len);
+                }
+                editor.cursors[i].caret = caret + len;
+                editor.cursors[i].anchor = caret + len;
+            }
+        });
+        self.reset_caret_blink();
     }
 
     /// Texto de TODAS las selecciones unidas con `\n` (portapapeles).
@@ -1907,6 +2184,139 @@ mod tests {
         assert_eq!(editor.primary().caret, 0, "de vuelta a la columna 0");
         editor.handle_key(&home, ModifiersState::empty());
         assert_eq!(editor.primary().caret, 4, "y otra vez al no-blanco");
+    }
+
+    #[test]
+    fn expand_to_line_extends_one_line_per_press() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres"); // len 12
+        editor.cursors = vec![Cursor::new(1)];
+        editor.expand_to_line();
+        assert_eq!(editor.primary().range(), 0..4, "línea 0 con su \\n");
+        editor.expand_to_line();
+        assert_eq!(editor.primary().range(), 0..8, "extiende a la línea 1");
+        editor.expand_to_line();
+        assert_eq!(editor.primary().range(), 0..12, "y a la última (sin \\n)");
+        editor.expand_to_line();
+        assert_eq!(editor.primary().range(), 0..12, "en el final no crece");
+    }
+
+    #[test]
+    fn join_lines_inserts_one_space_and_skips_indent() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola\n    mundo\nfin");
+        editor.cursors = vec![Cursor::new(1)];
+        editor.join_lines();
+        assert_eq!(
+            text_of(&editor),
+            "hola mundo\nfin",
+            "quita \\n e indent; un espacio"
+        );
+        editor.join_lines();
+        assert_eq!(text_of(&editor), "hola mundo fin");
+        editor.join_lines();
+        assert_eq!(text_of(&editor), "hola mundo fin", "última línea: no-op");
+        assert!(editor.undo(), "cada unión es un paso de undo");
+        assert_eq!(text_of(&editor), "hola mundo\nfin");
+    }
+
+    #[test]
+    fn move_line_up_and_down_swap_keeping_column() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres");
+        editor.cursors = vec![Cursor::new(5)]; // 'o' de "dos" (columna 1)
+
+        editor.move_line_up();
+        assert_eq!(text_of(&editor), "dos\nuno\ntres");
+        assert_eq!(
+            editor.primary().caret,
+            1,
+            "conserva la columna en la línea movida"
+        );
+
+        editor.move_line_down();
+        assert_eq!(
+            text_of(&editor),
+            "uno\ndos\ntres",
+            "vuelve a la posición original"
+        );
+        assert_eq!(editor.primary().caret, 5);
+
+        editor.cursors = vec![Cursor::new(0)];
+        editor.move_line_up();
+        assert_eq!(
+            text_of(&editor),
+            "uno\ndos\ntres",
+            "no-op en la primera línea"
+        );
+
+        editor.cursors = vec![Cursor::new(12)];
+        editor.move_line_down();
+        assert_eq!(text_of(&editor), "uno\ndos\ntres", "no-op en la última");
+    }
+
+    #[test]
+    fn tab_key_indents_selection_and_shift_tab_unindents() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos");
+        editor.cursors = vec![Cursor {
+            caret: 2,
+            anchor: 6,
+        }];
+
+        editor.handle_key(&Key::Named(NamedKey::Tab), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "\tuno\n\tdos");
+        assert_eq!(editor.primary().caret, 3, "caret desplazado por el tab");
+
+        editor.handle_key(&Key::Named(NamedKey::Tab), ModifiersState::SHIFT);
+        assert_eq!(text_of(&editor), "uno\ndos");
+        assert_eq!(editor.primary().caret, 2);
+    }
+
+    #[test]
+    fn translate_tabs_to_spaces_and_unindent_removes_one_level() {
+        let mut editor = Editor::default();
+        editor.set_tab_width(2);
+        editor.set_translate_tabs_to_spaces(true);
+        editor.insert_text("a\n  b");
+        editor.cursors = vec![Cursor {
+            caret: 0,
+            anchor: 6,
+        }];
+        editor.indent_selection();
+        assert_eq!(text_of(&editor), "  a\n    b", "añade 2 espacios por línea");
+        editor.unindent_selection();
+        assert_eq!(text_of(&editor), "a\n  b", "quita un nivel de espacios");
+        editor.unindent_selection();
+        assert_eq!(text_of(&editor), "a\nb", "y el segundo nivel");
+
+        // Con tabulador, Shift+Tab quita un solo \t aunque tab_width > 1.
+        let mut editor = Editor::default();
+        editor.set_tab_width(4);
+        editor.insert_text("\t\tx");
+        editor.cursors = vec![Cursor::new(3)];
+        editor.unindent_selection();
+        assert_eq!(text_of(&editor), "\tx");
+    }
+
+    #[test]
+    fn enter_carries_the_indentation() {
+        let mut editor = Editor::default();
+        editor.insert_text("    código");
+        editor.cursors = vec![Cursor::new(10)];
+        editor.handle_key(&Key::Named(NamedKey::Enter), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "    código\n    ");
+        assert_eq!(editor.primary().caret, 15);
+
+        // Con selección Enter la borra e inserta solo el \n (como antes).
+        let mut editor = Editor::default();
+        editor.insert_text("  ab");
+        editor.cursors = vec![Cursor {
+            caret: 2,
+            anchor: 4,
+        }];
+        editor.handle_key(&Key::Named(NamedKey::Enter), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "  \n");
     }
 
     #[test]

@@ -45,6 +45,10 @@ Linux (la CI compueba ambos).
   arrastre de la ventana con doble clic para maximizar, botones
   minimizar/maximizar/cerrar y bordes redimensionables en los 4 lados y
   las esquinas.
+- **Buscar en archivos** (Ctrl+Shift+F): panel de resultados al pie con
+  `ruta:línea: texto`, smart-case (mayúsculas activan distinguir
+  mayúsculas), hasta 1000 coincidencias y límites para no colgar en
+  binarios o archivos enormes.
 
 ## Requisitos
 
@@ -101,6 +105,7 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | Comentar / destacar línea | Ctrl+/ |
 | Comentar bloque | Ctrl+Shift+/ |
 | Buscar / Reemplazar | Ctrl+F / Ctrl+H |
+| Buscar en archivos | Ctrl+Shift+F |
 | Dividir panel / Unir paneles | Ctrl+\\ / Ctrl+Shift+\\ |
 | Cambiar tema claro/oscuro | Ctrl+T |
 | Zoom de fuente (+ / − / normal) | Ctrl+= / Ctrl+- / Ctrl+0 |
@@ -113,6 +118,13 @@ cursores arriba/abajo; doble click selecciona la palabra y triple la línea.
 coincidencia (con Shift, a la anterior), ↑/↓ también navegan, Tab salta de
 buscar a reemplazar (con el modo reemplazo activo), Ctrl+Enter reemplaza la
 actual, Ctrl+Shift+Enter reemplaza todas y Esc cierra.
+
+**Dentro del panel de buscar en archivos**: la consulta se recoge de la
+selección de una línea si la hay; Enter busca (o, con la búsqueda ya
+hecha, abre la coincidencia seleccionada), ↑/↓ recorren los resultados y
+Esc cierra. Click en una fila abre el archivo en esa línea; click fuera
+del panel lo cierra y sigue su curso hasta el editor. Buscar (Ctrl+F) y
+Buscar en archivos se excluyen mutuamente.
 
 **Movimiento**: flechas, Home/End (Home alterna columna 0 ↔ primer
 no-blanco), PageUp/PageDown, Ctrl+←/→ por palabras, Backspace/Delete,

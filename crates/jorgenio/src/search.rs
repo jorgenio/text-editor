@@ -229,12 +229,14 @@ impl SearchBar {
     }
 
     /// Dibuja la barra en la capa superior (si está abierta) y guarda el
-    /// layout para [`SearchBar::handle_click`].
+    /// layout para [`SearchBar::handle_click`]. `bottom` es la franja
+    /// inferior reservada (barra de estado) sobre la que flota la barra.
     pub fn render(
         &mut self,
         scene: &mut Scene,
         viewport: (f32, f32),
         advance: f32,
+        bottom: f32,
         editor: &Editor,
     ) {
         if !self.open {
@@ -243,7 +245,7 @@ impl SearchBar {
         }
         let rows = if self.replace_mode { 2 } else { 1 };
         let bar_h = EDGE + rows as f32 * ROW_H;
-        let bar_y = (viewport.1 - bar_h).max(0.0);
+        let bar_y = (viewport.1 - bottom - bar_h).max(0.0);
         let bar = Rect::new(0.0, bar_y, viewport.0, bar_h);
         scene
             .top_quads
@@ -609,7 +611,7 @@ mod tests {
         typed(&mut search, &mut editor, "hola");
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        search.render(&mut scene, (800.0, 600.0), 8.0, &editor);
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
         assert!(
             scene.top_quads.len() >= 4,
             "fondo + borde + campos + botones"
@@ -645,7 +647,7 @@ mod tests {
         assert!(!search.replace_mode);
 
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        search.render(&mut scene, (800.0, 600.0), 8.0, &editor);
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
         let layout = search.last.unwrap();
         assert_eq!(layout.replace_field.w, 0.0, "sin fila de reemplazo");
         // fondo + borde + campo + caret.
@@ -666,12 +668,12 @@ mod tests {
         search.insert_active("x");
 
         let mut dark_scene = Scene::new(wgpu::Color::BLACK);
-        search.render(&mut dark_scene, (800.0, 600.0), 8.0, &editor);
+        search.render(&mut dark_scene, (800.0, 600.0), 8.0, 0.0, &editor);
         assert_eq!(dark_scene.top_quads[0].color, Theme::dark().panel_bg);
 
         search.set_theme(Theme::light());
         let mut light_scene = Scene::new(wgpu::Color::BLACK);
-        search.render(&mut light_scene, (800.0, 600.0), 8.0, &editor);
+        search.render(&mut light_scene, (800.0, 600.0), 8.0, 0.0, &editor);
         assert_eq!(light_scene.top_quads[0].color, Theme::light().panel_bg);
         assert!(
             light_scene

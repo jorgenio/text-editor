@@ -2,6 +2,7 @@
 
 mod commands;
 mod editor;
+mod findfiles;
 mod palette;
 mod search;
 mod session;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use editor::Editor;
+use findfiles::FindFiles;
 use jorgenio_ui::gpu::GpuContext;
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use palette::Palette;
@@ -70,6 +72,8 @@ struct Application {
     palette: Palette,
     /// Barra de buscar/reemplazar (Ctrl+F / Ctrl+H).
     search: SearchBar,
+    /// Buscar en archivos (Ctrl+Shift+F) con panel de resultados.
+    findfiles: FindFiles,
     /// Preferencias cargadas de `settings.json` (M11).
     settings: settings::Settings,
     gpu: Option<GpuContext>,
@@ -107,6 +111,7 @@ impl Application {
             tabs,
             palette: Palette::default(),
             search,
+            findfiles: FindFiles::default(),
             settings,
             gpu: None,
             clipboard: None,
@@ -281,19 +286,21 @@ fn notify(slot: &mut Option<(String, Instant)>, text: String) {
 
 /// Acción elegida en el menú de la barra de título: comando o toggle.
 /// `true` = pide redraw.
+#[allow(clippy::too_many_arguments)]
 fn apply_menu_action(
     tabs: &mut Tabs,
     clipboard: &mut Option<arboard::Clipboard>,
     palette: &mut Palette,
     search: &mut SearchBar,
+    findfiles: &mut FindFiles,
     settings: &mut settings::Settings,
     notice: &mut Option<(String, Instant)>,
     action: title::Action,
 ) -> bool {
     match action {
-        title::Action::Command(id) => {
-            run_command(tabs, clipboard, palette, search, settings, notice, id)
-        }
+        title::Action::Command(id) => run_command(
+            tabs, clipboard, palette, search, findfiles, settings, notice, id,
+        ),
         title::Action::Toggle(field) => {
             match field {
                 "show_line_numbers" => settings.show_line_numbers = !settings.show_line_numbers,
@@ -383,11 +390,13 @@ fn open_path(tabs: &mut Tabs, settings: &mut settings::Settings, path: std::path
 
 /// Ejecuta un comando por id (keymap o paleta de comandos).
 /// `true` = pide redraw.
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     tabs: &mut Tabs,
     clipboard: &mut Option<arboard::Clipboard>,
     palette: &mut Palette,
     search: &mut SearchBar,
+    findfiles: &mut FindFiles,
     settings: &mut settings::Settings,
     notice: &mut Option<(String, Instant)>,
     id: &str,
@@ -398,13 +407,23 @@ fn run_command(
             true
         }
         "find.show" => {
+            findfiles.close();
             let prefill = tabs.active().single_line_selection();
             search.open(false, prefill.as_deref(), tabs.active_mut());
             true
         }
         "replace.show" => {
+            findfiles.close();
             let prefill = tabs.active().single_line_selection();
             search.open(true, prefill.as_deref(), tabs.active_mut());
+            true
+        }
+        "find_in_files.show" => {
+            search.close();
+            let prefill = tabs.active().single_line_selection();
+            let root = std::env::current_dir().unwrap_or_default();
+            let files = collect_files(&root, QUICK_OPEN_MAX);
+            findfiles.open(prefill.as_deref(), root, files);
             true
         }
         "file.new" => {
@@ -800,15 +819,9 @@ impl winit::application::ApplicationHandler for Application {
                             .push(Quad::new(x - 1.0, 0.0, 2.0, viewport.1, edge));
                     }
                 }
-                self.search.render(
-                    &mut scene,
-                    viewport,
-                    editor::FONT_SIZE * advance,
-                    self.tabs.active(),
-                );
                 // Barra de estado inferior: Ln/Col, selección, tabulado,
-                // lenguaje y archivo; se pinta ANTES que el aviso y la
-                // paleta para no taparlas.
+                // lenguaje y archivo; se pinta PRIMERO para que la barra de
+                // búsqueda y el panel de resultados floten sobre ella.
                 {
                     let status = self.tabs.active().status_text();
                     let char_w = editor::FONT_SIZE * advance;
@@ -829,6 +842,20 @@ impl winit::application::ApplicationHandler for Application {
                         NOTICE_FG,
                     ));
                 }
+                self.search.render(
+                    &mut scene,
+                    viewport,
+                    editor::FONT_SIZE * advance,
+                    STATUS_H,
+                    self.tabs.active(),
+                );
+                self.findfiles.render(
+                    &mut scene,
+                    viewport,
+                    editor::FONT_SIZE * advance,
+                    STATUS_H,
+                    &Theme::from_name(&self.settings.theme),
+                );
                 // Aviso efímero en la esquina superior derecha (los de
                 // paleta se pintan después: mandan sobre él).
                 if let Some((text, at)) = &self.notice
@@ -942,6 +969,7 @@ impl winit::application::ApplicationHandler for Application {
                         &mut self.clipboard,
                         &mut self.palette,
                         &mut self.search,
+                        &mut self.findfiles,
                         &mut self.settings,
                         &mut self.notice,
                         id,
@@ -960,6 +988,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
+                                &mut self.findfiles,
                                 &mut self.settings,
                                 &mut self.notice,
                                 id,
@@ -980,6 +1009,22 @@ impl winit::application::ApplicationHandler for Application {
                             gpu.request_redraw();
                         }
                         palette::Action::None => {}
+                    }
+                    return;
+                }
+                // Panel de buscar en archivos: su teclado manda (todo se
+                // traga; Enter abre el seleccionado, Esc lo cierra).
+                if self.findfiles.is_open() {
+                    if key_event.state == ElementState::Pressed {
+                        match self.findfiles.on_key(&key_event, self.modifiers) {
+                            findfiles::Action::None => {}
+                            findfiles::Action::Close => self.findfiles.close(),
+                            findfiles::Action::Open(path, line) => {
+                                open_path(&mut self.tabs, &mut self.settings, path);
+                                self.tabs.active_mut().goto_line(line);
+                            }
+                        }
+                        gpu.request_redraw();
                     }
                     return;
                 }
@@ -1031,7 +1076,10 @@ impl winit::application::ApplicationHandler for Application {
                     self.titlebar.hover_at(self.cursor.x, self.cursor.y);
                     let edge = title::resize_edge(self.cursor.x, self.cursor.y, width, height)
                         .map(CursorIcon::from);
-                    let icon = if self.palette.is_open() || self.search.is_open() {
+                    let icon = if self.palette.is_open()
+                        || self.search.is_open()
+                        || self.findfiles.is_open()
+                    {
                         CursorIcon::Default
                     } else if let Some(icon) = edge {
                         icon
@@ -1091,6 +1139,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
+                                &mut self.findfiles,
                                 &mut self.settings,
                                 &mut self.notice,
                                 id,
@@ -1130,6 +1179,23 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
+                // Panel de buscar en archivos: fila → abrir; dentro del
+                // panel → tragar; fuera → cerrar y que el click siga.
+                if self.findfiles.is_open() {
+                    match self.findfiles.click(self.cursor.x, self.cursor.y) {
+                        findfiles::Click::Row(path, line) => {
+                            open_path(&mut self.tabs, &mut self.settings, path);
+                            self.tabs.active_mut().goto_line(line);
+                            gpu.request_redraw();
+                            return;
+                        }
+                        findfiles::Click::Panel => {
+                            gpu.request_redraw();
+                            return;
+                        }
+                        findfiles::Click::Miss => self.findfiles.close(),
+                    }
+                }
                 // Barra de título y desplegado del menú (por encima del
                 // divisor y de las pestañas: ocupa la fila superior y su
                 // menú se despliega sobre el contenido).
@@ -1146,6 +1212,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.clipboard,
                                 &mut self.palette,
                                 &mut self.search,
+                                &mut self.findfiles,
                                 &mut self.settings,
                                 &mut self.notice,
                                 action,
@@ -1279,6 +1346,8 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if self.palette.is_open() {
                     self.palette.push_text(&text);
+                } else if self.findfiles.is_open() {
+                    self.findfiles.push_text(&text);
                 } else if self.search.is_open() {
                     self.search.push_text(&text, self.tabs.active_mut());
                 } else {
@@ -1298,6 +1367,7 @@ mod tests {
         run_command,
     };
     use crate::editor::Editor;
+    use crate::findfiles::FindFiles;
     use crate::palette::Palette;
     use crate::search::SearchBar;
     use crate::settings;
@@ -1385,6 +1455,7 @@ mod tests {
         let mut clipboard = None;
         let mut palette = Palette::default();
         let mut search = SearchBar::default();
+        let mut findfiles = FindFiles::default();
         let mut settings = settings::Settings::default();
         let mut notice: Option<(String, Instant)> = None;
 
@@ -1394,6 +1465,7 @@ mod tests {
             &mut clipboard,
             &mut palette,
             &mut search,
+            &mut findfiles,
             &mut settings,
             &mut notice,
             "file.save",
@@ -1412,6 +1484,7 @@ mod tests {
             &mut clipboard,
             &mut palette,
             &mut search,
+            &mut findfiles,
             &mut settings,
             &mut notice,
             "file.save",
@@ -1426,6 +1499,7 @@ mod tests {
         let mut clipboard = None;
         let mut palette = Palette::default();
         let mut search = SearchBar::default();
+        let mut findfiles = FindFiles::default();
         let mut settings = settings::Settings::default();
         let mut notice: Option<(String, Instant)> = None;
         assert_eq!(tabs.active().theme(), Theme::dark(), "arranca oscuro");
@@ -1435,6 +1509,7 @@ mod tests {
             &mut clipboard,
             &mut palette,
             &mut search,
+            &mut findfiles,
             &mut settings,
             &mut notice,
             "theme.toggle",
@@ -1450,6 +1525,7 @@ mod tests {
             &mut clipboard,
             &mut palette,
             &mut search,
+            &mut findfiles,
             &mut settings,
             &mut notice,
             "theme.toggle",

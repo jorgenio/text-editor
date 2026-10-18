@@ -63,6 +63,7 @@ pub static KEYMAP: &[Binding] = &[
     bind("?", true, true, false, "edit.comment_block"),
     bind("f", true, false, false, "find.show"),
     bind("h", true, false, false, "replace.show"),
+    bind("f", true, true, false, "find_in_files.show"),
     bind("\\", true, false, false, "view.split"),
     bind("\\", true, true, false, "view.unsplit"),
     bind("t", true, false, false, "theme.toggle"),
@@ -181,6 +182,11 @@ pub static COMMANDS: &[Command] = &[
     Command {
         id: "replace.show",
         name: "Reemplazar",
+        category: "Buscar",
+    },
+    Command {
+        id: "find_in_files.show",
+        name: "Buscar en archivos",
         category: "Buscar",
     },
     Command {

@@ -88,6 +88,7 @@ const MENUS: &[(&str, &[MenuItem])] = &[
             item("", Action::Separator),
             item("Buscar", Action::Command("find.show")),
             item("Reemplazar", Action::Command("replace.show")),
+            item("Buscar en archivos", Action::Command("find_in_files.show")),
         ],
     ),
     (

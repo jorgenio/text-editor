@@ -219,6 +219,20 @@ pub struct Editor {
     /// por fila y cuántas filas ocupa cada línea lógica. Se reconstruye con
     /// `ensure_wrap` cuando cambia buffer/ancho/fuente/indentación.
     wrap: WrapCache,
+    /// Texto completo cacheado para `find`: una copia por revisión del
+    /// buffer en vez de una por cada pulsación de la consulta (archivos
+    /// grandes). Se materializa perezosamente y se suelta en `find_close`.
+    find_hay: Option<FindHay>,
+}
+
+/// Caché del texto completo que ve la búsqueda (`Editor::find`).
+///
+/// Guarda la revisión con la que se copió (para invalidarla sola), el texto
+/// con `\n` y, si el smart-case la pidió, su copia plegada a minúsculas.
+struct FindHay {
+    revision: u64,
+    text: String,
+    lowered: Option<String>,
 }
 
 impl Default for Editor {
@@ -252,6 +266,7 @@ impl Default for Editor {
             word_wrap: false,
             advance_ratio: DEFAULT_ADVANCE_RATIO,
             wrap: WrapCache::default(),
+            find_hay: None,
         }
     }
 }
@@ -477,6 +492,13 @@ impl Editor {
     #[cfg(test)]
     pub fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    /// Solo para tests: revisión del buffer con el que se copió el texto
+    /// completo de `find` (`None` = no hay copia).
+    #[cfg(test)]
+    pub fn cached_find_revision(&self) -> Option<u64> {
+        self.find_hay.as_ref().map(|hay| hay.revision)
     }
 
     /// Mueve el caret a `line` (1-based, como el prompt de "Ir a la línea…")
@@ -1774,6 +1796,7 @@ impl Editor {
             self.find.clear();
             self.find_current = 0;
             self.find_revision = self.buffer.revision();
+            self.find_hay = None;
             return;
         }
         let from = self.primary().caret;
@@ -1793,6 +1816,7 @@ impl Editor {
             self.find.clear();
             self.find_current = 0;
             self.find_revision = self.buffer.revision();
+            self.find_hay = None;
             return;
         }
         let from = self.primary().caret;
@@ -1856,16 +1880,72 @@ impl Editor {
         self.find_revision = self.buffer.revision();
     }
 
+    /// Materializa el texto completo para `find` si cambió la revisión del
+    /// buffer; `casefold` pide además la copia en minúsculas (smart-case).
+    /// Así un archivo de 100 MB se copia una vez por sesión de búsqueda en
+    /// vez de una por tecla.
+    fn ensure_find_hay(&mut self, casefold: bool) {
+        let revision = self.buffer.revision();
+        if !self
+            .find_hay
+            .as_ref()
+            .is_some_and(|hay| hay.revision == revision)
+        {
+            let text = self.buffer.text_range(0..self.buffer.len_chars());
+            self.find_hay = Some(FindHay {
+                revision,
+                text,
+                lowered: None,
+            });
+        }
+        if !casefold {
+            return;
+        }
+        if let Some(hay) = self.find_hay.as_mut()
+            && hay.lowered.is_none()
+        {
+            let lowered = hay.text.to_ascii_lowercase();
+            hay.lowered = Some(lowered);
+        }
+    }
+
+    /// Texto completo cacheado (vacío si aún no se ha materializado).
+    fn find_hay_text(&self) -> &str {
+        self.find_hay.as_ref().map_or("", |hay| hay.text.as_str())
+    }
+
+    /// [`Self::find_hay_text`] plegado a minúsculas (smart-case); solo tiene
+    /// contenido si `casefold` estaba activo al construirlo.
+    fn find_hay_lowered(&self) -> &str {
+        self.find_hay
+            .as_ref()
+            .and_then(|hay| hay.lowered.as_deref())
+            .unwrap_or("")
+    }
+
     /// Recalcula `find` y deja como actual la primera coincidencia en o
     /// después de `from` (si no hay, la primera).
     fn recompute_find(&mut self, from: usize) {
-        self.find = if self.find_regex {
+        // smart-case: sin mayúsculas en la consulta se pliega el ASCII.
+        let casefold = !self.find_regex
+            && !self.find_query.is_empty()
+            && !self.find_query.chars().any(char::is_uppercase);
+        self.ensure_find_hay(casefold);
+        let matches = if self.find_regex {
             self.find_regex_compiled
                 .as_ref()
-                .map_or_else(Vec::new, |regex| find_in_buffer_regex(&self.buffer, regex))
+                .map_or_else(Vec::new, |regex| {
+                    find_in_buffer_regex(self.find_hay_text(), regex)
+                })
+        } else if self.find_query.is_empty() {
+            Vec::new()
+        } else if casefold {
+            let needle = self.find_query.to_ascii_lowercase();
+            find_in_buffer(self.find_hay_lowered(), &needle)
         } else {
-            find_in_buffer(&self.buffer, &self.find_query)
+            find_in_buffer(self.find_hay_text(), &self.find_query)
         };
+        self.find = matches;
         self.find_current = self
             .find
             .iter()
@@ -1906,6 +1986,7 @@ impl Editor {
         self.find_regex_compiled = None;
         self.find_regex_error = false;
         self.find_revision = self.buffer.revision();
+        self.find_hay = None;
         self.reset_caret_blink();
     }
 
@@ -1922,8 +2003,7 @@ impl Editor {
         let expanded = if self.find_regex {
             match &self.find_regex_compiled {
                 Some(regex) => {
-                    let hay = self.buffer.text_range(0..self.buffer.len_chars());
-                    expand_regex_replacement(regex, &hay, &range, replacement)
+                    expand_regex_replacement(regex, self.find_hay_text(), &range, replacement)
                 }
                 None => replacement.to_owned(),
             }
@@ -1949,10 +2029,10 @@ impl Editor {
         }
         let count = self.find.len();
         if self.find_regex && self.find_regex_compiled.is_some() {
-            let hay = self.buffer.text_range(0..self.buffer.len_chars());
             let mut todo: Vec<(Range<usize>, String)> = Vec::new();
             if let Some(regex) = &self.find_regex_compiled {
-                for caps in regex.captures_iter(&hay) {
+                let hay = self.find_hay_text();
+                for caps in regex.captures_iter(hay) {
                     let Ok(caps) = caps else { break };
                     let Some(m) = caps.get(0) else { continue };
                     if m.start() == m.end() {
@@ -2747,32 +2827,25 @@ fn push_range_quad(
     }
 }
 
-/// Todas las posiciones (chars) de `query` en el buffer, en orden.
+/// Todas las posiciones (chars) de `needle` en `hay`, en orden; las agujas
+/// multilínea buscan en el texto entero.
 ///
-/// smart-case: si `query` trae mayúsculas, distingue mayúsculas; si no,
-/// pliega SOLO el ASCII de ambos lados (los offsets byte no cambian, así que
-/// los rangos siguen siendo válidos; lo no-ASCII no se case-foldea, decisión
-/// documentada). Las agujas multilínea buscan en el texto entero.
-fn find_in_buffer(buffer: &Buffer, query: &str) -> Vec<Range<usize>> {
-    if query.is_empty() {
+/// El smart-case lo decide el llamante (no la función): si la consulta no
+/// distingue mayúsculas, `hay` y `needle` llegan ya plegados a minúsculas
+/// (ver `recompute_find`). Lo no-ASCII no se case-foldea, decisión ya
+/// documentada; los offsets byte no cambian al plegar, así que los rangos
+/// siguen siendo válidos sobre el texto original.
+fn find_in_buffer(hay: &str, needle: &str) -> Vec<Range<usize>> {
+    if needle.is_empty() {
         return Vec::new();
     }
-    let hay = buffer.text_range(0..buffer.len_chars());
-    let (hay_cmp, needle): (Cow<str>, Cow<str>) = if query.chars().any(char::is_uppercase) {
-        (Cow::Borrowed(hay.as_str()), Cow::Borrowed(query))
-    } else {
-        (
-            Cow::Owned(hay.to_ascii_lowercase()),
-            Cow::Owned(query.to_ascii_lowercase()),
-        )
-    };
     let needle_chars = needle.chars().count();
     let mut found = Vec::new();
     let mut prev_byte = 0;
     let mut prev_chars = 0;
     // Conversión byte→char incremental: O(n) por consulta, no O(n) por match.
-    for (byte, _) in hay_cmp.match_indices(needle.as_ref()) {
-        let chars = prev_chars + hay_cmp[prev_byte..byte].chars().count();
+    for (byte, _) in hay.match_indices(needle) {
+        let chars = prev_chars + hay[prev_byte..byte].chars().count();
         found.push(chars..chars + needle_chars);
         prev_byte = byte;
         prev_chars = chars;
@@ -2780,16 +2853,15 @@ fn find_in_buffer(buffer: &Buffer, query: &str) -> Vec<Range<usize>> {
     found
 }
 
-/// Posiciones (chars) de cada coincidencia de `re` en el buffer, en orden.
+/// Posiciones (chars) de cada coincidencia de `re` en `hay`, en orden.
 /// Los matches de ancho cero (`^`, `\b`…) no se listan: no se pueden ni
 /// resaltar ni reemplazar. Un error de backtracking corta la lista (nunca
 /// pánic: la regex compilada sigue siendo del usuario).
-fn find_in_buffer_regex(buffer: &Buffer, re: &fancy_regex::Regex) -> Vec<Range<usize>> {
-    let hay = buffer.text_range(0..buffer.len_chars());
+fn find_in_buffer_regex(hay: &str, re: &fancy_regex::Regex) -> Vec<Range<usize>> {
     let mut found = Vec::new();
     let mut prev_byte = 0;
     let mut prev_chars = 0;
-    for caps in re.captures_iter(&hay) {
+    for caps in re.captures_iter(hay) {
         let Ok(caps) = caps else { break };
         let Some(m) = caps.get(0) else { continue };
         if m.start() == m.end() {
@@ -3604,6 +3676,72 @@ mod tests {
             (0, 0),
             "consulta vacía sin coincidencias"
         );
+    }
+
+    #[test]
+    fn find_caches_the_text_once_per_revision_and_releases_it() {
+        let mut editor = Editor::default();
+        assert_eq!(
+            editor.cached_find_revision(),
+            None,
+            "sin buscar no se copia nada"
+        );
+
+        editor.insert_text("hola mundo hola");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.find_set_query("hola");
+        assert_eq!(editor.find_stats(), (1, 2));
+        assert_eq!(
+            editor.cached_find_revision(),
+            Some(editor.buffer.revision()),
+            "la copia corresponde a la revisión actual"
+        );
+
+        editor.insert_text("!");
+        editor.find_set_query("mundo");
+        assert_eq!(editor.find_stats(), (1, 1));
+        assert_eq!(
+            editor.cached_find_revision(),
+            Some(editor.buffer.revision()),
+            "una edición obliga a copiar de nuevo"
+        );
+
+        editor.find_close();
+        assert_eq!(
+            editor.cached_find_revision(),
+            None,
+            "cerrar la barra suelta la copia"
+        );
+
+        editor.find_set_query("");
+        assert_eq!(
+            editor.cached_find_revision(),
+            None,
+            "una consulta vacía no copia el texto"
+        );
+    }
+
+    #[test]
+    fn find_reuses_one_copy_between_folded_and_sensitive_queries() {
+        let mut editor = Editor::default();
+        editor.insert_text("Foo bar foo FOO");
+        editor.cursors = vec![Cursor::new(0)];
+        let revision = editor.buffer.revision();
+
+        editor.find_set_query("foo");
+        assert_eq!(editor.find_stats(), (1, 3), "plegado a minúsculas");
+        assert_eq!(editor.cached_find_revision(), Some(revision));
+
+        editor.find_set_query("Foo");
+        assert_eq!(editor.find_stats(), (1, 1), "sensible a mayúsculas");
+        assert_eq!(
+            editor.cached_find_revision(),
+            Some(revision),
+            "la misma copia sirve para las dos consultas"
+        );
+
+        editor.find_set_query("foo");
+        assert_eq!(editor.find_stats(), (1, 3), "vuelve al plegado");
     }
 
     #[test]

@@ -9,6 +9,7 @@ description = "Modelo de edición puro de Jorgenio Text (buffer, selecciones, co
 ropey.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

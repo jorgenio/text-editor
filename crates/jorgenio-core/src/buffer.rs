@@ -6,6 +6,7 @@
 //! - `revision` se incrementa en cada mutación para invalidar caches derivadas
 //!   (layout de líneas, syntax highlighting).
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 
@@ -104,14 +105,56 @@ impl Buffer {
     }
 
     /// Abre un archivo UTF-8 detectando su fin de línea.
+    ///
+    /// Un archivo que no es UTF-8 ya no se abre vacío: los bytes inválidos
+    /// se reemplazan por `U+FFFD`, se avisa en el log y el buffer queda
+    /// marcado como sucio, para que el "●" recuerde que guardar reemplazaría
+    /// esos bytes.
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        Ok(Self::from_text(&raw))
+        let raw = std::fs::read(path)?;
+        let (text, lossy) = match String::from_utf8(raw) {
+            Ok(text) => (text, false),
+            Err(err) => {
+                let invalid_at = err.utf8_error().valid_up_to();
+                let bytes = err.into_bytes();
+                log::warn!(
+                    "{}: no es UTF-8 ({} bytes; el primero inválido en {invalid_at}): \
+                     se abre con U+FFFD",
+                    path.display(),
+                    bytes.len()
+                );
+                (String::from_utf8_lossy(&bytes).into_owned(), true)
+            }
+        };
+        let mut buffer = Self::from_text(&text);
+        if lossy {
+            buffer.set_dirty();
+        }
+        Ok(buffer)
     }
 
     /// Guarda aplicando `line_ending` y limpia el bit de sucio.
+    ///
+    /// Vuelca por trozos (`rope.chunks()` sobre un `BufWriter`): un archivo
+    /// grande se escribe sin materializar un `String` con todo el texto.
     pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, self.text_with_line_ending())?;
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        match self.line_ending {
+            LineEnding::Lf => {
+                for chunk in self.rope.chunks() {
+                    out.write_all(chunk.as_bytes())?;
+                }
+            }
+            LineEnding::Crlf => {
+                for chunk in self.rope.chunks() {
+                    // La cuerda se guarda en `\n`, así que basta con volver a
+                    // expandir cada `\n` (un salto no cruza trozos).
+                    out.write_all(chunk.replace('\n', "\r\n").as_bytes())?;
+                }
+            }
+        }
+        out.flush()?;
         self.dirty = false;
         Ok(())
     }
@@ -120,15 +163,6 @@ impl Buffer {
     /// restaurado puede no coincidir con el disco).
     pub fn set_dirty(&mut self) {
         self.dirty = true;
-    }
-
-    /// Texto completo con los `\n` convertidos a `line_ending`.
-    pub fn text_with_line_ending(&self) -> String {
-        let text = self.rope.to_string();
-        match self.line_ending {
-            LineEnding::Lf => text,
-            LineEnding::Crlf => text.replace('\n', "\r\n"),
-        }
     }
 
     /// Empieza a grabar los edits (una acción de usuario = una transacción).
@@ -253,25 +287,29 @@ impl Buffer {
 }
 
 /// Detecta el EOL del archivo y normaliza el texto interno a `\n`.
-fn normalize(raw: &str) -> (String, LineEnding) {
-    let line_ending = if raw.contains("\r\n") {
-        LineEnding::Crlf
-    } else {
-        LineEnding::Lf
-    };
+///
+/// Si no hay ni un `\r` (lo normal en Unix y en los archivos con EOL unix)
+/// el texto se reutiliza tal cual: una copia de menos del fichero entero.
+/// Si lo hay, un único recorrido detecta `\r\n` y reescribe `\r` → `\n`.
+fn normalize(raw: &str) -> (Cow<'_, str>, LineEnding) {
+    if !raw.contains('\r') {
+        return (Cow::Borrowed(raw), LineEnding::Lf);
+    }
+    let mut line_ending = LineEnding::Lf;
     let mut text = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\r' {
             if chars.peek() == Some(&'\n') {
                 chars.next();
+                line_ending = LineEnding::Crlf;
             }
             text.push('\n');
         } else {
             text.push(c);
         }
     }
-    (text, line_ending)
+    (Cow::Owned(text), line_ending)
 }
 
 #[cfg(test)]
@@ -283,6 +321,63 @@ mod tests {
         let (text, eol) = normalize("a\r\nb\rc");
         assert_eq!(text, "a\nb\nc");
         assert_eq!(eol, LineEnding::Crlf);
+    }
+
+    #[test]
+    fn normalize_reuses_the_text_when_there_is_no_cr() {
+        let (text, eol) = normalize("áé\nñ\n");
+        assert!(matches!(text, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(text, "áé\nñ\n");
+        assert_eq!(eol, LineEnding::Lf);
+    }
+
+    #[test]
+    fn load_keeps_a_non_utf8_file_and_marks_it_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.txt");
+        std::fs::write(&path, b"hola \xFFmundo\n").unwrap();
+
+        let mut buffer = Buffer::load(&path).unwrap();
+        assert_eq!(
+            buffer.text_range(0..buffer.len_chars()),
+            "hola \u{FFFD}mundo\n"
+        );
+        assert_eq!(buffer.line_ending(), LineEnding::Lf);
+        assert!(buffer.dirty());
+
+        buffer.save(&path).unwrap();
+        assert!(!buffer.dirty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hola \u{FFFD}mundo\n"
+        );
+    }
+
+    #[test]
+    fn save_writes_a_big_file_chunk_by_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grande.txt");
+        let text: String = (0..20_000)
+            .map(|i| format!("línea número {i} con algo de texto\n"))
+            .collect();
+        let mut buffer = Buffer::from_text(&text);
+        buffer.insert(buffer.len_chars(), "final");
+        assert!(buffer.dirty());
+        buffer.save(&path).unwrap();
+        assert!(!buffer.dirty());
+        let mut expected = text;
+        expected.push_str("final");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+        // Con EOL detectado como CRLF se vuelve a expandir al guardar.
+        std::fs::write(&path, expected.replace('\n', "\r\n")).unwrap();
+        let mut buffer = Buffer::load(&path).unwrap();
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            expected.replace('\n', "\r\n")
+        );
     }
 
     #[test]

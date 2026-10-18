@@ -60,6 +60,12 @@ Linux (la CI compueba ambos).
   `ruta:línea: texto`, smart-case (mayúsculas activan distinguir
   mayúsculas), hasta 1000 coincidencias y límites para no colgar en
   binarios o archivos enormes.
+- **Archivos grandes y encodings raros**: guardar vuelca el texto por
+  trozos (sin materializarlo entero), buscar copia el texto una sola vez
+  por revisión en vez de una por tecla, y un archivo que no es UTF-8 se
+  abre con `U+FFFD` en los bytes inválidos y marcado como sucio, para que
+  el «●» avise de que guardar reemplazaría esos bytes (ver
+  [Archivos grandes](#archivos-grandes)).
 
 ## Requisitos
 
@@ -193,6 +199,27 @@ reparto se recuerda para el siguiente Ctrl+\. Al cerrar la ventana se
 guarda su tamaño en `session.json` (junto a `settings.json`; es estado de
 sesión, no una preferencia editable), junto a los buffers sin guardar del
 hot exit.
+
+## Archivos grandes
+
+El diseño apunta a que un archivo de **decenas de megabytes** se abra, edite
+y guarde sin sorpresas. Con un equipo de 8 GB los límites prácticos son,
+aproximadamente:
+
+- **≤ 50 MB**: uso cómodo (apertura, edición, buscar/reemplazar).
+- **~100 MB**: tirones al teclear en la búsqueda: cada revisión nueva vuelve
+  a copiar el texto completo para la caché de `find`, y esa copia ocupa lo
+  mismo que el archivo mientras la barra está abierta.
+- **≥ 1 GB**: no es viable en 8 GB (la cuerda, el resaltado y la caché de
+  búsqueda conviven en memoria); se abre, pero la experiencia no es la de un
+  editor.
+
+Cómo se consigue: guardar escribe `rope.chunks()` sobre un `BufWriter` en
+vez de construir un `String` con todo el texto; `find` materializa el texto
+una sola vez por revisión y lo suelta al cerrar la barra; y cargar un
+archivo que no es UTF-8 no lo abre vacío, sino con `U+FFFD` en los bytes
+inválidos y el buffer sucio, así el «●» recuerda que guardar reemplazaría
+esos bytes.
 
 ## Desarrollo
 

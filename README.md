@@ -11,9 +11,10 @@ Linux (la CI compueba ambos).
   nativos) y aviso efímero al guardar.
 - Resaltado de sintaxis por gramática (Rust, Python, JS… + texto plano) con
   dos paletas: **Monokai** (oscuro, por defecto) e **InspiredGitHub** (claro).
-- Pestañas, división vertical de paneles (Ctrl+\\) con **divisor
-  arrastrable** (reparto a medida, mínimo 80 px por panel) y foco por
-  panel con el ratón.
+- Pestañas y **división de paneles** (Ctrl+\\): el menú «Ver» cambia el
+  reparto (una columna, dos columnas, dos filas o **rejilla 2×2**) y sus
+  **divisores arrastrables** reparten el alto y el ancho a medida
+  (mínimo 80 px por panel y 62 px por fila); foco por panel con el ratón.
 - Selección múltiple: Alt+click, Ctrl+D (siguiente coincidencia) y
   Ctrl+Alt+↑/↓ (cursores en columna).
 - Buscar/reemplazar con resaltado incremental (Enter/F3 navegan; Ctrl+Enter
@@ -34,6 +35,11 @@ Linux (la CI compueba ambos).
   o `'` inserta el cierre y deja el caret dentro; escribir el cierre con
   el par ya completo salta por delante; Backspace entre el par borra los
   dos lados.
+- **Ajuste de línea** (preferencia `word_wrap`, por defecto desactivado):
+  las líneas largas se parten en varias filas de pantalla sin tocar el
+  buffer. El número de línea solo aparece en la primera fila, ↑/↓ y
+  PageUp/PageDown recorren las filas visibles conservando la columna, y
+  caret, scroll, selecciones y búsqueda comparten esa misma geometría.
 - Barra de estado inferior con Ln/Col (columna visual), selección,
   tabulado, lenguaje y nombre del archivo; zoom de fuente con
   Ctrl+= / Ctrl+- / Ctrl+0 (solo sesión); Ctrl+Shift+T reabre la última
@@ -168,7 +174,10 @@ los fuera de rango se recortan.
     "auto_match": true,
 
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
-    "theme": "dark"
+    "theme": "dark",
+
+    // ¿Ajustar las líneas largas al ancho del panel (word wrap)?
+    "word_wrap": false
 }
 ```
 
@@ -176,11 +185,14 @@ El cambio de tema con Ctrl+T es **solo de sesión**: para que perviva,
 escribe `"theme": "light"` en el archivo y guárdalo. La paleta de comandos
 y los avisos se pintan siempre en tono oscuro por encima del tema activo.
 
-Con dos paneles, el **divisor** (filete vertical) se arrastra con el ratón
-para repartir el ancho; el reparto se recuerda para el siguiente Ctrl+\.
-Al cerrar la ventana se guarda su tamaño en `session.json` (junto a
-`settings.json`; es estado de sesión, no una preferencia editable), junto a
-los buffers sin guardar del hot exit.
+El reparto de paneles lo decide el menú **Ver** (una columna, dos
+columnas, dos filas o rejilla 2×2; crece con editores en blanco y funde
+los sobrantes en el primer grupo). Sus **divisores** se arrastran con el
+ratón: el vertical reparte el ancho y el horizontal la altura, y cada
+reparto se recuerda para el siguiente Ctrl+\. Al cerrar la ventana se
+guarda su tamaño en `session.json` (junto a `settings.json`; es estado de
+sesión, no una preferencia editable), junto a los buffers sin guardar del
+hot exit.
 
 ## Desarrollo
 

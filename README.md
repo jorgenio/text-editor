@@ -40,6 +40,11 @@ Linux (la CI compueba ambos).
   guardar el archivo; el tamaño de la ventana se recuerda en `session.json`
   (estado, no preferencia).
 - Tema claro/oscuro con Ctrl+T (sesión) o persistente desde preferencias.
+- **Barra de título propia con menú embebido** (sin marco del sistema):
+  menús Archivo/Editar/Ver/Preferencias (Alt los abre, Escape los cierra),
+  arrastre de la ventana con doble clic para maximizar, botones
+  minimizar/maximizar/cerrar y bordes redimensionables en los 4 lados y
+  las esquinas.
 
 ## Requisitos
 

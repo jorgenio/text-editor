@@ -21,6 +21,21 @@ Linux (la CI compueba ambos).
 - Paleta de comandos (Ctrl+Shift+P) y búsqueda rápida de archivos (Ctrl+P)
   con fuzzy matching.
 - Comentarios por lenguaje (Ctrl+/) y snippets con Tab (for, if, fn…).
+- Movimiento tipo Sublime: palabras con Ctrl+←/→, Ctrl+Backspace/Delete
+  borra palabras, Home inteligente (alterna columna 0 ↔ primer no-blanco),
+  Ctrl+L expande a la línea (repetible), Ctrl+J une líneas y
+  Ctrl+Shift+↑/↓ mueve la línea entera.
+- Tabulación: Tab/Shift+Tab indentan o desindantan la selección (una
+  nivel por pulsación); Enter arrastra el sangrado de la línea; la
+  preferencia `translate_tabs_to_spaces` hace que Tab escriba espacios.
+- Auto-match de pares (por defecto activo): escribir `(`, `[`, `{`, `"`
+  o `'` inserta el cierre y deja el caret dentro; escribir el cierre con
+  el par ya completo salta por delante; Backspace entre el par borra los
+  dos lados.
+- Barra de estado inferior con Ln/Col (columna visual), selección,
+  tabulado, lenguaje y nombre del archivo; zoom de fuente con
+  Ctrl+= / Ctrl+- / Ctrl+0 (solo sesión); Ctrl+Shift+T reabre la última
+  pestaña cerrada.
 - Preferencias en `settings.json` con comentarios (JSONC) que se aplican al
   guardar el archivo; el tamaño de la ventana se recuerda en `session.json`
   (estado, no preferencia).
@@ -60,15 +75,22 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | --- | --- |
 | Paleta de comandos | Ctrl+Shift+P |
 | Búsqueda rápida de archivos | Ctrl+P |
+| Abrir "archivo:12" en la línea 12 | Ctrl+P → `ruta:12` |
 | Archivo nuevo | Ctrl+N |
 | Abrir archivo | Ctrl+O |
 | Guardar | Ctrl+S |
 | Guardar como… | Ctrl+Shift+S |
 | Cerrar pestaña | Ctrl+W |
+| Reabrir pestaña cerrada | Ctrl+Shift+T |
 | Deshacer / Rehacer | Ctrl+Z / Ctrl+Shift+Z (o Ctrl+Y) |
 | Copiar / Cortar / Pegar | Ctrl+C / Ctrl+X / Ctrl+V |
 | Seleccionar todo | Ctrl+A |
 | Seleccionar siguiente coincidencia | Ctrl+D |
+| Palabra izquierda / derecha | Ctrl+← / Ctrl+→ |
+| Borrar palabra | Ctrl+Backspace / Ctrl+Delete |
+| Expandir selección a la línea | Ctrl+L |
+| Unir con la línea siguiente | Ctrl+J |
+| Mover línea arriba / abajo | Ctrl+Shift+↑ / Ctrl+Shift+↓ |
 | Borrar línea | Ctrl+Shift+K |
 | Duplicar línea | Ctrl+Shift+D |
 | Comentar / destacar línea | Ctrl+/ |
@@ -76,6 +98,7 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | Buscar / Reemplazar | Ctrl+F / Ctrl+H |
 | Dividir panel / Unir paneles | Ctrl+\\ / Ctrl+Shift+\\ |
 | Cambiar tema claro/oscuro | Ctrl+T |
+| Zoom de fuente (+ / − / normal) | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Abrir preferencias | Ctrl+, |
 
 **Selección múltiple**: Alt+click añade un cursor; Ctrl+Alt+↑/↓ añade
@@ -86,8 +109,10 @@ coincidencia (con Shift, a la anterior), ↑/↓ también navegan, Tab salta de
 buscar a reemplazar (con el modo reemplazo activo), Ctrl+Enter reemplaza la
 actual, Ctrl+Shift+Enter reemplaza todas y Esc cierra.
 
-**Movimiento**: flechas, Home/End, PageUp/PageDown, Backspace/Delete, Tab
-(expande snippet o inserta sangría).
+**Movimiento**: flechas, Home/End (Home alterna columna 0 ↔ primer
+no-blanco), PageUp/PageDown, Ctrl+←/→ por palabras, Backspace/Delete,
+Ctrl+Backspace/Delete borra palabras, Tab (expande snippet, con selección
+indenta; Shift+Tab desindenta) y Enter (arrastra el sangrado).
 
 ## Preferencias (`settings.json`)
 
@@ -110,6 +135,12 @@ los fuera de rango se recortan.
 
     // Tamaño de la fuente en píxeles del editor (8-72).
     "font_size": 14,
+
+    // ¿Tabulador escribe espacios (true) o carácter de tabulación (false)?
+    "translate_tabs_to_spaces": false,
+
+    // ¿Auto-cerrar pares: () [] {} "" ''?
+    "auto_match": true,
 
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
     "theme": "dark"

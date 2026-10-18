@@ -44,6 +44,96 @@ const GUTTER_RIGHT_X: f32 = 56.0;
 const PADDING_TOP: f32 = 8.0;
 const CARET_WIDTH: f32 = 2.0;
 
+/// Advance por defecto (celdas por emisión), el mismo fallback que usa
+/// `probe_advance_ratio` en jorgenio-ui; `build_scene` lo refina con el
+/// valor real medido en la fuente del sistema.
+const DEFAULT_ADVANCE_RATIO: f32 = 0.6;
+/// Holgura en px a la derecha de cada fila envuelta: evita que un glifo
+/// redondeado se recorte justo en el borde del panel.
+const WRAP_PAD: f32 = 8.0;
+
+/// Caché de envoltura de líneas (solo con [`Editor::word_wrap`] activo).
+///
+/// `prefix[k]` es el número de filas de pantalla que ocupan las líneas
+/// lógicas `0..k`: tiene `line_count + 1` elementos, empieza en 0 y crece
+/// al menos en 1 por línea, de modo que `rows_of_line(k) = prefix[k+1] -
+/// prefix[k]` y `total_rows = *prefix.last()`. Se reconstruye entera cuando
+/// cambia el buffer, el ancho disponible, la fuente o el tabulador (todas
+/// claves de [`WrapCache::is_stale`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct WrapCache {
+    /// Celdas de pantalla por fila con las que se calculó.
+    wrap_cells: usize,
+    /// Ancho de tabulador con el que se calculó.
+    tab_width: usize,
+    /// Revisión del buffer con la que se calculó.
+    revision: u64,
+    /// Acumulado de filas por línea (ver la descripción del tipo).
+    prefix: Vec<u32>,
+}
+
+impl WrapCache {
+    /// ¿Ha cambiado algo relevante desde el último cálculo?
+    fn is_stale(&self, wrap_cells: usize, tab_width: usize, revision: u64) -> bool {
+        self.wrap_cells != wrap_cells || self.tab_width != tab_width || self.revision != revision
+    }
+
+    /// Cuenta cuántas filas de pantalla ocupa cada línea de `buffer`.
+    fn build(buffer: &Buffer, wrap_cells: usize, tab_width: usize) -> Self {
+        let wrap_cells = wrap_cells.max(1);
+        let mut prefix = Vec::with_capacity(buffer.line_count() + 1);
+        prefix.push(0u32);
+        let mut rows = 0u32;
+        for line in 0..buffer.line_count() {
+            let text = buffer.line_text(line);
+            let cells = movement::visual_column(&text, text.chars().count(), tab_width);
+            rows += cells.div_ceil(wrap_cells).max(1) as u32;
+            prefix.push(rows);
+        }
+        Self {
+            wrap_cells,
+            tab_width,
+            revision: buffer.revision(),
+            prefix,
+        }
+    }
+
+    /// Filas que ocupa la línea lógica `line` (≥1; fuera de rango → 1).
+    fn rows_of_line(&self, line: usize) -> usize {
+        let before = self.prefix.get(line).copied().unwrap_or(0);
+        let after = self
+            .prefix
+            .get(line + 1)
+            .copied()
+            .unwrap_or(before.saturating_add(1));
+        (after - before).max(1) as usize
+    }
+
+    /// Primera fila de pantalla de la línea lógica `line`.
+    fn rows_before(&self, line: usize) -> usize {
+        match self.prefix.get(line) {
+            Some(&rows) => rows as usize,
+            // Más allá del final: la última fila conocida.
+            None => self.total_rows().saturating_sub(1),
+        }
+    }
+
+    /// Filas de pantalla de todo el buffer (≥1).
+    fn total_rows(&self) -> usize {
+        self.prefix.last().copied().unwrap_or(1).max(1) as usize
+    }
+
+    /// Línea lógica que ocupa la fila de pantalla `row` (recortada al final).
+    fn line_at_row(&self, row: usize) -> usize {
+        if self.prefix.len() < 2 {
+            return 0;
+        }
+        // Primer acumulado estrictamente mayor que `row`, menos uno.
+        let idx = self.prefix.partition_point(|&cum| (cum as usize) <= row);
+        idx.saturating_sub(1).min(self.prefix.len() - 2)
+    }
+}
+
 /// Un cursor con su selección (`anchor == caret` → sin selección).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
@@ -117,6 +207,18 @@ pub struct Editor {
     find_regex: bool,
     find_regex_compiled: Option<fancy_regex::Regex>,
     find_regex_error: bool,
+    /// ¿Ajustar líneas largas al ancho del panel? (`word_wrap` de prefs).
+    /// Al activarse cambia la geometría (una línea lógica = varias filas
+    /// de pantalla); el buffer NO se toca.
+    word_wrap: bool,
+    /// Advance en celdas del carácter (px por celda). Se actualiza en cada
+    /// `build_scene` y lo usan scroll/caret para saber cuántas celdas caben
+    /// por fila sin esperar al siguiente frame.
+    advance_ratio: f32,
+    /// Caché de envoltura (solo con `word_wrap`): nº de celdas que caben
+    /// por fila y cuántas filas ocupa cada línea lógica. Se reconstruye con
+    /// `ensure_wrap` cuando cambia buffer/ancho/fuente/indentación.
+    wrap: WrapCache,
 }
 
 impl Default for Editor {
@@ -147,6 +249,9 @@ impl Default for Editor {
             find_regex: false,
             find_regex_compiled: None,
             find_regex_error: false,
+            word_wrap: false,
+            advance_ratio: DEFAULT_ADVANCE_RATIO,
+            wrap: WrapCache::default(),
         }
     }
 }
@@ -276,6 +381,15 @@ impl Editor {
         self.auto_match = on;
     }
 
+    /// Activa o desactiva el ajuste de línea (`word_wrap` de preferencias).
+    /// El buffer no se toca: solo la geometría (una línea lógica pasa a
+    /// ocupar varias filas de pantalla) y, con ella, el tope del scroll.
+    pub fn set_word_wrap(&mut self, on: bool) {
+        self.word_wrap = on;
+        self.ensure_wrap();
+        self.clamp_scroll();
+    }
+
     /// Tamaño de la fuente en px (recortado a 8-72). La altura de línea,
     /// el advance del código y el ancho del gutter se derivan solos.
     pub fn set_font_size(&mut self, px: u32) {
@@ -357,6 +471,12 @@ impl Editor {
     #[cfg(test)]
     pub fn auto_match(&self) -> bool {
         self.auto_match
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn word_wrap(&self) -> bool {
+        self.word_wrap
     }
 
     /// Mueve el caret a `line` (1-based, como el prompt de "Ir a la línea…")
@@ -579,19 +699,11 @@ impl Editor {
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                let tab_width = self.tab_width;
-                self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, -1, tab_width),
-                    shift,
-                );
+                self.vertical_step(-1, shift);
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                let tab_width = self.tab_width;
-                self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, 1, tab_width),
-                    shift,
-                );
+                self.vertical_step(1, shift);
                 true
             }
             Key::Named(NamedKey::Home) => {
@@ -607,20 +719,12 @@ impl Editor {
             }
             Key::Named(NamedKey::PageUp) => {
                 let page = -self.page_lines();
-                let tab_width = self.tab_width;
-                self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, tab_width),
-                    shift,
-                );
+                self.vertical_step(page, shift);
                 true
             }
             Key::Named(NamedKey::PageDown) => {
                 let page = self.page_lines();
-                let tab_width = self.tab_width;
-                self.move_cursors(
-                    |cursor, buffer| movement::vertical_move(buffer, cursor.caret, page, tab_width),
-                    shift,
-                );
+                self.vertical_step(page, shift);
                 true
             }
             Key::Character(text) => {
@@ -1526,19 +1630,28 @@ impl Editor {
         if delta == 0 {
             return;
         }
-        let mut additions = Vec::with_capacity(self.cursors.len());
+        self.ensure_wrap();
+        // Con envoltura el paso es de fila de pantalla; sin ella, de línea.
+        let wrap = self.word_wrap.then(|| self.wrap.clone());
         let tab_width = self.tab_width;
+        let mut additions = Vec::with_capacity(self.cursors.len());
         for cursor in &self.cursors {
-            let line = self.buffer.char_to_line(cursor.caret);
-            let target =
-                (line as isize + delta).clamp(0, self.buffer.line_count() as isize - 1) as usize;
-            let line_start = self.buffer.line_to_char(line);
-            let text = self.buffer.line_text(line);
-            let col = cursor.caret.saturating_sub(line_start);
-            let visual = movement::visual_column(&text, col, tab_width);
-            let target_text = self.buffer.line_text(target);
-            let target_col = movement::char_col_at_visual(&target_text, visual, tab_width);
-            additions.push(Cursor::new(self.buffer.line_to_char(target) + target_col));
+            let target = if let Some(wrap) = &wrap {
+                wrap_vertical_move(&self.buffer, cursor.caret, delta, wrap, tab_width)
+            } else {
+                let line = self.buffer.char_to_line(cursor.caret);
+                let line_start = self.buffer.line_to_char(line);
+                let text = self.buffer.line_text(line);
+                let col = cursor.caret.saturating_sub(line_start);
+                let visual = movement::visual_column(&text, col, tab_width);
+                let target_line = (line as isize + delta)
+                    .clamp(0, self.buffer.line_count() as isize - 1)
+                    as usize;
+                let target_text = self.buffer.line_text(target_line);
+                let target_col = movement::char_col_at_visual(&target_text, visual, tab_width);
+                self.buffer.line_to_char(target_line) + target_col
+            };
+            additions.push(Cursor::new(target));
         }
         self.cursors.extend(additions);
         self.sort_and_merge();
@@ -1904,8 +2017,17 @@ impl Editor {
     /// Resalta lo que haga falta (cache) hasta la última línea visible.
     /// `viewport` es el área del EDITOR (la ventana menos la barra de pestañas).
     pub fn build_scene(&mut self, viewport: (f32, f32), advance_ratio: f32) -> Scene {
+        // El ratio medido en la fuente manda también fuera de este frame:
+        // la caché de envoltura (y por tanto el scroll y el caret) depende
+        // de cuántas celdas caben por fila.
+        self.advance_ratio = advance_ratio;
+        self.ensure_wrap();
         let bg = self.theme.editor_bg;
         let mut scene = Scene::new(srgb(bg.0, bg.1, bg.2));
+        if self.word_wrap {
+            self.build_wrapped(&mut scene, viewport, advance_ratio);
+            return scene;
+        }
         let advance = self.font_size * advance_ratio;
         let line_h = self.line_height();
         let font = self.font_size;
@@ -2020,6 +2142,196 @@ impl Editor {
             }
         }
         scene
+    }
+
+    /// Rama de [`Editor::build_scene`] con `word_wrap` activo: recorre FILAS
+    /// de pantalla en vez de líneas lógicas, de modo que una línea larga
+    /// pinta varias filas y el número de línea solo aparece en la primera.
+    fn build_wrapped(&mut self, scene: &mut Scene, viewport: (f32, f32), advance_ratio: f32) {
+        let advance = self.font_size * advance_ratio;
+        let line_h = self.line_height();
+        let font = self.font_size;
+        let inset = self.top_inset;
+        let cx = self.left_inset + self.code_offset();
+        let gutter_right = self.left_inset + self.gutter_right();
+        let tab_width = self.tab_width;
+        let per_row = self.wrap.wrap_cells.max(1);
+
+        let (first_row, last_row) = self.visible_rows(viewport.1);
+        let last_line = self.wrap.line_at_row(last_row);
+
+        self.syntax.set_extension(&self.lang);
+        self.syntax.prepare(&mut self.buffer, last_line);
+        self.find_sync();
+
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            self.push_wrapped_range(scene, &range, self.theme.selection, viewport.1);
+        }
+        for (index, range) in self.find.iter().enumerate() {
+            let color = if index == self.find_current {
+                self.theme.current_match
+            } else {
+                self.theme.match_bg
+            };
+            self.push_wrapped_range(scene, range, color, viewport.1);
+        }
+
+        let caret_line = self.buffer.char_to_line(self.primary().caret);
+        for row in first_row..=last_row {
+            let y = inset + PADDING_TOP + row as f32 * line_h - self.scroll_y;
+            let line = self.wrap.line_at_row(row);
+            let row_in_line = row - self.wrap.rows_before(line);
+            let cells_from = row_in_line * per_row;
+            let cells_to = cells_from + per_row;
+
+            if row_in_line == 0 && self.show_line_numbers {
+                let color = if line == caret_line {
+                    self.theme.gutter_current
+                } else {
+                    self.theme.gutter_fg
+                };
+                let number = format!("{}", line + 1);
+                let number_x = gutter_right - number.len() as f32 * advance;
+                scene
+                    .texts
+                    .push(TextSpan::new(number, number_x, y, font, color));
+            }
+
+            let text = self.buffer.line_text(line);
+            if text.is_empty() {
+                continue;
+            }
+            let tokens = self.syntax.tokens(line);
+            if tokens.is_empty() {
+                let piece = row_slice(&text, cells_from, cells_to, tab_width);
+                if !piece.is_empty() {
+                    scene
+                        .texts
+                        .push(TextSpan::new(piece, cx, y, font, self.theme.fg));
+                }
+                continue;
+            }
+            // Columnas de todos los tokens de la línea en dos recorridos
+            // (uno de inicios, otro de fines) y recorte a la fila actual.
+            let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
+            let ends: Vec<usize> = tokens.iter().map(|token| token.end).collect();
+            let start_cells = movement::visual_columns_at(&text, &starts, tab_width);
+            let end_cells = movement::visual_columns_at(&text, &ends, tab_width);
+            for (token, (&start, &end)) in tokens.iter().zip(start_cells.iter().zip(&end_cells)) {
+                let cell_from = start.max(cells_from);
+                let cell_to = end.min(cells_to);
+                if cell_from >= cell_to {
+                    continue;
+                }
+                let piece = row_slice(&text, cell_from, cell_to, tab_width);
+                if piece.is_empty() || piece.chars().all(|c| c == '\n') {
+                    continue;
+                }
+                scene.texts.push(TextSpan::new(
+                    piece,
+                    cx + (cell_from - cells_from) as f32 * advance,
+                    y,
+                    font,
+                    token.color,
+                ));
+            }
+        }
+
+        if self.focused && self.caret_on {
+            for cursor in &self.cursors {
+                let line = self.buffer.char_to_line(cursor.caret);
+                let text = self.buffer.line_text(line);
+                let col = cursor.caret - self.buffer.line_to_char(line);
+                let cells = movement::visual_column(&text, col, tab_width);
+                let row = self.row_of_line_cells(line, cells);
+                if row < first_row || row > last_row {
+                    continue;
+                }
+                let y = inset + PADDING_TOP + row as f32 * line_h - self.scroll_y;
+                let cell_in_row = cells - (row - self.wrap.rows_before(line)) * per_row;
+                scene.overlays.push(Quad::new(
+                    cx + cell_in_row as f32 * advance,
+                    y,
+                    CARET_WIDTH,
+                    line_h - 2.0,
+                    self.theme.caret,
+                ));
+            }
+        }
+    }
+
+    /// Quad de selección/coincidencia recortado a las filas visibles, con
+    /// envoltura: un rango que abarca varias filas pinta una por fila. Se
+    /// acota primero a las líneas del viewport, así que es O(visible) y no
+    /// O(rango) (importa con "seleccionar todo" en archivos grandes).
+    fn push_wrapped_range(
+        &self,
+        scene: &mut Scene,
+        range: &Range<usize>,
+        color: (u8, u8, u8, u8),
+        viewport_h: f32,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        let per_row = self.wrap.wrap_cells.max(1);
+        let line_h = self.line_height();
+        let inset = self.top_inset;
+        let cx = self.left_inset + self.code_offset();
+        let advance = self.font_size * self.advance_ratio;
+        let tab_width = self.tab_width;
+
+        let first_line = self.buffer.char_to_line(range.start);
+        let last_line = self.buffer.char_to_line(range.end.saturating_sub(1));
+        let (vis_first, vis_last) = self.visible_rows(viewport_h);
+        // Acotado por líneas: `line_at_row` es una búsqueda binaria sobre el
+        // acumulado de filas, así que un rango enorme solo paga O(visible).
+        let from_line = first_line.max(self.wrap.line_at_row(vis_first));
+        let to_line = last_line.min(self.wrap.line_at_row(vis_last));
+
+        for line in from_line..=to_line {
+            let line_start = self.buffer.line_to_char(line);
+            let text = self.buffer.line_text(line);
+            let start_cells = if line == first_line {
+                movement::visual_column(&text, range.start - line_start, tab_width)
+            } else {
+                0
+            };
+            let end_cells = if line == last_line {
+                let col = range.end - line_start;
+                // Seleccionar el \n añade una celda más (como Sublime).
+                if col > text.chars().count() {
+                    movement::visual_column(&text, text.chars().count(), tab_width) + 1
+                } else {
+                    movement::visual_column(&text, col, tab_width)
+                }
+            } else {
+                movement::visual_column(&text, text.chars().count(), tab_width)
+            };
+
+            let row0 = self.wrap.rows_before(line);
+            for row_in_line in 0..self.wrap.rows_of_line(line) {
+                let row = row0 + row_in_line;
+                if row < vis_first || row > vis_last {
+                    continue;
+                }
+                let cells_from = row_in_line * per_row;
+                let cell_from = start_cells.max(cells_from);
+                let cell_to = end_cells.min(cells_from + per_row);
+                if cell_from >= cell_to {
+                    continue;
+                }
+                let y = inset + PADDING_TOP + row as f32 * line_h - self.scroll_y;
+                scene.quads.push(Quad::new(
+                    cx + (cell_from - cells_from) as f32 * advance,
+                    y,
+                    (cell_to - cell_from) as f32 * advance,
+                    line_h,
+                    color,
+                ));
+            }
+        }
     }
 
     /// Cursor primario (izquierdo); defensa ante una lista vacía.
@@ -2138,17 +2450,127 @@ impl Editor {
         self.scroll_into_view();
     }
 
+    /// Reconstruye la caché de envoltura si algo cambió (buffer, ancho
+    /// disponible, fuente o tabulador). Con el ajuste apagado la caché queda
+    /// vacía y toda la geometría sigue el camino de una fila por línea.
+    /// Casi no-op cuando la caché sigue vigente.
+    fn ensure_wrap(&mut self) {
+        if !self.word_wrap {
+            if !self.wrap.prefix.is_empty() {
+                self.wrap = WrapCache::default();
+            }
+            return;
+        }
+        let cells = self.wrap_cells();
+        if self
+            .wrap
+            .is_stale(cells, self.tab_width, self.buffer.revision())
+        {
+            self.wrap = WrapCache::build(&self.buffer, cells, self.tab_width);
+        }
+    }
+
+    /// Celdas de pantalla que caben por fila con el ancho y la fuente actuales.
+    fn wrap_cells(&self) -> usize {
+        let usable = self.viewport.0 - self.left_inset - self.code_offset() - WRAP_PAD;
+        ((usable / self.advance_px()).floor() as usize).max(1)
+    }
+
+    /// Advance en px por celda con el ratio medido en el último frame.
+    fn advance_px(&self) -> f32 {
+        (self.font_size * self.advance_ratio).max(1.0)
+    }
+
+    /// Fila de pantalla (0-based) que ocupa `pos`: la línea lógica sin
+    /// ajuste, la fila de envoltura con él.
+    fn row_of_pos(&mut self, pos: usize) -> usize {
+        self.ensure_wrap();
+        if self.word_wrap {
+            self.row_of_char(pos)
+        } else {
+            self.buffer.char_to_line(pos)
+        }
+    }
+
+    /// Fila de pantalla (con envoltura) que ocupa el offset `pos`.
+    fn row_of_char(&self, pos: usize) -> usize {
+        let line = self.buffer.char_to_line(pos);
+        let col = pos - self.buffer.line_to_char(line);
+        let text = self.buffer.line_text(line);
+        let cells = movement::visual_column(&text, col, self.tab_width);
+        self.row_of_line_cells(line, cells)
+    }
+
+    /// Fila de pantalla para la celda `cells` dentro de `line`. El final de
+    /// línea exacto (celdas == ancho de la línea) NO salta de fila: el
+    /// caret queda en el borde derecho de la última fila de la línea.
+    fn row_of_line_cells(&self, line: usize, cells: usize) -> usize {
+        let rows = self.wrap.rows_of_line(line);
+        let per_row = self.wrap.wrap_cells.max(1);
+        let row_in_line = (cells / per_row).min(rows - 1);
+        self.wrap.rows_before(line) + row_in_line
+    }
+
+    /// Primera y última fila de pantalla visibles con el scroll actual
+    /// (solo con envoltura; recortadas al total de filas).
+    fn visible_rows(&self, viewport_h: f32) -> (usize, usize) {
+        let line_h = self.line_height();
+        let total = self.wrap.total_rows();
+        let first = (((self.scroll_y - self.top_inset - PADDING_TOP) / line_h)
+            .floor()
+            .max(0.0) as usize)
+            .min(total - 1);
+        let last = (((self.scroll_y + viewport_h - self.top_inset - PADDING_TOP) / line_h).ceil()
+            as usize)
+            .min(total - 1);
+        (first, last)
+    }
+
+    /// Un paso vertical: de línea lógica sin ajuste y de FILA de pantalla
+    /// con él (conserva la columna dentro de la fila, como Sublime).
+    fn vertical_step(&mut self, delta: isize, shift: bool) {
+        if self.word_wrap {
+            self.ensure_wrap();
+            // `move_cursors` presta `&mut self`, así que la caché viaja
+            // clonada dentro del closure (un Vec de u32 por tecla).
+            let wrap = self.wrap.clone();
+            let tab_width = self.tab_width;
+            self.move_cursors(
+                |cursor, buffer| wrap_vertical_move(buffer, cursor.caret, delta, &wrap, tab_width),
+                shift,
+            );
+        } else {
+            let tab_width = self.tab_width;
+            self.move_cursors(
+                |cursor, buffer| movement::vertical_move(buffer, cursor.caret, delta, tab_width),
+                shift,
+            );
+        }
+    }
+
     /// Coordenadas lógicas → offset de char (columna visual, media celda).
-    fn caret_at(&self, x: f32, y: f32, advance: f32) -> usize {
-        let visual = ((x - self.left_inset - self.code_offset()) / advance)
+    /// Con envoltura `y` decide la FILA y `x` la columna dentro de ella.
+    fn caret_at(&mut self, x: f32, y: f32, advance: f32) -> usize {
+        self.ensure_wrap();
+        let cell = ((x - self.left_inset - self.code_offset()) / advance)
             .floor()
             .max(0.0) as usize;
-        let line_f =
+        let row_f =
             ((y - self.top_inset - PADDING_TOP + self.scroll_y) / self.line_height()).floor();
-        let line = (line_f.max(0.0) as usize).min(self.buffer.line_count() - 1);
-        let text = self.buffer.line_text(line);
-        let char_col = movement::char_col_at_visual(&text, visual, self.tab_width);
-        self.buffer.line_to_char(line) + char_col
+        let row = row_f.max(0.0) as usize;
+        if self.word_wrap {
+            let row = row.min(self.wrap.total_rows() - 1);
+            let line = self.wrap.line_at_row(row);
+            let cells = (row - self.wrap.rows_before(line)) * self.wrap.wrap_cells.max(1) + cell;
+            let text = self.buffer.line_text(line);
+            let char_col = movement::char_col_at_visual(&text, cells, self.tab_width);
+            self.buffer.line_to_char(line) + char_col
+        } else {
+            let line = row.min(self.buffer.line_count() - 1);
+            let text = self.buffer.line_text(line);
+            let char_col = movement::char_col_at_visual(&text, cell, self.tab_width);
+            self.buffer.line_to_char(line) + char_col
+        }
     }
 
     fn page_lines(&self) -> isize {
@@ -2162,9 +2584,9 @@ impl Editor {
 
     /// Garantiza que la posición `pos` (un offset de char) quede a la vista.
     fn scroll_position_into_view(&mut self, pos: usize) {
-        let line = self.buffer.char_to_line(pos);
+        let row = self.row_of_pos(pos);
         let line_h = self.line_height();
-        let top = self.top_inset + PADDING_TOP + line as f32 * line_h;
+        let top = self.top_inset + PADDING_TOP + row as f32 * line_h;
         let bottom = top + line_h;
         if top < self.scroll_y {
             self.scroll_y = top;
@@ -2176,23 +2598,70 @@ impl Editor {
 
     /// ¿El caret primario está a la vista? Si no lo está, el parpadeo puede
     /// saltarse el repintar (el estado de blink se conserva).
-    pub fn caret_in_view(&self) -> bool {
-        let line = self.buffer.char_to_line(self.primary().caret);
+    pub fn caret_in_view(&mut self) -> bool {
+        let row = self.row_of_pos(self.primary().caret);
         let line_h = self.line_height();
-        let top = self.top_inset + PADDING_TOP + line as f32 * line_h;
+        let top = self.top_inset + PADDING_TOP + row as f32 * line_h;
         let bottom = top + line_h;
         bottom > self.scroll_y && top < self.scroll_y + self.viewport.1
     }
 
     fn clamp_scroll(&mut self) {
-        let content_h = self.top_inset
-            + PADDING_TOP
-            + self.buffer.line_count() as f32 * self.line_height()
-            + PADDING_TOP;
+        self.ensure_wrap();
+        let rows = if self.word_wrap {
+            self.wrap.total_rows()
+        } else {
+            self.buffer.line_count()
+        };
+        let content_h =
+            self.top_inset + PADDING_TOP + rows as f32 * self.line_height() + PADDING_TOP;
         self.scroll_y = self
             .scroll_y
             .clamp(0.0, (content_h - self.viewport.1).max(0.0));
     }
+}
+
+/// Mueve el caret `delta` FILAS de pantalla manteniendo la columna dentro
+/// de la fila (con envoltura eso es lo que el usuario "ve" como columna).
+/// Al llegar al borde se queda donde está, igual que [`movement::vertical_move`].
+fn wrap_vertical_move(
+    buffer: &Buffer,
+    caret: usize,
+    delta: isize,
+    wrap: &WrapCache,
+    tab_width: usize,
+) -> usize {
+    let per_row = wrap.wrap_cells.max(1);
+    let line = buffer.char_to_line(caret);
+    let line_start = buffer.line_to_char(line);
+    let text = buffer.line_text(line);
+    let cells = movement::visual_column(&text, caret.saturating_sub(line_start), tab_width);
+    let rows = wrap.rows_of_line(line);
+    let row_in_line = (cells / per_row).min(rows - 1);
+    let goal = cells - row_in_line * per_row;
+
+    let current = wrap.rows_before(line) + row_in_line;
+    let target = (current as isize + delta).clamp(0, wrap.total_rows() as isize - 1) as usize;
+    if target == current {
+        return caret;
+    }
+    let target_line = wrap.line_at_row(target);
+    let target_cells = (target - wrap.rows_before(target_line)) * per_row + goal;
+    let target_text = buffer.line_text(target_line);
+    let char_col = movement::char_col_at_visual(&target_text, target_cells, tab_width);
+    buffer.line_to_char(target_line) + char_col
+}
+
+/// Subcadena de `text` que ocupa las celdas visuales `[from, to)` de la
+/// línea, recortada a ellas (nunca parte un glifo: si el límite cae en
+/// medio, la media celda decide). Vacía si el tramo no tiene texto.
+fn row_slice(text: &str, from: usize, to: usize, tab_width: usize) -> &str {
+    if from >= to {
+        return "";
+    }
+    let start = movement::byte_at_char(text, movement::char_col_at_visual(text, from, tab_width));
+    let end = movement::byte_at_char(text, movement::char_col_at_visual(text, to, tab_width));
+    text.get(start..end).unwrap_or("")
 }
 
 /// Intersección de las líneas `first..=last` con el rango visible
@@ -3811,5 +4280,201 @@ mod tests {
         ];
         assert!(!editor.try_expand_snippet(), "multi-cursor → sin snippet");
         assert_eq!(text_of(&editor), "fn");
+    }
+
+    //── Ajuste de línea (word wrap, M24a) ──────────────────────────────────
+    //
+    // Con viewport 640 px, gutter de 64 y holgura de 8, a 14 px de advance
+    // caben (640 − 64 − 8) / 14 = 40 celdas por fila de pantalla.
+
+    /// Editor con ajuste activo, ratio de fuente ya medido y scroll a cero.
+    fn wrapped(text: &str) -> Editor {
+        let mut editor = Editor::default();
+        editor.insert_text(text);
+        editor.set_viewport(640.0, 200.0);
+        editor.set_word_wrap(true);
+        editor.build_scene((640.0, 200.0), 1.0);
+        editor.scroll_y = 0.0;
+        editor
+    }
+
+    #[test]
+    fn word_wrap_counts_screen_rows_and_slices_each_one() {
+        let mut editor = wrapped(&format!("{}\nfin\n", "a".repeat(100)));
+        editor.cursors = vec![Cursor::new(0)];
+        let scene = editor.build_scene((640.0, 200.0), 1.0);
+
+        assert_eq!(editor.wrap.wrap_cells, 40, "40 celdas por fila");
+        assert_eq!(editor.wrap.total_rows(), 5, "3 filas + «fin» + la vacía");
+        assert_eq!(editor.wrap.rows_of_line(0), 3, "100 chars en 40 celdas");
+        assert_eq!(editor.wrap.rows_before(1), 3, "«fin» empieza en la fila 3");
+        assert_eq!(editor.wrap.line_at_row(2), 0);
+        assert_eq!(editor.wrap.line_at_row(3), 1);
+        assert_eq!(editor.wrap.line_at_row(4), 2);
+
+        // Las 3 filas de la línea larga se pintan en x = código, sin
+        // solaparse y reconstruyendo el texto entero.
+        let pieces: Vec<&TextSpan> = scene
+            .texts
+            .iter()
+            .filter(|span| span.x == CODE_X && span.y < 60.0)
+            .collect();
+        assert_eq!(pieces.len(), 3, "una fila de texto cada 40 celdas");
+        assert_eq!(pieces[0].y, PADDING_TOP);
+        assert_eq!(pieces[1].y, PADDING_TOP + LINE_HEIGHT);
+        assert_eq!(pieces[2].y, PADDING_TOP + 2.0 * LINE_HEIGHT);
+        let joined: String = pieces.iter().map(|span| span.text.as_str()).collect();
+        assert_eq!(joined, "a".repeat(100), "ni se pierde ni se repite nada");
+        // El número de línea solo aparece en la PRIMERA fila de cada línea.
+        assert!(
+            scene
+                .texts
+                .iter()
+                .any(|span| span.text == "1" && span.y == PADDING_TOP),
+            "gutter en la primera fila"
+        );
+        assert!(
+            !scene
+                .texts
+                .iter()
+                .any(|span| span.text == "1" && span.y > PADDING_TOP),
+            "sin gutter repetido en las filas de continuación"
+        );
+    }
+
+    #[test]
+    fn caret_at_lands_on_the_wrapped_row() {
+        let mut editor = wrapped(&"a".repeat(100));
+        editor.cursors = vec![Cursor::new(0)];
+        let advance = 14.0;
+        let row = |n: usize| PADDING_TOP + n as f32 * LINE_HEIGHT;
+
+        assert_eq!(
+            editor.caret_at(CODE_X, row(1), advance),
+            40,
+            "fila 1 → char 40"
+        );
+        assert_eq!(
+            editor.caret_at(CODE_X + 5.0 * advance, row(1), advance),
+            45,
+            "columna 5 de la fila 1"
+        );
+        assert_eq!(
+            editor.caret_at(CODE_X + 19.0 * advance, row(2), advance),
+            99
+        );
+        assert_eq!(
+            editor.caret_at(CODE_X, row(3), advance),
+            80,
+            "la fila 3 no existe: se recorta a la última"
+        );
+    }
+
+    #[test]
+    fn arrow_steps_walk_screen_rows_with_wrap() {
+        let mut editor = wrapped(&format!("{}\n{}", "a".repeat(50), "b".repeat(60)));
+        editor.cursors = vec![Cursor::new(0)];
+
+        assert_eq!(editor.wrap.total_rows(), 4, "50 → 2 filas y 60 → 2 filas");
+
+        editor.vertical_step(1, false);
+        assert_eq!(
+            editor.primary().caret,
+            40,
+            "fila 1 = misma línea, +40 celdas"
+        );
+        editor.vertical_step(1, false);
+        assert_eq!(editor.primary().caret, 51, "fila 2 = inicio de la 2ª línea");
+        editor.vertical_step(-1, false);
+        assert_eq!(editor.primary().caret, 40, "y vuelta a la fila 1");
+    }
+
+    #[test]
+    fn selection_quads_split_into_one_per_row() {
+        let mut editor = wrapped(&"a".repeat(100));
+        editor.cursors = vec![Cursor {
+            caret: 100,
+            anchor: 0,
+        }];
+
+        let scene = editor.build_scene((640.0, 200.0), 1.0);
+        assert_eq!(scene.quads.len(), 3, "un quad por cada fila de pantalla");
+        assert_eq!(scene.quads[0].x, CODE_X);
+        assert_eq!(scene.quads[0].w, 40.0 * 14.0, "primera fila llena");
+        assert_eq!(scene.quads[1].y, PADDING_TOP + LINE_HEIGHT);
+        assert_eq!(scene.quads[2].w, 20.0 * 14.0, "la última solo 20 celdas");
+        assert_eq!(
+            scene.overlays.len(),
+            1,
+            "el caret va en overlays, no cuenta como quad"
+        );
+    }
+
+    #[test]
+    fn wrapped_syntax_tiles_every_row_without_losing_text() {
+        let long = "fn an_example_function(argument: u32) -> u32 { argument + 1 }";
+        assert!(long.chars().count() > 40, "la línea desborda una fila");
+        let mut editor = Editor {
+            lang: "rs".to_owned(),
+            ..Editor::default()
+        };
+        editor.insert_text(long);
+        editor.set_viewport(640.0, 200.0);
+        editor.set_word_wrap(true);
+        editor.build_scene((640.0, 200.0), 1.0);
+        editor.scroll_y = 0.0;
+        editor.cursors = vec![Cursor::new(0)];
+
+        let scene = editor.build_scene((640.0, 200.0), 1.0);
+        assert_eq!(editor.wrap.wrap_cells, 40);
+        assert_eq!(editor.wrap.total_rows(), 2);
+
+        let rows = [PADDING_TOP, PADDING_TOP + LINE_HEIGHT];
+        let mut rebuilt = String::new();
+        for y in rows {
+            let spans: Vec<&TextSpan> = scene
+                .texts
+                .iter()
+                .filter(|span| span.x >= CODE_X && span.y == y)
+                .collect();
+            assert!(!spans.is_empty(), "la fila a y={y} pinta algo del código");
+            for span in spans {
+                assert!(
+                    span.x < CODE_X + 40.0 * 14.0,
+                    "ninguna pieza empieza fuera de la fila"
+                );
+                rebuilt.push_str(&span.text);
+            }
+        }
+        assert_eq!(
+            rebuilt, long,
+            "los trozos recortados en la frontera cuadran"
+        );
+    }
+
+    #[test]
+    fn wrap_scroll_and_caret_view_count_rows_not_lines() {
+        let mut editor = wrapped(&"a".repeat(100));
+        editor.set_viewport(640.0, 60.0);
+        editor.build_scene((640.0, 60.0), 1.0);
+        editor.cursors = vec![Cursor::new(45)];
+
+        // 100 chars en 3 filas → 8 + 3*20 + 8 = 76 px de contenido.
+        editor.scroll_y = 1_000.0;
+        editor.clamp_scroll();
+        assert_eq!(
+            editor.scroll_y, 16.0,
+            "el tope cuenta FILAS (3), no líneas (1)"
+        );
+
+        editor.scroll_y = 0.0;
+        assert!(editor.caret_in_view(), "la fila 1 (y=28) cabe en 60 px");
+        editor.scroll_y = 100.0;
+        assert!(!editor.caret_in_view(), "por encima de la fila del caret");
+
+        // Con el ajuste apagado el mismo buffer es UNA línea: no hay nada
+        // que desplazar y el caret (fila lógica 0) vuelve a caber.
+        editor.set_word_wrap(false);
+        assert_eq!(editor.scroll_y, 0.0, "una sola línea cabe en 60 px");
     }
 }

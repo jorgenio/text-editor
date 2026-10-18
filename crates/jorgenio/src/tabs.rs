@@ -452,6 +452,7 @@ impl Tabs {
                 editor.set_font_size(prefs.font_size);
                 editor.set_translate_tabs_to_spaces(prefs.translate_tabs_to_spaces);
                 editor.set_auto_match(prefs.auto_match);
+                editor.set_word_wrap(prefs.word_wrap);
                 editor.set_theme(theme);
             }
         }
@@ -875,6 +876,7 @@ mod tests {
             show_line_numbers: false,
             translate_tabs_to_spaces: true,
             auto_match: false,
+            word_wrap: true,
             ..crate::settings::Settings::default()
         };
         tabs.apply_prefs(&prefs);
@@ -885,6 +887,7 @@ mod tests {
             assert!(!editor.show_line_numbers(), "grupo {gi} sin gutter");
             assert!(editor.translate_tabs_to_spaces(), "grupo {gi} con espacios");
             assert!(!editor.auto_match(), "grupo {gi} sin auto_match");
+            assert!(editor.word_wrap(), "grupo {gi} con ajuste de línea");
         }
 
         assert_eq!(

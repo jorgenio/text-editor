@@ -32,6 +32,9 @@ pub struct Settings {
     pub auto_match: bool,
     /// Tema de colores: "dark" (Monokai, por defecto) o "light".
     pub theme: String,
+    /// ¿Ajustar las líneas largas al ancho del panel (word wrap)? Las
+    /// líneas se parten en varias filas de pantalla sin tocar el buffer.
+    pub word_wrap: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +47,7 @@ impl Default for Settings {
             translate_tabs_to_spaces: false,
             auto_match: true,
             theme: "dark".to_owned(),
+            word_wrap: false,
         }
     }
 }
@@ -237,6 +241,9 @@ pub fn default_template() -> &'static str {
 
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
     "theme": "dark",
+
+    // ¿Ajustar las líneas largas al ancho del panel (word wrap)?
+    "word_wrap": false,
 }
 "#
 }
@@ -345,6 +352,19 @@ mod tests {
         assert!(
             !parse("{\"auto_match\": false}").unwrap().auto_match,
             "se puede desactivar"
+        );
+    }
+
+    #[test]
+    fn word_wrap_defaults_off_and_parses() {
+        assert!(!Settings::default().word_wrap, "por defecto no se ajusta");
+        assert!(
+            parse("{\"word_wrap\": true}").unwrap().word_wrap,
+            "se puede activar"
+        );
+        assert!(
+            !parse("{\"word_wrap\": false}").unwrap().word_wrap,
+            "y desactivar"
         );
     }
 

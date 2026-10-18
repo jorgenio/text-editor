@@ -783,7 +783,7 @@ impl winit::application::ApplicationHandler for Application {
                 // Si el caret está fuera de pantalla no hay nada que
                 // parpadear: se conserva el estado y se ahorra el repintar
                 // completo (escena + glifos + quads) cada 530 ms.
-                if self.tabs.active().caret_in_view() {
+                if self.tabs.active_mut().caret_in_view() {
                     self.tabs.active_mut().toggle_caret();
                     if let Some(gpu) = &self.gpu {
                         gpu.request_redraw();

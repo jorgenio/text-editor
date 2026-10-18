@@ -315,6 +315,78 @@ impl Editor {
         self.translate_tabs_to_spaces
     }
 
+    /// Mueve el caret a `line` (1-based, como el prompt de "Ir a la línea…")
+    /// y lo deja visible. Líneas fuera de rango → la última.
+    pub fn goto_line(&mut self, line: usize) {
+        let last = self.buffer.char_to_line(self.buffer.len_chars());
+        let line = line.saturating_sub(1).min(last);
+        let at = self.buffer.line_to_char(line);
+        self.cursors = vec![Cursor::new(at)];
+        self.reset_caret_blink();
+        self.scroll_into_view();
+    }
+
+    /// Texto de la barra de estado: Ln/Col (columna visual), selección,
+    /// tabulado, lenguaje y nombre del archivo.
+    pub fn status_text(&self) -> String {
+        let caret = self.primary().caret;
+        let line = self.buffer.char_to_line(caret);
+        let line_start = self.buffer.line_to_char(line);
+        let col = movement::visual_column(
+            &self.buffer.line_text(line),
+            caret - line_start,
+            self.tab_width,
+        ) + 1;
+        let mut parts = vec![format!("Ln {}, Col {}", line + 1, col)];
+        if let Some(sel) = self.selection_status() {
+            parts.push(sel);
+        }
+        parts.push(if self.translate_tabs_to_spaces {
+            format!("Esp: {}", self.tab_width)
+        } else {
+            format!("Tab: {}", self.tab_width)
+        });
+        parts.push(self.lang_label());
+        parts.push(self.tab_label());
+        parts.join("  |  ")
+    }
+
+    /// "N líneas, M chars" de la selección del cursor principal (si la hay).
+    fn selection_status(&self) -> Option<String> {
+        let range = self.primary().range();
+        if range.is_empty() {
+            return None;
+        }
+        let first = self.buffer.char_to_line(range.start);
+        let last = self.buffer.char_to_line(range.end.max(range.start + 1) - 1);
+        Some(format!(
+            "{} líneas, {} chars",
+            last - first + 1,
+            range.end - range.start
+        ))
+    }
+
+    /// Nombre mostrable del lenguaje según la extensión detectada.
+    fn lang_label(&self) -> String {
+        match self.lang.as_str() {
+            "" => "Texto plano".to_owned(),
+            "rs" => "Rust".to_owned(),
+            "py" => "Python".to_owned(),
+            "js" | "mjs" | "cjs" => "JavaScript".to_owned(),
+            "ts" => "TypeScript".to_owned(),
+            "json" => "JSON".to_owned(),
+            "md" => "Markdown".to_owned(),
+            "toml" => "TOML".to_owned(),
+            "yml" | "yaml" => "YAML".to_owned(),
+            "sh" | "bash" => "Shell".to_owned(),
+            "html" | "htm" => "HTML".to_owned(),
+            "css" => "CSS".to_owned(),
+            "c" | "h" => "C".to_owned(),
+            "cpp" | "cc" | "cxx" | "hpp" => "C++".to_owned(),
+            other => other.to_uppercase(),
+        }
+    }
+
     pub fn focused(&self) -> bool {
         self.focused
     }
@@ -2317,6 +2389,42 @@ mod tests {
         }];
         editor.handle_key(&Key::Named(NamedKey::Enter), ModifiersState::empty());
         assert_eq!(text_of(&editor), "  \n");
+    }
+
+    #[test]
+    fn goto_line_moves_caret_and_clamps() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres");
+        editor.goto_line(2);
+        assert_eq!(editor.primary().caret, 4);
+        editor.goto_line(99);
+        assert_eq!(editor.primary().caret, 8, "clamp a la última línea");
+        editor.goto_line(1);
+        assert_eq!(editor.primary().caret, 0, "línea 1 = la primera");
+    }
+
+    #[test]
+    fn status_text_reports_ln_col_selection_tab_and_lang() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola\nmundo");
+        editor.cursors = vec![Cursor::new(8)]; // antes de la 'd' de "mundo"
+        assert_eq!(
+            editor.status_text(),
+            "Ln 2, Col 4  |  Tab: 4  |  Texto plano  |  sin título"
+        );
+
+        editor.cursors = vec![Cursor {
+            caret: 8,
+            anchor: 4,
+        }];
+        assert!(
+            editor.status_text().contains("2 líneas, 4 chars"),
+            "{}",
+            editor.status_text()
+        );
+
+        editor.set_translate_tabs_to_spaces(true);
+        assert!(editor.status_text().contains("Esp: 4"), "tab → espacios");
     }
 
     #[test]

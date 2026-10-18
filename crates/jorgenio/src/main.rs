@@ -34,6 +34,8 @@ const CLICK_SLOP2: f32 = 16.0; // (4 px)^2
 const DRAG_SLOP2: f32 = 16.0;
 /// Vida del aviso efímero (guardado, errores) en la esquina superior.
 const NOTICE_TTL: Duration = Duration::from_secs(3);
+/// Altura de la barra de estado inferior (px lógicos).
+const STATUS_H: f32 = 24.0;
 const NOTICE_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
 const NOTICE_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
 const NOTICE_FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
@@ -262,6 +264,16 @@ fn notify(slot: &mut Option<(String, Instant)>, text: String) {
     *slot = Some((text, Instant::now()));
 }
 
+/// "archivo.rs:12" → Some(12) (goto de línea del Ctrl+P); sin sufijo
+/// numérico claro → None.
+fn parse_goto_line(query: &str) -> Option<usize> {
+    let (path, line) = query.rsplit_once(':')?;
+    if path.is_empty() || line.is_empty() || !line.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    line.parse::<usize>().ok().filter(|n| *n >= 1)
+}
+
 /// Archivos del árbol de `root` para el Ctrl+P (sin directorios ruidosos
 /// y con tope: caminar un monorepo entero colgaría la interfaz).
 fn collect_files(root: &std::path::Path, max: usize) -> Vec<std::path::PathBuf> {
@@ -451,6 +463,14 @@ fn run_command(
             open_quickopen(palette);
             true
         }
+        "file.reopen_closed" => {
+            let Some(path) = tabs.take_closed() else {
+                notify(notice, "No hay pestañas cerradas".to_owned());
+                return true;
+            };
+            open_path(tabs, settings, path);
+            true
+        }
         "file.close" => {
             if !tabs.close(None) {
                 log::info!("la última pestaña no se cierra");
@@ -554,6 +574,24 @@ fn run_command(
             search.set_theme(theme);
             // Solo sesión: para persistir, escríbelo en settings.json.
             notify(notice, format!("Tema: {}", theme.label()));
+            true
+        }
+        "view.zoom_in" => {
+            settings.font_size = (settings.font_size + 1).min(72);
+            tabs.apply_prefs(settings);
+            notify(notice, format!("Fuente: {} px", settings.font_size));
+            true
+        }
+        "view.zoom_out" => {
+            settings.font_size = settings.font_size.saturating_sub(1).max(8);
+            tabs.apply_prefs(settings);
+            notify(notice, format!("Fuente: {} px", settings.font_size));
+            true
+        }
+        "view.zoom_reset" => {
+            settings.font_size = settings::Settings::default().font_size;
+            tabs.apply_prefs(settings);
+            notify(notice, format!("Fuente: {} px", settings.font_size));
             true
         }
         other => {
@@ -677,7 +715,7 @@ impl winit::application::ApplicationHandler for Application {
                 // decide el divisor arrastrable (`split_ratio`).
                 let group_count = self.tabs.group_count();
                 let geometry = self.tabs.group_geometry(viewport.0);
-                let editor_h = (viewport.1 - TAB_BAR_H).max(50.0);
+                let editor_h = (viewport.1 - TAB_BAR_H - STATUS_H).max(50.0);
                 for (g, &(x, w)) in geometry.iter().enumerate() {
                     self.tabs.set_group_geometry(g, x, w, editor_h);
                 }
@@ -716,6 +754,29 @@ impl winit::application::ApplicationHandler for Application {
                     editor::FONT_SIZE * advance,
                     self.tabs.active(),
                 );
+                // Barra de estado inferior: Ln/Col, selección, tabulado,
+                // lenguaje y archivo; se pinta ANTES que el aviso y la
+                // paleta para no taparlas.
+                {
+                    let status = self.tabs.active().status_text();
+                    let char_w = editor::FONT_SIZE * advance;
+                    let text_w = status.chars().count() as f32 * char_w;
+                    let y = viewport.1 - STATUS_H;
+                    let edge = Theme::from_name(&self.settings.theme).tab_edge;
+                    scene
+                        .top_quads
+                        .push(Quad::new(0.0, y, viewport.0, STATUS_H, NOTICE_BG));
+                    scene
+                        .top_quads
+                        .push(Quad::new(0.0, y, viewport.0, 1.0, edge));
+                    scene.top_texts.push(TextSpan::new(
+                        status,
+                        (viewport.0 - text_w - 12.0).max(8.0),
+                        y + (STATUS_H - editor::FONT_SIZE) / 2.0,
+                        editor::FONT_SIZE,
+                        NOTICE_FG,
+                    ));
+                }
                 // Aviso efímero en la esquina superior derecha (los de
                 // paleta se pintan después: mandan sobre él).
                 if let Some((text, at)) = &self.notice
@@ -821,8 +882,12 @@ impl winit::application::ApplicationHandler for Application {
                             gpu.request_redraw();
                         }
                         palette::Action::Open(path) => {
+                            let goto = parse_goto_line(self.palette.query());
                             self.palette.close();
                             open_path(&mut self.tabs, &mut self.settings, path);
+                            if let Some(line) = goto {
+                                self.tabs.active_mut().goto_line(line);
+                            }
                             gpu.request_redraw();
                         }
                         palette::Action::Close => {
@@ -933,8 +998,12 @@ impl winit::application::ApplicationHandler for Application {
                             return;
                         }
                         palette::Click::File(path) => {
+                            let goto = parse_goto_line(self.palette.query());
                             self.palette.close();
                             open_path(&mut self.tabs, &mut self.settings, path);
+                            if let Some(line) = goto {
+                                self.tabs.active_mut().goto_line(line);
+                            }
                             gpu.request_redraw();
                             return;
                         }
@@ -1050,7 +1119,10 @@ impl winit::application::ApplicationHandler for Application {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, default_save_name, focus_group, focus_tab, open_path, run_command};
+    use super::{
+        collect_files, default_save_name, focus_group, focus_tab, open_path, parse_goto_line,
+        run_command,
+    };
     use crate::editor::Editor;
     use crate::palette::Palette;
     use crate::search::SearchBar;
@@ -1063,6 +1135,20 @@ mod tests {
     fn default_save_name_keeps_or_adds_extension() {
         assert_eq!(default_save_name("foo.rs"), "foo.rs");
         assert_eq!(default_save_name("sin título"), "sin título.txt");
+    }
+
+    #[test]
+    fn parse_goto_line_reads_trailing_numbers() {
+        assert_eq!(parse_goto_line("main.rs:12"), Some(12));
+        assert_eq!(
+            parse_goto_line("main.rs:0"),
+            None,
+            "las líneas empiezan en 1"
+        );
+        assert_eq!(parse_goto_line("main.rs"), None, "sin sufijo no hay goto");
+        assert_eq!(parse_goto_line("a:b:7"), Some(7), "el último ':' manda");
+        assert_eq!(parse_goto_line(":5"), None, "sin nombre no hay goto");
+        assert_eq!(parse_goto_line("main.rs:x"), None, "no numérico");
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub static KEYMAP: &[Binding] = &[
     bind("s", true, false, false, "file.save"),
     bind("s", true, true, false, "file.save_as"),
     bind("w", true, false, false, "file.close"),
+    bind("t", true, true, false, "file.reopen_closed"),
     bind("z", true, false, false, "edit.undo"),
     bind("z", true, true, false, "edit.redo"),
     bind("y", true, false, false, "edit.redo"),
@@ -65,6 +66,12 @@ pub static KEYMAP: &[Binding] = &[
     bind("\\", true, false, false, "view.split"),
     bind("\\", true, true, false, "view.unsplit"),
     bind("t", true, false, false, "theme.toggle"),
+    bind("=", true, false, false, "view.zoom_in"),
+    // "+" llega con Shift en layouts US y sin él en el teclado numérico.
+    bind("+", true, true, false, "view.zoom_in"),
+    bind("+", true, false, false, "view.zoom_in"),
+    bind("-", true, false, false, "view.zoom_out"),
+    bind("0", true, false, false, "view.zoom_reset"),
     bind(",", true, false, false, "settings.open"),
 ];
 
@@ -207,6 +214,11 @@ pub static COMMANDS: &[Command] = &[
         category: "Editar",
     },
     Command {
+        id: "file.reopen_closed",
+        name: "Reabrir pestaña cerrada (Ctrl+Shift+T)",
+        category: "Archivo",
+    },
+    Command {
         id: "theme.toggle",
         name: "Cambiar tema claro/oscuro",
         category: "Ver",
@@ -215,6 +227,21 @@ pub static COMMANDS: &[Command] = &[
         id: "settings.open",
         name: "Abrir preferencias (settings.json)",
         category: "Preferencias",
+    },
+    Command {
+        id: "view.zoom_in",
+        name: "Aumentar tamaño de fuente (Ctrl+=)",
+        category: "Ver",
+    },
+    Command {
+        id: "view.zoom_out",
+        name: "Reducir tamaño de fuente (Ctrl+-)",
+        category: "Ver",
+    },
+    Command {
+        id: "view.zoom_reset",
+        name: "Restablecer tamaño de fuente (Ctrl+0)",
+        category: "Ver",
     },
 ];
 
@@ -366,8 +393,8 @@ mod tests {
         );
         assert_eq!(
             command_for(mods(true, true, false), &key('t')),
-            None,
-            "Ctrl+Shift+T no está atado"
+            Some("file.reopen_closed"),
+            "Ctrl+Shift+T reabre la última pestaña cerrada"
         );
     }
 

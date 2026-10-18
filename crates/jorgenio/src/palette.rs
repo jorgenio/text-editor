@@ -122,6 +122,11 @@ impl Palette {
         self.open
     }
 
+    /// Query actual (para interpretar el sufijo ":12" del modo archivos).
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
     /// Abre en modo comandos (Ctrl+Shift+P): muestra todos los comandos.
     pub fn open(&mut self) {
         self.open = true;
@@ -167,7 +172,14 @@ impl Palette {
     /// Re-evalúa el fuzzy match sobre `query` y reordena por puntuación
     /// (sort estable: los empates conservan el orden de la lista fuente).
     fn refilter(&mut self) {
-        let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+        // En modo archivos el ":12" final es un goto de línea, no parte
+        // del nombre: se quita solo para puntuar (la query se ve igual).
+        let source = if self.mode == Mode::Files {
+            strip_goto_suffix(&self.query)
+        } else {
+            self.query.as_str()
+        };
+        let pattern = Pattern::parse(source, CaseMatching::Ignore, Normalization::Smart);
         let mut scored: Vec<(usize, u32)> = match self.mode {
             Mode::Commands => COMMANDS
                 .iter()
@@ -406,6 +418,19 @@ fn rel_label(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// "src/main.rs:12" → "src/main.rs" (el sufijo numérico es un goto de
+/// línea, no parte del nombre del archivo).
+fn strip_goto_suffix(query: &str) -> &str {
+    match query.rsplit_once(':') {
+        Some((head, tail))
+            if !head.is_empty() && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => query,
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +685,34 @@ mod tests {
             palette.handle_key(&Key::Named(NamedKey::Enter), mods()),
             Action::Close
         );
+    }
+
+    #[test]
+    fn files_query_goto_suffix_is_ignored_for_matching() {
+        let mut palette = Palette::default();
+        palette.open_files(
+            std::path::PathBuf::from("D:\\p"),
+            vec![
+                std::path::PathBuf::from("D:\\p\\src\\main.rs"),
+                std::path::PathBuf::from("D:\\p\\lib.rs"),
+            ],
+        );
+        palette.push_text("main.rs:12");
+        assert_eq!(palette.matches, vec![0], "el ':12' no estorba al match");
+        // Sin sufijo numérico la query es un nombre corriente.
+        palette.push_text("");
+        palette.query = "main.rs".to_owned();
+        palette.refilter();
+        assert_eq!(palette.matches, vec![0]);
+    }
+
+    #[test]
+    fn strip_goto_suffix_only_takes_trailing_numbers() {
+        assert_eq!(strip_goto_suffix("src/main.rs:12"), "src/main.rs");
+        assert_eq!(strip_goto_suffix("a:b:7"), "a:b");
+        assert_eq!(strip_goto_suffix("main.rs"), "main.rs");
+        assert_eq!(strip_goto_suffix("main.rs:"), "main.rs:");
+        assert_eq!(strip_goto_suffix(":12"), ":12", "sin nombre no hay goto");
+        assert_eq!(strip_goto_suffix("v1.2"), "v1.2", "decimales no son goto");
     }
 }

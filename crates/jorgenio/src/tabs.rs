@@ -49,7 +49,13 @@ pub struct Tabs {
     /// Solo importa con 2 grupos; se recuerda entre splits (lo mueve el
     /// divisor arrastrable). Invariante: 0 < split_ratio < 1.
     split_ratio: f32,
+    /// Rutas de las últimas pestañas cerradas (la más reciente al final),
+    /// para Ctrl+Shift+T. Solo paths: el contenido no se conserva.
+    closed: Vec<std::path::PathBuf>,
 }
+
+/// Tope de pestañas cerradas que se recuerdan (como Sublime).
+const CLOSED_MAX: usize = 10;
 
 impl Tabs {
     /// Un solo grupo con una pestaña.
@@ -64,6 +70,7 @@ impl Tabs {
             theme: Theme::dark(),
             font_size: FONT_SIZE,
             split_ratio: 0.5,
+            closed: Vec::new(),
         }
     }
 
@@ -81,6 +88,7 @@ impl Tabs {
             theme: Theme::dark(),
             font_size: FONT_SIZE,
             split_ratio: 0.5,
+            closed: Vec::new(),
         }
     }
 
@@ -274,6 +282,7 @@ impl Tabs {
         if index >= self.groups[gi].list.len() {
             return false;
         }
+        let closed_path = self.groups[gi].list[index].path().map(|p| p.to_path_buf());
         if self.groups[gi].list.len() == 1 {
             if self.groups.len() == 1 {
                 return false;
@@ -282,6 +291,7 @@ impl Tabs {
             if self.active_group >= self.groups.len() {
                 self.active_group = self.groups.len() - 1;
             }
+            self.remember_closed(closed_path);
             return true;
         }
         self.groups[gi].list.remove(index);
@@ -291,7 +301,25 @@ impl Tabs {
         } else if index < group.active {
             group.active -= 1;
         }
+        self.remember_closed(closed_path);
         true
+    }
+
+    /// Apila la ruta de una pestaña cerrada (sin duplicar la última).
+    fn remember_closed(&mut self, path: Option<std::path::PathBuf>) {
+        let Some(path) = path else { return };
+        if self.closed.last() == Some(&path) {
+            return;
+        }
+        self.closed.push(path);
+        if self.closed.len() > CLOSED_MAX {
+            self.closed.remove(0);
+        }
+    }
+
+    /// La última pestaña cerrada (Ctrl+Shift+T); la saca de la pila.
+    pub fn take_closed(&mut self) -> Option<std::path::PathBuf> {
+        self.closed.pop()
     }
 
     /// Barras de pestañas (una por grupo) en la capa superior, más la
@@ -426,6 +454,23 @@ mod tests {
         let mut editor = Editor::default();
         editor.insert_text(label);
         editor
+    }
+
+    #[test]
+    fn close_remembers_paths_for_reopen() {
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.add(tab_named("b.rs"));
+        assert!(tabs.close(Some(0)), "cierra a.rs");
+        assert_eq!(
+            tabs.take_closed().map(|p| p.to_string_lossy().into_owned()),
+            Some("a.rs".to_owned()),
+            "la última cerrada sale de la pila"
+        );
+        assert!(tabs.take_closed().is_none(), "la pila se vacía");
+
+        // La única pestaña del único grupo no se cierra ni se recuerda.
+        assert!(!tabs.close(None));
+        assert!(tabs.take_closed().is_none());
     }
 
     /// Editor CON ruta (sin tocar disco): `tab_label` es el nombre del archivo.

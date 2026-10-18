@@ -98,6 +98,8 @@ pub struct Editor {
     show_line_numbers: bool,
     /// ¿Tabulador escribe espacios? (`translate_tabs_to_spaces` de prefs).
     translate_tabs_to_spaces: bool,
+    /// ¿Auto-cerrar pares de paréntesis/comillas? (`auto_match` de prefs).
+    auto_match: bool,
     /// Tamaño de la fuente en px (preferencias; ver [`FONT_SIZE`]). El
     /// advance, la altura de línea y el gutter se derivan de él.
     font_size: f32,
@@ -129,6 +131,7 @@ impl Default for Editor {
             tab_width: TAB_WIDTH,
             show_line_numbers: true,
             translate_tabs_to_spaces: false,
+            auto_match: true,
             font_size: FONT_SIZE,
             theme: Theme::dark(),
             find: Vec::new(),
@@ -238,6 +241,10 @@ impl Editor {
         self.translate_tabs_to_spaces = translate;
     }
 
+    pub fn set_auto_match(&mut self, on: bool) {
+        self.auto_match = on;
+    }
+
     /// Tamaño de la fuente en px (recortado a 8-72). La altura de línea,
     /// el advance del código y el ancho del gutter se derivan solos.
     pub fn set_font_size(&mut self, px: u32) {
@@ -313,6 +320,12 @@ impl Editor {
     #[cfg(test)]
     pub fn translate_tabs_to_spaces(&self) -> bool {
         self.translate_tabs_to_spaces
+    }
+
+    /// Solo para tests (comprobar `apply_prefs`).
+    #[cfg(test)]
+    pub fn auto_match(&self) -> bool {
+        self.auto_match
     }
 
     /// Mueve el caret a `line` (1-based, como el prompt de "Ir a la línea…")
@@ -580,7 +593,15 @@ impl Editor {
                 true
             }
             Key::Character(text) => {
-                self.insert_text(text);
+                let mut chars = text.chars();
+                let first = chars.next();
+                if let (Some(ch), None) = (first, chars.next())
+                    && self.auto_match_single(ch)
+                {
+                    // Par insertado o skip-over del cierre.
+                } else {
+                    self.insert_text(text);
+                }
                 true
             }
             _ => false,
@@ -638,10 +659,21 @@ impl Editor {
                 let (start, end) = if !range.is_empty() {
                     (range.start, range.end)
                 } else if range.start > 0 {
-                    (
-                        movement::prev_grapheme(&editor.buffer, range.start),
-                        range.start,
-                    )
+                    // Entre un par de auto_match: borra los dos lados.
+                    let caret = range.start;
+                    let len = editor.buffer.len_chars();
+                    let prev = editor.buffer.text_range(caret - 1..caret);
+                    let next = if caret < len {
+                        editor.buffer.text_range(caret..caret + 1)
+                    } else {
+                        String::new()
+                    };
+                    if editor.auto_match && editor.cursors.len() == 1 && is_auto_pair(&prev, &next)
+                    {
+                        (caret - 1, caret + 1)
+                    } else {
+                        (movement::prev_grapheme(&editor.buffer, caret), caret)
+                    }
                 } else {
                     continue; // sin selección y al inicio del buffer
                 };
@@ -683,6 +715,42 @@ impl Editor {
             }
         });
         self.reset_caret_blink();
+    }
+
+    /// Escribe el par automático o salta por delante del cierre ya
+    /// presente (como Sublime con `auto_match`): solo con UN cursor sin
+    /// selección. `true` = el carácter ya está gestionado.
+    fn auto_match_single(&mut self, ch: char) -> bool {
+        if !self.auto_match || self.cursors.len() != 1 || self.cursors[0].has_selection() {
+            return false;
+        }
+        let caret = self.cursors[0].caret;
+        let len = self.buffer.len_chars();
+        let next = if caret < len {
+            self.buffer.text_range(caret..caret + 1)
+        } else {
+            String::new()
+        };
+        if let Some(closer) = auto_closer_of(ch) {
+            if next == closer.to_string() {
+                // Ya está el cierre: solo avanza el caret.
+                self.cursors[0].caret = caret + 1;
+                self.cursors[0].anchor = caret + 1;
+                return true;
+            }
+            self.insert_text(&format!("{ch}{closer}"));
+            let pos = caret + 1;
+            self.cursors[0].caret = pos;
+            self.cursors[0].anchor = pos;
+            return true;
+        }
+        // Tipear el cierre directamente antes del existente también salta.
+        if matches!(ch, ')' | ']' | '}') && next == ch.to_string() {
+            self.cursors[0].caret = caret + 1;
+            self.cursors[0].anchor = caret + 1;
+            return true;
+        }
+        false
     }
 
     /// Ctrl+Backspace: borra hacia atrás hasta el inicio de la palabra
@@ -2104,6 +2172,27 @@ fn find_in_buffer(buffer: &Buffer, query: &str) -> Vec<Range<usize>> {
     found
 }
 
+/// Cierre que auto_match escribe tras este apertura (paréntesis, corchetes,
+/// llaves y comillas; las comillas son su propio cierre).
+fn auto_closer_of(ch: char) -> Option<char> {
+    match ch {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        _ => None,
+    }
+}
+
+/// ¿Juntos forman un par que Backspace debe borrar de una vez?
+fn is_auto_pair(prev: &str, next: &str) -> bool {
+    matches!(
+        (prev, next),
+        ("(", ")") | ("[", "]") | ("{", "}") | ("\"", "\"") | ("'", "'")
+    )
+}
+
 /// Mapeo de una posición tras borrar `start..end` e insertar `inserted` chars
 /// en `start`: lo que quedaba dentro del rango borrado colapsa al inicio.
 fn shift_after(pos: usize, start: usize, end: usize, inserted: usize) -> usize {
@@ -2425,6 +2514,85 @@ mod tests {
 
         editor.set_translate_tabs_to_spaces(true);
         assert!(editor.status_text().contains("Esp: 4"), "tab → espacios");
+    }
+
+    #[test]
+    fn auto_match_wraps_pairs_and_skips_closers() {
+        let mut editor = Editor::default();
+        let open = Key::Character("(".into());
+        let close = Key::Character(")".into());
+
+        editor.handle_key(&open, ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()", "escribe el par entero");
+        assert_eq!(editor.primary().caret, 1, "el caret queda en medio");
+
+        editor.handle_key(&close, ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()", "skip-over: no duplica el cierre");
+        assert_eq!(editor.primary().caret, 2);
+
+        editor.insert_text("x");
+        editor.handle_key(&Key::Character("\"".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()x\"\"", "comillas también");
+        // Cada par deja el caret dentro: se salta al final para el siguiente.
+        editor.cursors = vec![Cursor::new(editor.buffer.len_chars())];
+        editor.handle_key(&Key::Character("'".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()x\"\"''", "y comilla simple");
+        editor.cursors = vec![Cursor::new(editor.buffer.len_chars())];
+        editor.handle_key(&Key::Character("{".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()x\"\"''{}", "llaves");
+        editor.cursors = vec![Cursor::new(editor.buffer.len_chars())];
+        editor.handle_key(&Key::Character("[".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "()x\"\"''{}[]", "corchetes");
+    }
+
+    #[test]
+    fn backspace_between_auto_pair_deletes_both() {
+        let mut editor = Editor::default();
+        editor.handle_key(&Key::Character("(".into()), ModifiersState::empty());
+        editor.backspace();
+        assert_eq!(text_of(&editor), "", "borra () de una vez");
+        assert!(editor.undo(), "es una sola transacción");
+        assert_eq!(text_of(&editor), "()");
+
+        // Entre un par escrito a mano también, pero con selección no.
+        let mut editor = Editor::default();
+        editor.insert_text("a()c");
+        editor.cursors = vec![Cursor::new(2)];
+        editor.backspace();
+        assert_eq!(text_of(&editor), "ac", "par manual: borra los dos");
+        editor.cursors = vec![Cursor {
+            caret: 0,
+            anchor: 2,
+        }];
+        editor.backspace();
+        assert_eq!(text_of(&editor), "", "con selección solo la selección");
+    }
+
+    #[test]
+    fn auto_match_off_selection_and_multicursor_write_plain() {
+        let mut editor = Editor::default();
+        editor.set_auto_match(false);
+        editor.handle_key(&Key::Character("(".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "(", "auto_match desactivado");
+
+        let mut editor = Editor::default();
+        editor.insert_text("ab");
+        editor.cursors = vec![Cursor {
+            caret: 1,
+            anchor: 2,
+        }];
+        editor.handle_key(&Key::Character("(".into()), ModifiersState::empty());
+        assert_eq!(
+            text_of(&editor),
+            "a(",
+            "con selección reemplaza sin emparejar"
+        );
+
+        let mut editor = Editor::default();
+        editor.insert_text("ab cd"); // caret 3 = antes de la 'c', tras el espacio
+        editor.cursors = vec![Cursor::new(0), Cursor::new(3)];
+        editor.handle_key(&Key::Character("(".into()), ModifiersState::empty());
+        assert_eq!(text_of(&editor), "(ab (cd", "multi-cursor: inserta plano");
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub struct Settings {
     /// ¿Tabulador escribe espacios en vez de `\t`? (también afecta al
     /// indentar/desindentar selecciones).
     pub translate_tabs_to_spaces: bool,
+    /// ¿Auto-cerrar pares de paréntesis/comillas? (escribe el cierre y
+    /// salta por delante; Backspace entre el par borra los dos).
+    pub auto_match: bool,
     /// Tema de colores: "dark" (Monokai, por defecto) o "light".
     pub theme: String,
 }
@@ -39,6 +42,7 @@ impl Default for Settings {
             caret_blink_ms: 530,
             font_size: 14,
             translate_tabs_to_spaces: false,
+            auto_match: true,
             theme: "dark".to_owned(),
         }
     }
@@ -228,6 +232,9 @@ pub fn default_template() -> &'static str {
     // ¿Tabulador escribe espacios (true) o carácter de tabulación (false)?
     "translate_tabs_to_spaces": false,
 
+    // ¿Auto-cerrar pares: () [] {} "" ''?
+    "auto_match": true,
+
     // Tema de colores: "dark" (Monokai) o "light" (fondo blanco).
     "theme": "dark",
 }
@@ -329,6 +336,15 @@ mod tests {
                 .unwrap()
                 .translate_tabs_to_spaces,
             "se puede activar"
+        );
+    }
+
+    #[test]
+    fn auto_match_defaults_on_and_parses() {
+        assert!(Settings::default().auto_match, "por defecto los pares van");
+        assert!(
+            !parse("{\"auto_match\": false}").unwrap().auto_match,
+            "se puede desactivar"
         );
     }
 

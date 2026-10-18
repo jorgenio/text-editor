@@ -17,7 +17,9 @@ Linux (la CI compueba ambos).
 - Selección múltiple: Alt+click, Ctrl+D (siguiente coincidencia) y
   Ctrl+Alt+↑/↓ (cursores en columna).
 - Buscar/reemplazar con resaltado incremental (Enter/F3 navegan; Ctrl+Enter
-  reemplaza; Ctrl+Shift+Enter reemplaza todo).
+  reemplaza; Ctrl+Shift+Enter reemplaza todo) y **modo regex** con el botón
+  «.*»: smart-case también en regex, `$1`/`$name` en el reemplazo, `^`/`$`
+  por línea y aviso si el patrón no compila.
 - Paleta de comandos (Ctrl+Shift+P) y búsqueda rápida de archivos (Ctrl+P)
   con fuzzy matching.
 - Comentarios por lenguaje (Ctrl+/) y snippets con Tab (for, if, fn…).
@@ -39,6 +41,9 @@ Linux (la CI compueba ambos).
 - Preferencias en `settings.json` con comentarios (JSONC) que se aplican al
   guardar el archivo; el tamaño de la ventana se recuerda en `session.json`
   (estado, no preferencia).
+- **Hot exit**: al cerrar la ventana, los buffers sin guardar se guardan en
+  `session.json` (máx. 20 pestañas y 1 MiB por buffer) y se restauran en el
+  próximo arranque como sucios, antes que los archivos pasados por la CLI.
 - Tema claro/oscuro con Ctrl+T (sesión) o persistente desde preferencias.
 - **Barra de título propia con menú embebido** (sin marco del sistema):
   menús Archivo/Editar/Ver/Preferencias (Alt los abre, Escape los cierra),
@@ -117,7 +122,10 @@ cursores arriba/abajo; doble click selecciona la palabra y triple la línea.
 **Dentro de la barra de buscar/reemplazar**: Enter o F3 van a la siguiente
 coincidencia (con Shift, a la anterior), ↑/↓ también navegan, Tab salta de
 buscar a reemplazar (con el modo reemplazo activo), Ctrl+Enter reemplaza la
-actual, Ctrl+Shift+Enter reemplaza todas y Esc cierra.
+actual, Ctrl+Shift+Enter reemplaza todas y Esc cierra. El botón «.*» a la
+derecha alterna la búsqueda por regex (se conserva al cerrar la barra; un
+patrón inválido muestra «Regex inválida» en vez del contador; en el
+reemplazo, `$1`…`$9` expanden los captures de cada coincidencia).
 
 **Dentro del panel de buscar en archivos**: la consulta se recoge de la
 selección de una línea si la hay; Enter busca (o, con la búsqueda ya
@@ -171,7 +179,8 @@ y los avisos se pintan siempre en tono oscuro por encima del tema activo.
 Con dos paneles, el **divisor** (filete vertical) se arrastra con el ratón
 para repartir el ancho; el reparto se recuerda para el siguiente Ctrl+\.
 Al cerrar la ventana se guarda su tamaño en `session.json` (junto a
-`settings.json`; es estado de sesión, no una preferencia editable).
+`settings.json`; es estado de sesión, no una preferencia editable), junto a
+los buffers sin guardar del hot exit.
 
 ## Desarrollo
 

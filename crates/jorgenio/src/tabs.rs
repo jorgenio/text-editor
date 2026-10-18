@@ -52,6 +52,9 @@ pub struct Tabs {
     /// Rutas de las últimas pestañas cerradas (la más reciente al final),
     /// para Ctrl+Shift+T. Solo paths: el contenido no se conserva.
     closed: Vec<std::path::PathBuf>,
+    /// Desplazamiento vertical de las barras de pestañas (barra de título
+    /// propia en M21; 0 antes de pintarla).
+    top: f32,
 }
 
 /// Tope de pestañas cerradas que se recuerdan (como Sublime).
@@ -71,6 +74,7 @@ impl Tabs {
             font_size: FONT_SIZE,
             split_ratio: 0.5,
             closed: Vec::new(),
+            top: 0.0,
         }
     }
 
@@ -89,6 +93,7 @@ impl Tabs {
             font_size: FONT_SIZE,
             split_ratio: 0.5,
             closed: Vec::new(),
+            top: 0.0,
         }
     }
 
@@ -199,12 +204,18 @@ impl Tabs {
         self.active_mut().set_focused(focused);
     }
 
+    /// Desplaza verticalmente las barras de pestañas (barra de título M21).
+    pub fn set_top(&mut self, top: f32) {
+        self.top = top;
+    }
+
     /// Fija insets y viewport del editor activo del grupo `index` para este
     /// frame (`x` = origen horizontal de la columna).
     pub fn set_group_geometry(&mut self, index: usize, x: f32, w: f32, editor_h: f32) {
+        let top = self.top + TAB_BAR_H;
         let editor = self.group_active_mut(index);
         editor.set_left_inset(x);
-        editor.set_top_inset(TAB_BAR_H);
+        editor.set_top_inset(top);
         editor.set_viewport(w, editor_h);
     }
 
@@ -334,12 +345,17 @@ impl Tabs {
         for (gi, group) in self.groups.iter().enumerate() {
             let gx = gi as f32 * gw;
             let bar_right = gx + gw;
+            let top = self.top;
             scene
                 .top_quads
-                .push(Quad::new(gx, 0.0, gw, TAB_BAR_H, self.theme.bar_bg));
-            scene
-                .top_quads
-                .push(Quad::new(gx, TAB_BAR_H - 1.0, gw, 1.0, self.theme.tab_edge));
+                .push(Quad::new(gx, top, gw, TAB_BAR_H, self.theme.bar_bg));
+            scene.top_quads.push(Quad::new(
+                gx,
+                top + TAB_BAR_H - 1.0,
+                gw,
+                1.0,
+                self.theme.tab_edge,
+            ));
             // Separación vertical con el panel vecino (altura entera).
             if gi > 0 {
                 scene.top_quads.push(Quad::new(
@@ -371,7 +387,7 @@ impl Tabs {
                 let is_active = index == group.active;
                 scene.top_quads.push(Quad::new(
                     x,
-                    0.0,
+                    top,
                     w,
                     TAB_BAR_H,
                     if is_active {
@@ -384,7 +400,7 @@ impl Tabs {
                 if !is_active {
                     scene.top_quads.push(Quad::new(
                         x,
-                        TAB_BAR_H - 1.0,
+                        top + TAB_BAR_H - 1.0,
                         w,
                         1.0,
                         self.theme.tab_edge,
@@ -393,7 +409,7 @@ impl Tabs {
                 if index > 0 {
                     scene.top_quads.push(Quad::new(
                         x,
-                        4.0,
+                        top + 4.0,
                         1.0,
                         TAB_BAR_H - 8.0,
                         self.theme.tab_edge,
@@ -413,7 +429,7 @@ impl Tabs {
                 scene.top_texts.push(TextSpan::new(
                     label,
                     x + TAB_PAD,
-                    (TAB_BAR_H - font) / 2.0,
+                    top + (TAB_BAR_H - font) / 2.0,
                     font,
                     if is_active {
                         self.theme.fg
@@ -432,7 +448,7 @@ impl Tabs {
     /// Click en alguna barra: grupo y pestaña tocadas, o `None` si no fue
     /// dentro de la barra o de una pestaña dibujada.
     pub fn click(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        if y < 0.0 || y >= TAB_BAR_H {
+        if y < self.top || y >= self.top + TAB_BAR_H {
             return None;
         }
         let group = self

@@ -9,6 +9,7 @@ mod settings;
 mod snippets;
 mod tabs;
 mod theme;
+mod title;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use palette::Palette;
 use search::SearchBar;
 use tabs::{TAB_BAR_H, Tabs};
 use theme::Theme;
+use title::TitleBar;
 use winit::dpi::LogicalPosition;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -89,6 +91,8 @@ struct Application {
     divider_drag: Option<f32>,
     /// Icono actual del cursor (para no pisarlo en cada movimiento).
     cursor_icon: CursorIcon,
+    /// Barra de título propia con menú embebido (M21, sin decoraciones).
+    titlebar: TitleBar,
 }
 
 impl Application {
@@ -118,7 +122,18 @@ impl Application {
             drag_active: false,
             divider_drag: None,
             cursor_icon: CursorIcon::Default,
+            titlebar: TitleBar::default(),
         }
+    }
+}
+
+/// Valor actual de una preferencia booleana (para el aviso del toggle).
+fn field_value(settings: &settings::Settings, field: &str) -> bool {
+    match field {
+        "show_line_numbers" => settings.show_line_numbers,
+        "translate_tabs_to_spaces" => settings.translate_tabs_to_spaces,
+        "auto_match" => settings.auto_match,
+        _ => false,
     }
 }
 
@@ -262,6 +277,41 @@ fn reload_settings_if_needed(
 /// Fija el aviso efímero que se pinta en la esquina superior derecha.
 fn notify(slot: &mut Option<(String, Instant)>, text: String) {
     *slot = Some((text, Instant::now()));
+}
+
+/// Acción elegida en el menú de la barra de título: comando o toggle.
+/// `true` = pide redraw.
+fn apply_menu_action(
+    tabs: &mut Tabs,
+    clipboard: &mut Option<arboard::Clipboard>,
+    palette: &mut Palette,
+    search: &mut SearchBar,
+    settings: &mut settings::Settings,
+    notice: &mut Option<(String, Instant)>,
+    action: title::Action,
+) -> bool {
+    match action {
+        title::Action::Command(id) => {
+            run_command(tabs, clipboard, palette, search, settings, notice, id)
+        }
+        title::Action::Toggle(field) => {
+            match field {
+                "show_line_numbers" => settings.show_line_numbers = !settings.show_line_numbers,
+                "translate_tabs_to_spaces" => {
+                    settings.translate_tabs_to_spaces = !settings.translate_tabs_to_spaces;
+                }
+                "auto_match" => settings.auto_match = !settings.auto_match,
+                _ => return false,
+            }
+            tabs.apply_prefs(settings);
+            notify(
+                notice,
+                format!("{field} = {}", field_value(settings, field)),
+            );
+            true
+        }
+        title::Action::Separator => false,
+    }
 }
 
 /// "archivo.rs:12" → Some(12) (goto de línea del Ctrl+P); sin sufijo
@@ -611,6 +661,7 @@ impl winit::application::ApplicationHandler for Application {
         let session = session::load();
         let attrs = Window::default_attributes()
             .with_title(self.tabs.active().title())
+            .with_decorations(false)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 session.window_width,
                 session.window_height,
@@ -715,7 +766,8 @@ impl winit::application::ApplicationHandler for Application {
                 // decide el divisor arrastrable (`split_ratio`).
                 let group_count = self.tabs.group_count();
                 let geometry = self.tabs.group_geometry(viewport.0);
-                let editor_h = (viewport.1 - TAB_BAR_H - STATUS_H).max(50.0);
+                let editor_h = (viewport.1 - title::TITLE_H - TAB_BAR_H - STATUS_H).max(50.0);
+                self.tabs.set_top(title::TITLE_H);
                 for (g, &(x, w)) in geometry.iter().enumerate() {
                     self.tabs.set_group_geometry(g, x, w, editor_h);
                 }
@@ -792,7 +844,7 @@ impl winit::application::ApplicationHandler for Application {
                     let width = text.chars().count() as f32 * char_w + 24.0;
                     let height = 26.0;
                     let x = viewport.0 - width - 12.0;
-                    let y = TAB_BAR_H + 8.0;
+                    let y = title::TITLE_H + TAB_BAR_H + 8.0;
                     scene
                         .top_quads
                         .push(Quad::new(x, y, width, height, NOTICE_BG));
@@ -806,6 +858,21 @@ impl winit::application::ApplicationHandler for Application {
                         editor::FONT_SIZE,
                         NOTICE_FG,
                     ));
+                }
+                // Barra de título con menú (capa superior, debajo de la
+                // paleta: su desplegado se pinta antes).
+                {
+                    let theme = Theme::from_name(&self.settings.theme);
+                    let title = self.tabs.active().title();
+                    let advance_title = self.settings.font_size as f32 * advance;
+                    self.titlebar.render(
+                        &mut scene,
+                        viewport,
+                        advance_title,
+                        &theme,
+                        &title,
+                        &self.settings,
+                    );
                 }
                 self.palette
                     .render(&mut scene, viewport, editor::FONT_SIZE * advance);
@@ -830,6 +897,24 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
+                // Menú de la barra de título: Alt lo abre (como en
+                // Windows) y Escape lo cierra.
+                if key_event.state == ElementState::Pressed {
+                    if matches!(key_event.logical_key, Key::Named(NamedKey::Alt))
+                        && self.modifiers.is_empty()
+                    {
+                        self.titlebar.open_first();
+                        gpu.request_redraw();
+                        return;
+                    }
+                    if matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
+                        && self.titlebar.is_open()
+                    {
+                        self.titlebar.close();
+                        gpu.request_redraw();
+                        return;
+                    }
+                }
                 // Atajos del keymap (combinaciones exactas: ni mods extra
                 // ni de menos). AltGr (Ctrl+Alt) no llega aquí: sin binding
                 // con alt coincide.
@@ -931,6 +1016,7 @@ impl winit::application::ApplicationHandler for Application {
                 let scale = gpu.scale_factor();
                 self.cursor = position.to_logical::<f32>(scale);
                 let width = gpu.logical_size().0;
+                let height = gpu.logical_size().1;
                 if let Some(last_x) = self.divider_drag {
                     // Arrastre del divisor: solo se mueve el filete.
                     let dx = self.cursor.x - last_x;
@@ -939,13 +1025,17 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
-                // Flecha de resize al pasar por el divisor (con overlays
-                // cerrados; durante un arrastre de texto no se toca).
+                // Flechas de resize del marco propio y del divisor (con
+                // overlays cerrados; durante un arrastre no se toca).
                 if !self.mouse_down {
-                    let icon = if self.tabs.over_divider(self.cursor.x, width)
-                        && !self.palette.is_open()
-                        && !self.search.is_open()
-                    {
+                    self.titlebar.hover_at(self.cursor.x, self.cursor.y);
+                    let edge = title::resize_edge(self.cursor.x, self.cursor.y, width, height)
+                        .map(CursorIcon::from);
+                    let icon = if self.palette.is_open() || self.search.is_open() {
+                        CursorIcon::Default
+                    } else if let Some(icon) = edge {
+                        icon
+                    } else if self.tabs.over_divider(self.cursor.x, width) {
                         CursorIcon::EwResize
                     } else {
                         CursorIcon::Default
@@ -953,6 +1043,9 @@ impl winit::application::ApplicationHandler for Application {
                     if icon != self.cursor_icon {
                         gpu.window().set_cursor(icon);
                         self.cursor_icon = icon;
+                    }
+                    if self.titlebar.is_open() {
+                        gpu.request_redraw();
                     }
                 }
                 if self.mouse_down {
@@ -979,6 +1072,14 @@ impl winit::application::ApplicationHandler for Application {
                 button: MouseButton::Left,
                 ..
             } => {
+                let width = gpu.logical_size().0;
+                let height = gpu.logical_size().1;
+                // Borde de la ventana: resize (sin decoraciones nativas).
+                if let Some(dir) = title::resize_edge(self.cursor.x, self.cursor.y, width, height) {
+                    let _ = gpu.window().drag_resize_window(dir);
+                    gpu.request_redraw();
+                    return;
+                }
                 // Paleta (capa superior): fila → ejecutar; dentro del panel →
                 // solo cerrar; fuera → cerrar y que el click siga al editor.
                 if self.palette.is_open() {
@@ -1028,6 +1129,79 @@ impl winit::application::ApplicationHandler for Application {
                 {
                     gpu.request_redraw();
                     return;
+                }
+                // Barra de título y desplegado del menú (por encima del
+                // divisor y de las pestañas: ocupa la fila superior y su
+                // menú se despliega sobre el contenido).
+                if self.cursor.y < title::TITLE_H || self.titlebar.is_open() {
+                    let (w_logical, h_logical) = gpu.logical_size();
+                    match self
+                        .titlebar
+                        .click(self.cursor.x, self.cursor.y, w_logical, h_logical)
+                    {
+                        title::Click::Action(action) => {
+                            self.titlebar.close();
+                            apply_menu_action(
+                                &mut self.tabs,
+                                &mut self.clipboard,
+                                &mut self.palette,
+                                &mut self.search,
+                                &mut self.settings,
+                                &mut self.notice,
+                                action,
+                            );
+                            gpu.request_redraw();
+                            return;
+                        }
+                        title::Click::Root(i) => {
+                            self.titlebar.toggle_root(i);
+                            gpu.request_redraw();
+                            return;
+                        }
+                        title::Click::Minimize => {
+                            gpu.window().set_minimized(true);
+                            return;
+                        }
+                        title::Click::Maximize => {
+                            let window = gpu.window();
+                            window.set_maximized(!window.is_maximized());
+                            return;
+                        }
+                        title::Click::Close => {
+                            event_loop.exit();
+                            return;
+                        }
+                        title::Click::Drag => {
+                            // Arrastre de la ventana; doble clic → maximizar.
+                            let mut maximize = false;
+                            if let Some((at, point)) = self.last_click {
+                                let dx = self.cursor.x - point.x;
+                                let dy = self.cursor.y - point.y;
+                                if at.elapsed() < CLICK_WINDOW && dx * dx + dy * dy <= CLICK_SLOP2 {
+                                    maximize = true;
+                                }
+                            }
+                            self.last_click = Some((Instant::now(), self.cursor));
+                            if maximize {
+                                let window = gpu.window();
+                                window.set_maximized(!window.is_maximized());
+                            } else {
+                                let _ = gpu.window().drag_window();
+                            }
+                            gpu.request_redraw();
+                            return;
+                        }
+                        title::Click::Miss => {
+                            if self.titlebar.is_open() && self.cursor.y >= title::TITLE_H {
+                                self.titlebar.close();
+                                gpu.request_redraw();
+                                return;
+                            }
+                            if self.cursor.y < title::TITLE_H {
+                                return; // barra: no llega al editor
+                            }
+                        }
+                    }
                 }
                 // Divisor entre paneles: el click lo inicia; no llega ni a
                 // la barra ni al editor (el icono vuelve a flecha al soltar).

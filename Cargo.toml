@@ -36,6 +36,8 @@ tempfile = "3"
 arboard = { version = "3", default-features = false }
 # Syntax highlighting (fancy-regex: puro Rust, sin librerías C)
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+# Regex de buscar/reemplazar (M23): misma libra que syntect, ya en el árbol
+fancy-regex = "0.16"
 # Fuzzy matching para la paleta de comandos (de helix/nucleo)
 nucleo-matcher = "0.3"
 # Diálogos nativos de abrir/guardar (async: en Linux usa xdg-portal, sin GTK)

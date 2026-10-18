@@ -1056,6 +1056,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "env_logger",
+ "fancy-regex",
  "jorgenio-core",
  "jorgenio-syntax",
  "jorgenio-ui",

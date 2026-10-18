@@ -116,6 +116,12 @@ impl Buffer {
         Ok(())
     }
 
+    /// Marca el buffer como sucio sin tocar el texto (hot exit: el contenido
+    /// restaurado puede no coincidir con el disco).
+    pub fn set_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Texto completo con los `\n` convertidos a `line_ending`.
     pub fn text_with_line_ending(&self) -> String {
         let text = self.rope.to_string();
@@ -372,5 +378,17 @@ mod tests {
         buffer.insert(buffer.len_chars(), "!");
         buffer.insert(5, "y"); // línea 1
         assert_eq!(buffer.take_dirty_from_line(), Some(1));
+    }
+
+    #[test]
+    fn set_dirty_marks_without_touching_text() {
+        let mut buffer = Buffer::from_text("calmado");
+        assert!(!buffer.dirty());
+        let revision = buffer.revision();
+
+        buffer.set_dirty();
+        assert!(buffer.dirty(), "hot exit marca sucio sin editar");
+        assert_eq!(buffer.revision(), revision, "y no altera la revisión");
+        assert_eq!(buffer.text_range(0..buffer.len_chars()), "calmado");
     }
 }

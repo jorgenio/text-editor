@@ -78,13 +78,12 @@ impl Tabs {
         }
     }
 
-    /// Pestañas desde los paths de la CLI (ninguno → un editor en blanco);
-    /// la activa es la primera. Todas van al primer grupo.
-    pub fn from_paths(paths: Vec<std::path::PathBuf>) -> Self {
-        if paths.is_empty() {
+    /// Pestañas desde editores ya construidos (CLI + hot exit; M23). La
+    /// activa es la primera; sin pestañas, un editor en blanco.
+    pub fn from_editors(list: Vec<Editor>) -> Self {
+        if list.is_empty() {
             return Self::new(Editor::default());
         }
-        let list = paths.into_iter().map(Editor::from_cli).collect();
         Self {
             groups: vec![Group { list, active: 0 }],
             active_group: 0,
@@ -95,6 +94,12 @@ impl Tabs {
             closed: Vec::new(),
             top: 0.0,
         }
+    }
+
+    /// Todos los editores abiertos, en orden de grupo y de pestaña
+    /// (para el hot exit de la sesión).
+    pub fn iter(&self) -> impl Iterator<Item = &Editor> {
+        self.groups.iter().flat_map(|group| group.list.iter())
     }
 
     /// Editor activo del grupo activo (al que van teclado, IME y comandos).
@@ -527,14 +532,14 @@ mod tests {
     }
 
     #[test]
-    fn from_paths_opens_all_and_empty_falls_back_to_blank() {
-        let blank = Tabs::from_paths(Vec::new());
+    fn from_editors_keeps_order_and_empty_falls_back_to_blank() {
+        let blank = Tabs::from_editors(Vec::new());
         assert_eq!(blank.len(), 1);
         assert!(!blank.active().has_path());
 
-        let tabs = Tabs::from_paths(vec![
-            std::path::PathBuf::from("no_existe_a.txt"),
-            std::path::PathBuf::from("no_existe_b.txt"),
+        let tabs = Tabs::from_editors(vec![
+            Editor::from_cli(std::path::PathBuf::from("no_existe_a.txt")),
+            Editor::from_cli(std::path::PathBuf::from("no_existe_b.txt")),
         ]);
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs.active_index(), 0, "la activa es la primera");

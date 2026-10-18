@@ -54,6 +54,8 @@ struct Layout {
     replace_field: Rect,
     btn_replace: Rect,
     btn_all: Rect,
+    /// Toggle ".*" de modo regex (fila de buscar; M23).
+    btn_regex: Rect,
     advance: f32,
 }
 
@@ -61,6 +63,9 @@ pub struct SearchBar {
     open: bool,
     /// Fila de reemplazo visible (Ctrl+H la muestra).
     replace_mode: bool,
+    /// ¿Buscar por regex? (botón ".*"; como en Sublime, el modo se
+    /// conserva al cerrar la barra, la consulta también).
+    regex: bool,
     query: String,
     replacement: String,
     field: Field,
@@ -76,6 +81,7 @@ impl Default for SearchBar {
         Self {
             open: false,
             replace_mode: false,
+            regex: false,
             query: String::new(),
             replacement: String::new(),
             field: Field::Query,
@@ -207,6 +213,11 @@ impl SearchBar {
         if !layout.bar.contains(x, y) {
             return false;
         }
+        if layout.btn_regex.contains(x, y) {
+            self.regex = !self.regex;
+            editor.set_find_regex(self.regex);
+            return true;
+        }
         if layout.btn_all.contains(x, y) {
             editor.find_replace_all(&self.replacement);
             return true;
@@ -258,20 +269,25 @@ impl SearchBar {
             self.theme.panel_edge,
         ));
 
-        // Fila de buscar: etiqueta + campo + contador "actual / total".
+        // Fila de buscar: etiqueta + campo + contador "actual / total" y el
+        // toggle ".*" de modo regex, a la derecha (como en Sublime).
         let find_row_y = bar_y + EDGE;
         let label = "Buscar:";
         let field_x = PAD + label.chars().count() as f32 * advance + 6.0;
         let (current, total) = editor.find_stats();
         let counter = if self.query.is_empty() {
             String::new()
+        } else if editor.find_regex_invalid() {
+            "Regex inválida".to_owned()
         } else if total == 0 {
             "0 / 0".to_owned()
         } else {
             format!("{current} / {total}")
         };
+        let re_w = ".*".chars().count() as f32 * advance + 12.0;
+        let re_x = viewport.0 - PAD - re_w;
         let counter_w = counter.chars().count() as f32 * advance;
-        let field_w = (viewport.0 - field_x - PAD - counter_w - 8.0).max(60.0);
+        let field_w = (re_x - 8.0 - counter_w - 8.0 - field_x).max(60.0);
         let find_field = Rect::new(field_x, find_row_y + 4.0, field_w, ROW_H - 8.0);
         let text_y = find_row_y + (ROW_H - FONT_SIZE) / 2.0;
         scene
@@ -282,12 +298,33 @@ impl SearchBar {
         if !counter.is_empty() {
             scene.top_texts.push(TextSpan::new(
                 counter,
-                viewport.0 - PAD - counter_w,
+                re_x - 8.0 - counter_w,
                 text_y,
                 FONT_SIZE,
                 self.theme.dim,
             ));
         }
+        let btn_regex = Rect::new(re_x, find_row_y + 4.0, re_w, ROW_H - 8.0);
+        let regex_bg = if self.regex {
+            self.theme.match_bg
+        } else {
+            self.theme.button_bg
+        };
+        scene.top_quads.push(Quad::new(
+            btn_regex.x,
+            btn_regex.y,
+            btn_regex.w,
+            btn_regex.h,
+            regex_bg,
+        ));
+        let re_x_text = btn_regex.x + (btn_regex.w - 2.0 * advance) / 2.0;
+        scene.top_texts.push(TextSpan::new(
+            ".*",
+            re_x_text,
+            text_y,
+            FONT_SIZE,
+            self.theme.fg,
+        ));
 
         // Fila de reemplazar (solo en modo reemplazo): etiqueta, campo y
         // los dos botones, alineados a la derecha.
@@ -337,6 +374,7 @@ impl SearchBar {
             replace_field,
             btn_replace,
             btn_all,
+            btn_regex,
             advance,
         });
     }
@@ -650,14 +688,94 @@ mod tests {
         search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
         let layout = search.last.unwrap();
         assert_eq!(layout.replace_field.w, 0.0, "sin fila de reemplazo");
-        // fondo + borde + campo + caret.
-        assert_eq!(scene.top_quads.len(), 4);
+        // fondo + borde + campo + caret + botón ".*".
+        assert_eq!(scene.top_quads.len(), 5);
 
         // Ctrl+H no escribe en la barra: ese atajo lo resuelve el keymap
         // ANTES de repartir el teclado (aquí solo caería en `_`).
         search.handle_key(&key('h'), ModifiersState::CONTROL, &mut editor);
         assert!(search.query.is_empty(), "Ctrl+H no escribe 'h'");
         assert!(search.is_open(), "la barra no se cierra sola");
+    }
+
+    #[test]
+    fn regex_toggle_button_switches_editor_mode() {
+        let mut editor = Editor::default();
+        editor.insert_text("foo fooo");
+        let mut search = SearchBar::default();
+        search.open(false, None, &mut editor);
+        typed(&mut search, &mut editor, "fo+");
+        assert_eq!(
+            editor.find_stats(),
+            (0, 0),
+            "literal: 'fo+' como texto no está en el buffer"
+        );
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
+        let layout = search.last.expect("render guarda el layout");
+        assert!(
+            search.handle_click(
+                layout.btn_regex.x + 2.0,
+                layout.btn_regex.y + 2.0,
+                &mut editor
+            ),
+            "el click en .* se consume"
+        );
+        assert!(search.regex, "el botón alterna el modo");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 2),
+            "regex: 'fo+' coincide con 'foo' y 'fooo' (la actual, la primera)"
+        );
+
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
+        let layout = search.last.expect("re-render");
+        search.handle_click(
+            layout.btn_regex.x + 2.0,
+            layout.btn_regex.y + 2.0,
+            &mut editor,
+        );
+        assert!(!search.regex, "y se vuelve a literal");
+        assert_eq!(editor.find_stats(), (0, 0), "la consulta no cambia");
+    }
+
+    #[test]
+    fn invalid_regex_shows_warning_instead_of_counter() {
+        let mut editor = Editor::default();
+        editor.insert_text("abc");
+        let mut search = SearchBar::default();
+        search.open(false, None, &mut editor);
+        search.regex = true;
+        editor.set_find_regex(true);
+        typed(&mut search, &mut editor, "(");
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
+        let shown: Vec<&str> = scene
+            .top_texts
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(
+            shown.contains(&"Regex inválida"),
+            "avisa del patrón roto: {shown:?}"
+        );
+
+        // Un patrón válido vuelve al contador normal.
+        search.handle_key(&Key::Named(NamedKey::Backspace), mods(), &mut editor);
+        typed(&mut search, &mut editor, "a");
+        scene = Scene::new(wgpu::Color::BLACK);
+        search.render(&mut scene, (800.0, 600.0), 8.0, 0.0, &editor);
+        let shown: Vec<&str> = scene
+            .top_texts
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+        assert!(
+            shown.contains(&"1 / 1"),
+            "contador normal de nuevo: {shown:?}"
+        );
     }
 
     #[test]

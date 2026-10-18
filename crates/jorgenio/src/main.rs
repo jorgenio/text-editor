@@ -61,7 +61,10 @@ const QUICK_SKIP: [&str; 9] = [
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut Application::new(editor::cli_paths()))?;
+    // La sesión se carga UNA vez: el tamaño de la ventana en `resumed` y el
+    // hot exit (buffers sin guardar) en `Application::new`.
+    let session = session::load();
+    event_loop.run_app(&mut Application::new(session, editor::cli_paths()))?;
     Ok(())
 }
 
@@ -76,6 +79,9 @@ struct Application {
     findfiles: FindFiles,
     /// Preferencias cargadas de `settings.json` (M11).
     settings: settings::Settings,
+    /// Sesión del arranque (tamaño de ventana; los buffers ya se
+    /// restauraron en `boot_tabs`).
+    session: session::Session,
     gpu: Option<GpuContext>,
     /// Portapapeles del SO, creado en la primera uso (lazy).
     clipboard: Option<arboard::Clipboard>,
@@ -100,9 +106,9 @@ struct Application {
 }
 
 impl Application {
-    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+    fn new(session: session::Session, paths: Vec<std::path::PathBuf>) -> Self {
         let settings = settings::load();
-        let mut tabs = Tabs::from_paths(paths);
+        let mut tabs = boot_tabs(&session, paths);
         tabs.apply_prefs(&settings);
         let mut search = SearchBar::default();
         search.set_theme(Theme::from_name(&settings.theme));
@@ -113,6 +119,7 @@ impl Application {
             search,
             findfiles: FindFiles::default(),
             settings,
+            session,
             gpu: None,
             clipboard: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
@@ -130,6 +137,43 @@ impl Application {
             titlebar: TitleBar::default(),
         }
     }
+}
+
+/// Pestañas al arrancar (M23): primero el hot exit de la sesión (los
+/// buffers sucios, en su orden), luego los paths de la CLI que no estén ya
+/// restaurados (un path repetido no duplica pestañas: lo no-guardado manda
+/// sobre el disco). Sin nada, un editor en blanco.
+fn boot_tabs(session: &session::Session, cli: Vec<std::path::PathBuf>) -> Tabs {
+    let mut list: Vec<Editor> = session
+        .buffers
+        .iter()
+        .map(|buffer| {
+            Editor::from_hot(
+                buffer.path.as_deref().map(std::path::PathBuf::from),
+                &buffer.text,
+            )
+        })
+        .collect();
+    for path in cli {
+        if !list
+            .iter()
+            .any(|editor| editor.path() == Some(path.as_path()))
+        {
+            list.push(Editor::from_cli(path));
+        }
+    }
+    Tabs::from_editors(list)
+}
+
+/// Pestañas sin guardar de TODOS los grupos, para el hot exit al cerrar.
+fn collect_hot_buffers(tabs: &Tabs) -> Vec<session::HotBuffer> {
+    tabs.iter()
+        .filter(|editor| editor.dirty())
+        .map(|editor| session::HotBuffer {
+            path: editor.path().map(|p| p.to_string_lossy().into_owned()),
+            text: editor.text(),
+        })
+        .collect()
 }
 
 /// Valor actual de una preferencia booleana (para el aviso del toggle).
@@ -677,13 +721,12 @@ impl winit::application::ApplicationHandler for Application {
         }
 
         // Tamaño recordado de la sesión anterior (clampeado en Session::new).
-        let session = session::load();
         let attrs = Window::default_attributes()
             .with_title(self.tabs.active().title())
             .with_decorations(false)
             .with_inner_size(winit::dpi::LogicalSize::new(
-                session.window_width,
-                session.window_height,
+                self.session.window_width,
+                self.session.window_height,
             ));
         let window = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
@@ -760,14 +803,16 @@ impl winit::application::ApplicationHandler for Application {
             }
             WindowEvent::ScaleFactorChanged { .. } => gpu.request_redraw(),
             WindowEvent::CloseRequested => {
-                // Recuerda el tamaño lógico de la ventana para el próximo
-                // arranque (los errores solo se loguean: cerrar manda).
+                // Recuerda el tamaño lógico y los buffers sin guardar (hot
+                // exit; M23) para el próximo arranque (los errores solo se
+                // loguean: cerrar manda).
                 let size = gpu.window().inner_size();
                 let scale = gpu.scale_factor();
-                let session = session::Session::new(
+                let mut session = session::Session::new(
                     (size.width as f64 / scale).round() as u32,
                     (size.height as f64 / scale).round() as u32,
                 );
+                session.set_buffers(collect_hot_buffers(&self.tabs));
                 session::save(&session);
                 event_loop.exit();
             }
@@ -1363,13 +1408,14 @@ impl winit::application::ApplicationHandler for Application {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_files, default_save_name, focus_group, focus_tab, open_path, parse_goto_line,
-        run_command,
+        boot_tabs, collect_files, collect_hot_buffers, default_save_name, focus_group, focus_tab,
+        open_path, parse_goto_line, run_command,
     };
     use crate::editor::Editor;
     use crate::findfiles::FindFiles;
     use crate::palette::Palette;
     use crate::search::SearchBar;
+    use crate::session;
     use crate::settings;
     use crate::tabs::Tabs;
     use crate::theme::Theme;
@@ -1563,5 +1609,88 @@ mod tests {
         assert_eq!(tabs.active_group_index(), 1);
         focus_group(&mut tabs, 1);
         assert_eq!(tabs.active_group_index(), 1);
+    }
+
+    #[test]
+    fn boot_tabs_restores_hot_buffers_and_dedupes_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "en disco").expect("escribe a.rs");
+
+        let mut session = session::Session::default();
+        session.set_buffers(vec![
+            session::HotBuffer {
+                path: Some(a.to_string_lossy().into_owned()),
+                text: "versión sin guardar".to_owned(),
+            },
+            session::HotBuffer {
+                path: None,
+                text: "borrador".to_owned(),
+            },
+        ]);
+
+        // La CLI trae a.rs (ya restaurado) y b.rs (nuevo).
+        let b = dir.path().join("b.rs");
+        let tabs = boot_tabs(&session, vec![a.clone(), b.clone()]);
+
+        assert_eq!(tabs.len(), 3, "hot exit (2) + b.rs; a.rs no duplica");
+        assert_eq!(
+            tabs.active().tab_label(),
+            "a.rs",
+            "el orden: sesión primero"
+        );
+        assert_eq!(
+            tabs.active().text(),
+            "versión sin guardar",
+            "lo no-guardado manda sobre el disco"
+        );
+        assert!(tabs.active().dirty(), "el buffer restaurado sigue sucio");
+        assert_eq!(tabs.active().path(), Some(a.as_path()));
+    }
+
+    #[test]
+    fn boot_tabs_falls_back_to_blank_and_cli_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "fn main() {}").expect("escribe");
+
+        let blank = boot_tabs(&session::Session::default(), Vec::new());
+        assert_eq!(blank.len(), 1, "sin sesión ni CLI: editor en blanco");
+        assert!(!blank.active().dirty());
+
+        let only_cli = boot_tabs(&session::Session::default(), vec![a.clone()]);
+        assert_eq!(only_cli.len(), 1);
+        assert_eq!(only_cli.active().tab_label(), "a.rs");
+    }
+
+    #[test]
+    fn collect_hot_buffers_takes_only_dirty_tabs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "en disco").expect("escribe");
+        let mut tabs = Tabs::from_editors(vec![Editor::from_cli(a.clone())]);
+        tabs.active_mut().select_all();
+        tabs.active_mut().insert_text("cambio");
+
+        let untitled = Editor::default();
+        tabs.add(untitled);
+        tabs.active_mut().insert_text("borrador");
+
+        let buffers = collect_hot_buffers(&tabs);
+        assert_eq!(buffers.len(), 2, "los dos sucios");
+        assert_eq!(
+            buffers[0].path.as_deref(),
+            Some(a.to_string_lossy().as_ref())
+        );
+        assert_eq!(buffers[0].text, "cambio");
+        assert_eq!(buffers[1].path, None, "sin título va como None");
+        assert_eq!(buffers[1].text, "borrador");
+
+        // Guardar limpia la marca: el tab salvo desaparece del hot exit.
+        tabs.set_active(0);
+        tabs.active_mut().save().expect("guarda a.rs");
+        let buffers = collect_hot_buffers(&tabs);
+        assert_eq!(buffers.len(), 1, "el que se guardó se descarta");
+        assert_eq!(buffers[0].path, None);
     }
 }

@@ -111,6 +111,12 @@ pub struct Editor {
     find_query: String,
     /// Revisión del buffer con la que `find` está calculado.
     find_revision: u64,
+    /// ¿Buscar por regex? (botón ".*" de la barra; M23). La consulta se
+    /// compila al escribirla: si el patrón es inválido no hay coincidencias
+    /// y [`Editor::find_regex_invalid`] lo dice para la barra.
+    find_regex: bool,
+    find_regex_compiled: Option<fancy_regex::Regex>,
+    find_regex_error: bool,
 }
 
 impl Default for Editor {
@@ -138,6 +144,9 @@ impl Default for Editor {
             find_current: 0,
             find_query: String::new(),
             find_revision: 0,
+            find_regex: false,
+            find_regex_compiled: None,
+            find_regex_error: false,
         }
     }
 }
@@ -159,6 +168,28 @@ impl Editor {
             path: Some(path),
             ..Self::default()
         }
+    }
+
+    /// Reconstruye un buffer desde el hot exit de la sesión (M23): `text` es
+    /// lo que quedó sin guardar (puede no coincidir con el disco) y el
+    /// buffer arranca como sucio, para que el "●" y Ctrl+S sigan honestos.
+    pub fn from_hot(path: Option<PathBuf>, text: &str) -> Self {
+        let mut editor = match path {
+            Some(path) => Self {
+                lang: SyntaxHighlighter::detect(&path),
+                path: Some(path),
+                ..Self::default()
+            },
+            None => Self::default(),
+        };
+        editor.buffer = Buffer::from_text(text);
+        editor.buffer.set_dirty();
+        editor
+    }
+
+    /// Texto completo del buffer (para el hot exit de la sesión).
+    pub fn text(&self) -> String {
+        self.buffer.text_range(0..self.buffer.len_chars())
     }
 
     /// Título de la ventana: nombre del archivo + indicador de cambios.
@@ -1623,6 +1654,9 @@ impl Editor {
     /// La actual es la primera coincidencia en o después del caret, con vuelta.
     pub fn find_set_query(&mut self, query: &str) {
         self.find_query = query.to_owned();
+        if self.find_regex {
+            self.recompile_find_regex();
+        }
         if query.is_empty() {
             self.find.clear();
             self.find_current = 0;
@@ -1632,6 +1666,61 @@ impl Editor {
         let from = self.primary().caret;
         self.recompute_find(from);
         self.reveal_current_match();
+    }
+
+    /// Activa/desactiva la búsqueda por regex (botón ".*" de la barra; M23)
+    /// y recalcula las coincidencias con la consulta actual.
+    pub fn set_find_regex(&mut self, on: bool) {
+        if self.find_regex == on {
+            return;
+        }
+        self.find_regex = on;
+        self.recompile_find_regex();
+        if self.find_query.is_empty() {
+            self.find.clear();
+            self.find_current = 0;
+            self.find_revision = self.buffer.revision();
+            return;
+        }
+        let from = self.primary().caret;
+        self.recompute_find(from);
+        self.reveal_current_match();
+    }
+
+    /// ¿Modo regex activo con un patrón inválido? (lo enseña la barra en
+    /// vez del contador "0 / 0", que no distingue "no coincide" de "no
+    /// compila").
+    pub fn find_regex_invalid(&self) -> bool {
+        self.find_regex && self.find_regex_error
+    }
+
+    /// Compila `find_query` en modo regex. smart-case: mayúsculas en el
+    /// patrón → distingue mayúsculas; sin ellas, plegado insensible (en
+    /// regex no hay plegado ASCII parcial: se pliega entero). `^`/`$` marcan
+    /// límites de línea (multi_line), que es lo que se espera al buscar en
+    /// código. Un patrón inválido no compila: no hay coincidencias.
+    fn recompile_find_regex(&mut self) {
+        if !self.find_regex || self.find_query.is_empty() {
+            self.find_regex_compiled = None;
+            self.find_regex_error = false;
+            return;
+        }
+        let case_insensitive = !self.find_query.chars().any(char::is_uppercase);
+        match fancy_regex::RegexBuilder::new(&self.find_query)
+            .case_insensitive(case_insensitive)
+            .multi_line(true)
+            .build()
+        {
+            Ok(regex) => {
+                self.find_regex_compiled = Some(regex);
+                self.find_regex_error = false;
+            }
+            Err(err) => {
+                log::debug!("regex inválida ({err}): {}", self.find_query);
+                self.find_regex_compiled = None;
+                self.find_regex_error = true;
+            }
+        }
     }
 
     /// Resincroniza `find` si el buffer cambió desde su cálculo (undo/redo,
@@ -1657,7 +1746,13 @@ impl Editor {
     /// Recalcula `find` y deja como actual la primera coincidencia en o
     /// después de `from` (si no hay, la primera).
     fn recompute_find(&mut self, from: usize) {
-        self.find = find_in_buffer(&self.buffer, &self.find_query);
+        self.find = if self.find_regex {
+            self.find_regex_compiled
+                .as_ref()
+                .map_or_else(Vec::new, |regex| find_in_buffer_regex(&self.buffer, regex))
+        } else {
+            find_in_buffer(&self.buffer, &self.find_query)
+        };
         self.find_current = self
             .find
             .iter()
@@ -1695,34 +1790,78 @@ impl Editor {
         self.find.clear();
         self.find_current = 0;
         self.find_query.clear();
+        self.find_regex_compiled = None;
+        self.find_regex_error = false;
         self.find_revision = self.buffer.revision();
         self.reset_caret_blink();
     }
 
     /// Reemplaza la coincidencia actual en su transacción de undo y avanza a
     /// la siguiente a partir del texto nuevo (con vuelta). `false` si no hay.
+    /// En modo regex el reemplazo expande `$1`/`$name` con los captures de
+    /// la propia coincidencia.
     pub fn find_replace_current(&mut self, replacement: &str) -> bool {
         self.find_sync();
         let Some(range) = self.find.get(self.find_current).cloned() else {
             return false;
         };
         let start = range.start;
-        self.with_transaction(|editor| editor.replace_match(&range, replacement));
-        self.recompute_find(start + replacement.chars().count());
+        let expanded = if self.find_regex {
+            match &self.find_regex_compiled {
+                Some(regex) => {
+                    let hay = self.buffer.text_range(0..self.buffer.len_chars());
+                    expand_regex_replacement(regex, &hay, &range, replacement)
+                }
+                None => replacement.to_owned(),
+            }
+        } else {
+            replacement.to_owned()
+        };
+        let inserted = expanded.chars().count();
+        self.with_transaction(|editor| editor.replace_match(&range, &expanded));
+        self.recompute_find(start + inserted);
         self.reveal_current_match();
         true
     }
 
     /// Reemplaza TODAS las coincidencias de derecha a izquierda (los offsets
     /// altos no afectan a los bajos) en UNA transacción de undo.
-    /// Devuelve cuántas había.
+    /// Devuelve cuántas había. En modo regex cada reemplazo se expande con
+    /// los captures de SU coincidencia, calculados sobre el texto original
+    /// (los reemplazos de la derecha no afectan a la izquierda).
     pub fn find_replace_all(&mut self, replacement: &str) -> usize {
         self.find_sync();
         if self.find.is_empty() {
             return 0;
         }
+        let count = self.find.len();
+        if self.find_regex && self.find_regex_compiled.is_some() {
+            let hay = self.buffer.text_range(0..self.buffer.len_chars());
+            let mut todo: Vec<(Range<usize>, String)> = Vec::new();
+            if let Some(regex) = &self.find_regex_compiled {
+                for caps in regex.captures_iter(&hay) {
+                    let Ok(caps) = caps else { break };
+                    let Some(m) = caps.get(0) else { continue };
+                    if m.start() == m.end() {
+                        continue;
+                    }
+                    let start = hay[..m.start()].chars().count();
+                    let len = hay[m.start()..m.end()].chars().count();
+                    let mut expanded = String::new();
+                    caps.expand(replacement, &mut expanded);
+                    todo.push((start..start + len, expanded));
+                }
+            }
+            self.with_transaction(|editor| {
+                for (range, expanded) in todo.iter().rev() {
+                    editor.replace_match(range, expanded);
+                }
+            });
+            self.recompute_find(0);
+            self.reset_caret_blink();
+            return todo.len();
+        }
         let matches = self.find.clone();
-        let count = matches.len();
         self.with_transaction(|editor| {
             for range in matches.iter().rev() {
                 editor.replace_match(range, replacement);
@@ -2170,6 +2309,61 @@ fn find_in_buffer(buffer: &Buffer, query: &str) -> Vec<Range<usize>> {
         prev_chars = chars;
     }
     found
+}
+
+/// Posiciones (chars) de cada coincidencia de `re` en el buffer, en orden.
+/// Los matches de ancho cero (`^`, `\b`…) no se listan: no se pueden ni
+/// resaltar ni reemplazar. Un error de backtracking corta la lista (nunca
+/// pánic: la regex compilada sigue siendo del usuario).
+fn find_in_buffer_regex(buffer: &Buffer, re: &fancy_regex::Regex) -> Vec<Range<usize>> {
+    let hay = buffer.text_range(0..buffer.len_chars());
+    let mut found = Vec::new();
+    let mut prev_byte = 0;
+    let mut prev_chars = 0;
+    for caps in re.captures_iter(&hay) {
+        let Ok(caps) = caps else { break };
+        let Some(m) = caps.get(0) else { continue };
+        if m.start() == m.end() {
+            continue;
+        }
+        // Conversión byte→char incremental (como en find_in_buffer).
+        let start = prev_chars + hay[prev_byte..m.start()].chars().count();
+        let len = hay[m.start()..m.end()].chars().count();
+        prev_byte = m.start();
+        prev_chars = start;
+        found.push(start..start + len);
+    }
+    found
+}
+
+/// Expansión del reemplazo con los captures de `re` sobre la coincidencia
+/// exacta `range` (fancy-regex `Captures::expand`: `$1`, `$name`…); si no
+/// hay coincidencia exacta, texto literal.
+fn expand_regex_replacement(
+    re: &fancy_regex::Regex,
+    text: &str,
+    range: &Range<usize>,
+    replacement: &str,
+) -> String {
+    let mut prev_byte = 0;
+    let mut prev_chars = 0;
+    for caps in re.captures_iter(text) {
+        let Ok(caps) = caps else { break };
+        let Some(m) = caps.get(0) else { continue };
+        if m.start() == m.end() {
+            continue;
+        }
+        let start = prev_chars + text[prev_byte..m.start()].chars().count();
+        let len = text[m.start()..m.end()].chars().count();
+        prev_byte = m.start();
+        prev_chars = start;
+        if (start..start + len) == *range {
+            let mut expanded = String::new();
+            caps.expand(replacement, &mut expanded);
+            return expanded;
+        }
+    }
+    replacement.to_owned()
 }
 
 /// Cierre que auto_match escribe tras este apertura (paréntesis, corchetes,
@@ -3065,6 +3259,110 @@ mod tests {
         assert_eq!(editor.single_line_selection().as_deref(), Some("uno"));
         editor.cursors = vec![Cursor::new(0)];
         assert_eq!(editor.single_line_selection(), None, "sin selección");
+    }
+
+    #[test]
+    fn find_regex_matches_and_keeps_smart_case() {
+        let mut editor = Editor::default();
+        editor.insert_text("Foo bar foo FOO");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.set_find_regex(true);
+
+        editor.find_set_query("fo+");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 3),
+            "regex sin mayúsculas: insensible como el literal"
+        );
+
+        editor.find_set_query("Fo+");
+        assert_eq!(
+            editor.find_stats(),
+            (1, 1),
+            "con mayúscula: smart-case también en regex"
+        );
+
+        editor.set_find_regex(false);
+        assert_eq!(
+            editor.find_stats(),
+            (0, 0),
+            "volver a literal reinterpreta la consulta: 'Fo+' no está en el texto"
+        );
+        assert!(!editor.find_regex_invalid());
+    }
+
+    #[test]
+    fn find_regex_invalid_reports_and_zero_width_matches_are_ignored() {
+        let mut editor = Editor::default();
+        editor.insert_text("hola mundo");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.set_find_regex(true);
+
+        editor.find_set_query("(");
+        assert_eq!(
+            editor.find_stats(),
+            (0, 0),
+            "patrón inválido: sin coincidencias"
+        );
+        assert!(editor.find_regex_invalid(), "y la barra puede avisar");
+
+        editor.find_set_query("mundo");
+        assert!(!editor.find_regex_invalid(), "patrón válido repara el flag");
+        assert_eq!(editor.find_stats(), (1, 1));
+
+        editor.find_set_query("^");
+        assert_eq!(
+            editor.find_stats(),
+            (0, 0),
+            "zero-width (^): no se lista ni se reemplaza"
+        );
+        assert!(!editor.find_regex_invalid(), "'^' sí compila");
+    }
+
+    #[test]
+    fn find_regex_replace_expands_captures() {
+        let mut editor = Editor::default();
+        editor.insert_text("a@x b@y");
+        editor.cursors = vec![Cursor::new(0)];
+        editor.set_find_regex(true);
+        editor.find_set_query(r"(\w+)@(\w+)");
+
+        assert_eq!(
+            editor.find_replace_all("$2:$1"),
+            2,
+            "cuenta las dos coincidencias"
+        );
+        assert_eq!(text_of(&editor), "x:a y:b", "$1/$2 se expanden por capture");
+        assert!(editor.undo(), "un solo undo para todo");
+        assert_eq!(text_of(&editor), "a@x b@y");
+
+        // Reemplazo puntual también expande.
+        editor.find_set_query(r"(\w+)@(\w+)");
+        assert!(editor.find_replace_current("<$2>"));
+        assert_eq!(text_of(&editor), "<x> b@y");
+    }
+
+    #[test]
+    fn from_hot_restores_text_dirty_and_path() {
+        let editor = Editor::from_hot(
+            Some(std::path::PathBuf::from("nota.md")),
+            "contenido sin guardar",
+        );
+        assert_eq!(text_of(&editor), "contenido sin guardar");
+        assert!(
+            editor.dirty(),
+            "hot exit arranca sucio (el disco puede estar viejo)"
+        );
+        assert_eq!(
+            editor.path().map(|p| p.display().to_string()),
+            Some("nota.md".to_owned())
+        );
+        assert_eq!(editor.tab_label(), "nota.md");
+
+        let untitled = Editor::from_hot(None, "borrador");
+        assert_eq!(untitled.tab_label(), "sin título");
+        assert!(untitled.dirty());
+        assert!(!untitled.has_path());
     }
 
     #[test]

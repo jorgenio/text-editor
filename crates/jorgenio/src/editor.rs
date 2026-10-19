@@ -19,6 +19,7 @@ use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use crate::minimap;
 use crate::snippets;
 use crate::theme::Theme;
 
@@ -2224,6 +2225,124 @@ impl Editor {
         scene
     }
 
+    /// Estado del minimap para su `rect` (M27): qué líneas del buffer
+    /// muestra la franja, cuántas ve el editor ahora y dónde está su
+    /// ventana. Es la fuente que usan render, click y arrastre.
+    pub fn minimap_view(&mut self, rect: (f32, f32, f32, f32)) -> minimap::View {
+        let total = self.buffer.line_count();
+        let fit = minimap::lines_fit(rect.3);
+        let line_h = self.line_height();
+        let raw = ((self.scroll_y - self.top_inset - PADDING_TOP) / line_h)
+            .floor()
+            .max(0.0) as usize;
+        // Con envoltura el scroll mide FILAS de pantalla: la franja mapea
+        // líneas lógicas (aproximación aceptable mientras se envuelve).
+        let scroll_line = if self.word_wrap {
+            self.ensure_wrap();
+            let row = raw.min(self.wrap.total_rows() - 1);
+            self.wrap.line_at_row(row)
+        } else {
+            raw.min(total - 1)
+        };
+        let view_lines = ((self.viewport.1 / line_h).ceil() as usize).max(1);
+        let first = minimap::map_first(total, fit, scroll_line, view_lines);
+        minimap::View {
+            rect,
+            first,
+            total,
+            fit,
+            scroll_line,
+            view_lines,
+        }
+    }
+
+    /// Centra la ventana en `line` (click/arrastre sobre el minimap, M27):
+    /// no toca el caret, solo el scroll (con clamp a los extremos).
+    pub fn scroll_to_center_line(&mut self, line: usize) {
+        let line = line.min(self.buffer.line_count() - 1);
+        let line_h = self.line_height();
+        let row = self.row_of_pos(self.buffer.line_to_char(line)) as f32;
+        let vis = (self.viewport.1 / line_h).max(1.0);
+        self.scroll_y = self.top_inset + PADDING_TOP + (row + 0.5 - vis / 2.0) * line_h;
+        self.clamp_scroll();
+    }
+
+    /// Dibuja el minimap de este editor sobre su `rect` (M27): fondo opaco
+    /// (tapa el código que pasa por debajo), filete, ventana visible y las
+    /// líneas del buffer a 2 px con sus colores de sintaxis. Solo se
+    /// dibujan las líneas que caben en la franja.
+    pub fn draw_minimap(&mut self, scene: &mut Scene, rect: (f32, f32, f32, f32)) {
+        let view = self.minimap_view(rect);
+        let (x, y, w, h) = rect;
+        scene
+            .top_quads
+            .push(Quad::new(x, y, w, h, self.theme.panel_bg));
+        scene
+            .top_quads
+            .push(Quad::new(x, y, 1.0, h, self.theme.tab_edge));
+        let (vx, vy, vw, vh) = minimap::viewport_rect(&view);
+        scene
+            .top_quads
+            .push(Quad::new(vx, vy, vw, vh, self.theme.selection));
+
+        let last = (view.first + view.fit).min(view.total - 1);
+        // Mismo pipeline de sintaxis que el editor: la caché de estados se
+        // extiende hasta la última línea de la franja.
+        self.syntax.set_extension(&self.lang);
+        self.syntax.prepare(&mut self.buffer, last);
+        let mini_advance = minimap::FONT * self.advance_ratio;
+        let budget = w - 2.0 * minimap::PAD_X;
+        let max_cells = ((budget / mini_advance).floor() as usize).max(1);
+        for line in view.first..=last {
+            let text = self.buffer.line_text(line);
+            if text.is_empty() {
+                continue;
+            }
+            let ly = y + (line - view.first) as f32 * minimap::LINE_PITCH;
+            let tokens = self.syntax.tokens(line);
+            if tokens.is_empty() {
+                let piece = truncate_cells(&text, max_cells);
+                if !piece.is_empty() {
+                    scene.top_texts.push(TextSpan::new(
+                        piece,
+                        x + minimap::PAD_X,
+                        ly,
+                        minimap::FONT,
+                        self.theme.fg,
+                    ));
+                }
+                continue;
+            }
+            // Columnas visuales de todos los tokens en un recorrido (como
+            // en `build_scene`), recortadas al presupuesto de la franja.
+            let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
+            let columns = movement::visual_columns_at(&text, &starts, self.tab_width);
+            for (token, &cells) in tokens.iter().zip(&columns) {
+                if cells >= max_cells {
+                    break;
+                }
+                let piece = text
+                    .get(token.start..token.end.min(text.len()))
+                    .unwrap_or("");
+                if piece.is_empty() || piece.chars().all(|c| c == '\n') {
+                    continue;
+                }
+                let room = max_cells - cells;
+                let piece = truncate_cells(piece, room);
+                if piece.is_empty() {
+                    continue;
+                }
+                scene.top_texts.push(TextSpan::new(
+                    piece,
+                    x + minimap::PAD_X + cells as f32 * mini_advance,
+                    ly,
+                    minimap::FONT,
+                    token.color,
+                ));
+            }
+        }
+    }
+
     /// Rama de [`Editor::build_scene`] con `word_wrap` activo: recorre FILAS
     /// de pantalla en vez de líneas lógicas, de modo que una línea larga
     /// pinta varias filas y el número de línea solo aparece en la primera.
@@ -2698,6 +2817,19 @@ impl Editor {
         self.scroll_y = self
             .scroll_y
             .clamp(0.0, (content_h - self.viewport.1).max(0.0));
+    }
+}
+
+/// Corta `text` por carácteres para que quepa en `cells` columnas (la
+/// franja del minimap recorta el final de las líneas largas; en miniatura
+/// la diferencia de ancho de un tab no se nota).
+fn truncate_cells(text: &str, cells: usize) -> &str {
+    if text.chars().count() <= cells {
+        return text;
+    }
+    match text.char_indices().nth(cells) {
+        Some((i, _)) => &text[..i],
+        None => text,
     }
 }
 
@@ -4614,5 +4746,116 @@ mod tests {
         // que desplazar y el caret (fila lógica 0) vuelve a caber.
         editor.set_word_wrap(false);
         assert_eq!(editor.scroll_y, 0.0, "una sola línea cabe en 60 px");
+    }
+
+    #[test]
+    fn minimap_view_maps_the_scroll_to_a_window() {
+        let mut editor = Editor::default();
+        let mut bulk = String::new();
+        for i in 0..500 {
+            bulk.push_str(&format!("linea {i}\n"));
+        }
+        editor.insert_text(&bulk);
+        editor.set_viewport(600.0, 340.0);
+        // insert deja el caret al final (scroll automático): volvemos al techo.
+        editor.scroll_y = 0.0;
+        let rect = (500.0, 30.0, 100.0, 340.0);
+
+        let top = editor.minimap_view(rect);
+        assert_eq!(top.first, 0, "arriba del todo la franja muestra el inicio");
+        assert!(top.total >= 500);
+        assert!(top.fit >= 100, "340 px de franja admiten muchas líneas");
+
+        editor.scroll_to_center_line(400);
+        let mid = editor.minimap_view(rect);
+        assert!(
+            mid.scroll_line > 350 && mid.scroll_line < 400,
+            "centrado en 400: scroll_line={} (viewport de {} filas)",
+            mid.scroll_line,
+            mid.view_lines
+        );
+        assert!(mid.first > top.first, "la franja sigue al scroll");
+        let top_y = minimap::viewport_rect(&top).1;
+        let mid_y = minimap::viewport_rect(&mid).1;
+        assert!(
+            mid_y > top_y,
+            "el rect de la ventana baja ({top_y} → {mid_y})"
+        );
+    }
+
+    #[test]
+    fn scroll_to_center_line_clamps_to_both_ends() {
+        let mut editor = Editor::default();
+        editor.insert_text("uno\ndos\ntres\n");
+        editor.set_viewport(600.0, 340.0);
+
+        editor.scroll_to_center_line(0);
+        assert_eq!(editor.scroll_y, 0.0, "arriba: suelo");
+        editor.scroll_to_center_line(9_999);
+        assert!(editor.scroll_y >= 0.0, "sin contenido que ver no baja de 0");
+        editor.scroll_to_center_line(2);
+        assert_eq!(
+            editor.scroll_y, 0.0,
+            "3 líneas no llenan la ventana: no hay scroll"
+        );
+    }
+
+    #[test]
+    fn draw_minimap_draws_fringe_window_and_tiny_lines() {
+        let mut editor = Editor::default();
+        let mut bulk = String::new();
+        for i in 0..40 {
+            bulk.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        editor.insert_text(&bulk);
+        editor.set_viewport(600.0, 340.0);
+        let rect = (500.0, 30.0, 100.0, 340.0);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        editor.draw_minimap(&mut scene, rect);
+
+        assert_eq!(
+            scene.top_quads[0].color,
+            Theme::dark().panel_bg,
+            "fondo opaco de la franja"
+        );
+        assert_eq!((scene.top_quads[0].x, scene.top_quads[0].w), (500.0, 100.0));
+        assert_eq!(scene.top_quads[1].color, Theme::dark().tab_edge, "filete");
+        assert_eq!(
+            scene.top_quads[2].color,
+            Theme::dark().selection,
+            "ventana visible"
+        );
+
+        assert!(!scene.top_texts.is_empty(), "líneas en miniatura");
+        let view = editor.minimap_view(rect);
+        for span in &scene.top_texts {
+            assert_eq!(span.size, minimap::FONT, "2 px por línea");
+            assert!(
+                span.x >= 500.0 && span.x < 600.0,
+                "dentro de la franja ({} px)",
+                span.x
+            );
+            assert!(span.y >= 30.0 && span.y < 370.0, "dentro en y");
+        }
+        assert!(
+            scene.top_texts.len() <= view.total,
+            "cada línea como mucho un span ({} > {})",
+            scene.top_texts.len(),
+            view.total
+        );
+
+        // Líneas largas: los spans se recortan y no invaden la franja.
+        let mut long = Editor::default();
+        long.insert_text(&"x".repeat(500));
+        long.set_viewport(600.0, 340.0);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        long.draw_minimap(&mut scene, rect);
+        for span in &scene.top_texts {
+            assert!(
+                span.x + span.text.chars().count() as f32 * minimap::FONT * long.advance_ratio
+                    <= 600.0,
+                "la línea recortada no se sale"
+            );
+        }
     }
 }

@@ -74,6 +74,9 @@ pub static KEYMAP: &[Binding] = &[
     bind("-", true, false, false, "view.zoom_out"),
     bind("0", true, false, false, "view.zoom_reset"),
     bind(",", true, false, false, "settings.open"),
+    // Minimap (M27): franja de vista previa lateral; Ctrl+B queda libre
+    // para el build system (M28).
+    bind("m", true, false, false, "minimap.toggle"),
 ];
 
 /// Un comando ejecutable desde la paleta.
@@ -249,6 +252,11 @@ pub static COMMANDS: &[Command] = &[
         name: "Restablecer tamaño de fuente (Ctrl+0)",
         category: "Ver",
     },
+    Command {
+        id: "minimap.toggle",
+        name: "Alternar minimap (Ctrl+M)",
+        category: "Ver",
+    },
 ];
 
 /// Normaliza la tecla lógica a la forma del keymap (minúsculas).
@@ -409,6 +417,22 @@ mod tests {
         for command in COMMANDS {
             assert!(keys_for(command.id).is_some(), "sin atajo: {}", command.id);
         }
+    }
+
+    #[test]
+    fn minimap_toggle_binds_ctrl_m() {
+        assert_eq!(keys_for("minimap.toggle").as_deref(), Some("Ctrl+M"));
+        assert_eq!(
+            command_for(mods(true, false, false), &key('m')),
+            Some("minimap.toggle"),
+            "Ctrl+M (sin Shift/Alt) alterna el minimap"
+        );
+        // Ctrl+B queda reservado para el build system (M28).
+        assert_eq!(
+            command_for(mods(true, false, false), &key('b')),
+            None,
+            "Ctrl+B sin usar aún"
+        );
     }
 
     #[test]

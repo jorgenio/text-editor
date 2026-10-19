@@ -35,6 +35,9 @@ pub struct Settings {
     /// ¿Ajustar las líneas largas al ancho del panel (word wrap)? Las
     /// líneas se parten en varias filas de pantalla sin tocar el buffer.
     pub word_wrap: bool,
+    /// ¿Mostrar la franja de vista previa lateral (minimap, M27)? Se
+    /// alterna también desde «Ver → Minimap» y la paleta (Ctrl+M).
+    pub minimap: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +51,7 @@ impl Default for Settings {
             auto_match: true,
             theme: "dark".to_owned(),
             word_wrap: false,
+            minimap: true,
         }
     }
 }
@@ -244,6 +248,9 @@ pub fn default_template() -> &'static str {
 
     // ¿Ajustar las líneas largas al ancho del panel (word wrap)?
     "word_wrap": false,
+
+    // ¿Mostrar la franja de vista previa lateral (minimap)?
+    "minimap": true,
 }
 "#
 }
@@ -366,6 +373,16 @@ mod tests {
             !parse("{\"word_wrap\": false}").unwrap().word_wrap,
             "y desactivar"
         );
+    }
+
+    #[test]
+    fn minimap_defaults_on_and_parses() {
+        assert!(Settings::default().minimap, "por defecto el minimap va");
+        assert!(
+            !parse("{\"minimap\": false}").unwrap().minimap,
+            "se puede apagar"
+        );
+        assert!(parse("{\"minimap\": true}").unwrap().minimap, "y encender");
     }
 
     #[test]

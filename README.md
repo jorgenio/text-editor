@@ -42,6 +42,13 @@ Linux (la CI compueba ambos).
   buffer. El número de línea solo aparece en la primera fila, ↑/↓ y
   PageUp/PageDown recorren las filas visibles conservando la columna, y
   caret, scroll, selecciones y búsqueda comparten esa misma geometría.
+- **Minimap** (preferencia `minimap`, por defecto activo): franja de vista
+  previa a la derecha de cada panel con el código en miniatura (2 px por
+  línea, con los colores de sintaxis) y un rectángulo con la ventana
+  visible; el click centra en esa línea y arrastrarlo hace scroll (sin
+  robar el foco, como la rueda). Se alterna con Ctrl+M o con «Ver →
+  Minimap»; los paneles estrechos (menos de 280 px) se quedan sin franja
+  para no tapar código.
 - Barra de estado inferior con Ln/Col (columna visual), selección,
   tabulado, lenguaje y nombre del archivo; zoom de fuente con
   Ctrl+= / Ctrl+- / Ctrl+0 (solo sesión); Ctrl+Shift+T reabre la última
@@ -134,6 +141,7 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | Dividir panel / Unir paneles | Ctrl+\\ / Ctrl+Shift+\\ |
 | Cambiar tema claro/oscuro | Ctrl+T |
 | Zoom de fuente (+ / − / normal) | Ctrl+= / Ctrl+- / Ctrl+0 |
+| Alternar minimap | Ctrl+M |
 | Abrir preferencias | Ctrl+, |
 
 **Selección múltiple**: Alt+click añade un cursor; Ctrl+Alt+↑/↓ añade
@@ -191,7 +199,10 @@ los fuera de rango se recortan.
     "theme": "dark",
 
     // ¿Ajustar las líneas largas al ancho del panel (word wrap)?
-    "word_wrap": false
+    "word_wrap": false,
+
+    // ¿Mostrar la franja de vista previa lateral (minimap)?
+    "minimap": true
 }
 ```
 

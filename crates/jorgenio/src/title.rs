@@ -102,6 +102,8 @@ const MENUS: &[(&str, &[MenuItem])] = &[
             item("Alejar fuente", Action::Command("view.zoom_out")),
             item("Fuente normal", Action::Command("view.zoom_reset")),
             item("", Action::Separator),
+            item("Minimap", Action::Toggle("minimap")),
+            item("", Action::Separator),
             item("Tema claro/oscuro", Action::Command("theme.toggle")),
         ],
     ),
@@ -434,6 +436,7 @@ fn toggle_on(settings: &Settings, field: &str) -> bool {
         "show_line_numbers" => settings.show_line_numbers,
         "translate_tabs_to_spaces" => settings.translate_tabs_to_spaces,
         "auto_match" => settings.auto_match,
+        "minimap" => settings.minimap,
         _ => false,
     }
 }
@@ -608,10 +611,15 @@ mod tests {
     fn layout_menu_marks_the_current_layout_and_click_returns_it() {
         let mut b = bar();
         let mut s = scene();
-        render_layout(&mut b, &mut s, &Settings::default(), (2, 2));
+        // Sin minimap la única marca del menú Ver es la rejilla activa.
+        let settings = Settings {
+            minimap: false,
+            ..Settings::default()
+        };
+        render_layout(&mut b, &mut s, &settings, (2, 2));
         b.open = Some(2); // Ver
         let mut s = scene();
-        render_layout(&mut b, &mut s, &Settings::default(), (2, 2));
+        render_layout(&mut b, &mut s, &settings, (2, 2));
         let checks: Vec<String> = s
             .top_texts
             .iter()

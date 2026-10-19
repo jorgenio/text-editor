@@ -3,6 +3,7 @@
 mod commands;
 mod editor;
 mod findfiles;
+mod minimap;
 mod palette;
 mod search;
 mod session;
@@ -96,6 +97,8 @@ struct Application {
     drag_active: bool,
     /// Arrastre del divisor activo: Some(eje, última coordenada en ese eje).
     divider_drag: Option<(Divider, f32)>,
+    /// Arrastre del minimap activo (M27): Some(grupo, `first` congelado).
+    minimap_drag: Option<(usize, usize)>,
     /// Icono actual del cursor (para no pisarlo en cada movimiento).
     cursor_icon: CursorIcon,
     /// Barra de título propia con menú embebido (M21, sin decoraciones).
@@ -130,6 +133,7 @@ impl Application {
             drag_origin: None,
             drag_active: false,
             divider_drag: None,
+            minimap_drag: None,
             cursor_icon: CursorIcon::Default,
             titlebar: TitleBar::default(),
         }
@@ -179,6 +183,7 @@ fn field_value(settings: &settings::Settings, field: &str) -> bool {
         "show_line_numbers" => settings.show_line_numbers,
         "translate_tabs_to_spaces" => settings.translate_tabs_to_spaces,
         "auto_match" => settings.auto_match,
+        "minimap" => settings.minimap,
         _ => false,
     }
 }
@@ -349,6 +354,7 @@ fn apply_menu_action(
                     settings.translate_tabs_to_spaces = !settings.translate_tabs_to_spaces;
                 }
                 "auto_match" => settings.auto_match = !settings.auto_match,
+                "minimap" => settings.minimap = !settings.minimap,
                 _ => return false,
             }
             tabs.apply_prefs(settings);
@@ -718,6 +724,15 @@ fn run_command(
             notify(notice, format!("Fuente: {} px", settings.font_size));
             true
         }
+        "minimap.toggle" => {
+            settings.minimap = !settings.minimap;
+            // Solo sesión: para persistir, escríbelo en settings.json.
+            notify(
+                notice,
+                format!("minimap = {}", field_value(settings, "minimap")),
+            );
+            true
+        }
         other => {
             log::warn!("comando desconocido: {other}");
             false
@@ -867,6 +882,15 @@ impl winit::application::ApplicationHandler for Application {
                     }
                 }
                 let mut scene = scene.expect("siempre hay al menos un grupo");
+                // Minimap (M27): franja sobre el código de SU celda (capa
+                // superior); las celdas estrechas se quedan sin franja.
+                if self.settings.minimap {
+                    for (g, &cell) in geometry.iter().enumerate() {
+                        if let Some(rect) = minimap::rect(cell) {
+                            self.tabs.group_active_mut(g).draw_minimap(&mut scene, rect);
+                        }
+                    }
+                }
                 // Tema del frame, calculado UNA vez y compartido por la barra
                 // de estado, los avisos, el menú de título y la paleta (M26).
                 let theme = Theme::from_name(&self.settings.theme);
@@ -1143,6 +1167,26 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
+                // Arrastre del minimap (M27): la ventana sigue al cursor con
+                // el `first` congelado del click (los límites no saltan bajo
+                // el ratón); no roba foco ni selecciona texto.
+                if let Some((g, first)) = self.minimap_drag {
+                    let (vw, vh) = gpu.logical_size();
+                    let (ct, ch) = content_area(vh);
+                    let cells = self.tabs.group_geometry(vw, ct, ch);
+                    if let Some(rect) = minimap::rect(cells[g]) {
+                        let view = self.tabs.group_active_mut(g).minimap_view(rect);
+                        let line = minimap::line_at(
+                            view.y_rel(self.cursor.y),
+                            first,
+                            view.total,
+                            view.fit,
+                        );
+                        self.tabs.group_active_mut(g).scroll_to_center_line(line);
+                    }
+                    gpu.request_redraw();
+                    return;
+                }
                 // Flechas de resize del marco propio y del divisor (con
                 // overlays cerrados; durante un arrastre no se toca).
                 if !self.mouse_down {
@@ -1399,6 +1443,27 @@ impl winit::application::ApplicationHandler for Application {
                     }
                     None => {}
                 }
+                // Franja del minimap (M27): el click centra la ventana en esa
+                // línea y el arrastre la mueve (sin robar el foco, como la
+                // rueda del ratón).
+                let cells = self.tabs.group_geometry(width, ct, ch);
+                if self.settings.minimap
+                    && let Some(g) = minimap::group_at(&cells, self.cursor.x, self.cursor.y)
+                    && let Some(rect) = minimap::rect(cells[g])
+                {
+                    let view = self.tabs.group_active_mut(g).minimap_view(rect);
+                    let line = minimap::line_at(
+                        view.y_rel(self.cursor.y),
+                        view.first,
+                        view.total,
+                        view.fit,
+                    );
+                    self.tabs.group_active_mut(g).scroll_to_center_line(line);
+                    self.minimap_drag = Some((g, view.first));
+                    self.mouse_down = false;
+                    gpu.request_redraw();
+                    return;
+                }
                 // Click en otro panel: ese grupo toma el foco (como Sublime)
                 // y su editor activo coloca el caret.
                 let group = self
@@ -1439,6 +1504,7 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.window().set_cursor(CursorIcon::Default);
                     self.cursor_icon = CursorIcon::Default;
                 }
+                self.minimap_drag = None;
                 self.mouse_down = false;
                 self.drag_active = false;
                 self.drag_origin = None;
@@ -1607,6 +1673,49 @@ mod tests {
         );
         let (text, _) = notice.take().expect("aviso de error");
         assert!(text.starts_with("Error al guardar"), "{text}");
+    }
+
+    #[test]
+    fn minimap_toggle_flips_setting_with_notice() {
+        let mut tabs = Tabs::new(Editor::default());
+        let mut clipboard = None;
+        let mut palette = Palette::default();
+        let mut search = SearchBar::default();
+        let mut findfiles = FindFiles::default();
+        let mut settings = settings::Settings::default();
+        let mut notice: Option<(String, Instant)> = None;
+
+        assert!(settings.minimap, "por defecto la franja va visible");
+        let redraw = run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut findfiles,
+            &mut settings,
+            &mut notice,
+            "minimap.toggle",
+        );
+        assert!(redraw, "pide repintar");
+        assert!(!settings.minimap, "se apaga");
+        let (text, _) = notice.take().expect("aviso del toggle");
+        assert_eq!(text, "minimap = false", "{text}");
+
+        run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut findfiles,
+            &mut settings,
+            &mut notice,
+            "minimap.toggle",
+        );
+        assert!(settings.minimap, "vuelve a encender");
+        assert_eq!(
+            notice.take().map(|(t, _)| t).as_deref(),
+            Some("minimap = true")
+        );
     }
 
     #[test]

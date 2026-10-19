@@ -38,6 +38,12 @@ pub struct Settings {
     /// ¿Mostrar la franja de vista previa lateral (minimap, M27)? Se
     /// alterna también desde «Ver → Minimap» y la paleta (Ctrl+M).
     pub minimap: bool,
+    /// ¿Dibujar los espacios (`·`) y tabuladores (`→`) del código (M29)?
+    /// Se alterna también desde «Preferencias → Espacios y tabuladores».
+    pub show_whitespace: bool,
+    /// ¿Recortar los espacios/tabuladores finales de cada línea al guardar
+    /// (M29)? La operación es una sola transacción de deshacer.
+    pub trim_on_save: bool,
     /// Tareas de build (M28, Ctrl+B): la primera cuya `ext` encaje con el
     /// archivo activo (o la primera comodín, sin `ext`) se lanza en un
     /// shell con su salida en el panel inferior.
@@ -85,6 +91,8 @@ impl Default for Settings {
             theme: "dark".to_owned(),
             word_wrap: false,
             minimap: true,
+            show_whitespace: false,
+            trim_on_save: false,
             builds: Vec::new(),
         }
     }
@@ -320,6 +328,13 @@ pub fn default_template() -> &'static str {
     // ¿Mostrar la franja de vista previa lateral (minimap)?
     "minimap": true,
 
+    // ¿Dibujar los espacios (·) y tabuladores (→) del código?
+    "show_whitespace": false,
+
+    // ¿Recortar espacios/tabuladores finales de cada línea al guardar?
+    // (una sola transacción de deshacer; por defecto apagado)
+    "trim_on_save": false,
+
     // Tareas de build (Ctrl+B): se lanzan en un shell (cmd /C o sh -c) con
     // «working_dir» como directorio de trabajo (vacío = el del archivo
     // activo). «ext» empareja con la extensión del archivo abierto (vacío
@@ -461,6 +476,23 @@ mod tests {
             "se puede apagar"
         );
         assert!(parse("{\"minimap\": true}").unwrap().minimap, "y encender");
+    }
+
+    #[test]
+    fn whitespace_and_trim_default_off_and_template_documents_them() {
+        let default = Settings::default();
+        assert!(
+            !default.show_whitespace && !default.trim_on_save,
+            "por defecto no se dibujan ni se recorta nada"
+        );
+        let on = parse(r#"{"show_whitespace": true, "trim_on_save": true}"#).expect("json");
+        assert!(on.show_whitespace, "se activa el dibujo de espacios");
+        assert!(on.trim_on_save, "se activa el recorte al guardar");
+        let template = default_template();
+        assert!(
+            template.contains("\"show_whitespace\"") && template.contains("\"trim_on_save\""),
+            "la plantilla documenta ambas opciones"
+        );
     }
 
     #[test]

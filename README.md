@@ -49,6 +49,12 @@ Linux (la CI compueba ambos).
   robar el foco, como la rueda). Se alterna con Ctrl+M o con «Ver →
   Minimap»; los paneles estrechos (menos de 280 px) se quedan sin franja
   para no tapar código.
+- **Espacios visibles y recorte al guardar** (M29): con `show_whitespace`
+  activo (o «Preferencias → Espacios y tabuladores») cada espacio se dibuja
+  como `·` y cada tabulador como `→`, también con ajuste de línea; con
+  `trim_on_save`, guardar recorta los espacios/tabuladores finales de cada
+  línea en el buffer como UNA sola operación de deshacer (ambos apagados
+  por defecto; ver [preferencias](#preferencias-settingsjson)).
 - **Builds** (Ctrl+B o «Herramientas → Ejecutar build»): la tarea definida
   para la extensión del archivo actual en `builds` de `settings.json` corre
   en un hilo aparte (la ventana no se congela) y su salida aparece en un
@@ -218,6 +224,13 @@ los fuera de rango se recortan.
 
     // ¿Mostrar la franja de vista previa lateral (minimap)?
     "minimap": true,
+
+    // ¿Dibujar los espacios (·) y tabuladores (→) del código?
+    "show_whitespace": false,
+
+    // ¿Recortar espacios/tabuladores finales de cada línea al guardar?
+    // (una sola transacción de deshacer; por defecto apagado)
+    "trim_on_save": false,
 
     // Tareas de build (Ctrl+B): se lanzan en un shell (cmd /C o sh -c) con
     // «working_dir» como directorio de trabajo (vacío = el del archivo

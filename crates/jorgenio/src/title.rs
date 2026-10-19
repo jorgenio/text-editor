@@ -113,6 +113,7 @@ const MENUS: &[(&str, &[MenuItem])] = &[
             item("Abrir settings.json", Action::Command("settings.open")),
             item("", Action::Separator),
             item("Números de línea", Action::Toggle("show_line_numbers")),
+            item("Espacios y tabuladores", Action::Toggle("show_whitespace")),
             item(
                 "Tabulador → espacios",
                 Action::Toggle("translate_tabs_to_spaces"),
@@ -441,6 +442,7 @@ fn toggle_on(settings: &Settings, field: &str) -> bool {
         "translate_tabs_to_spaces" => settings.translate_tabs_to_spaces,
         "auto_match" => settings.auto_match,
         "minimap" => settings.minimap,
+        "show_whitespace" => settings.show_whitespace,
         _ => false,
     }
 }
@@ -589,9 +591,10 @@ mod tests {
     fn toggle_items_show_check_only_when_setting_on() {
         let mut s = scene();
         let mut b = bar();
-        // Por defecto solo show_line_numbers está activo; activamos auto_match.
+        // Por defecto solo show_line_numbers está activo; activamos dos más.
         let settings = Settings {
             auto_match: true,
+            show_whitespace: true,
             ..Settings::default()
         };
         render_into(&mut b, &mut s, &settings);
@@ -604,7 +607,11 @@ mod tests {
             .filter(|t| t.text.starts_with('\u{2713}'))
             .map(|t| t.text.clone())
             .collect();
-        assert_eq!(checks.len(), 2, "números de línea + auto_match: {checks:?}");
+        assert_eq!(
+            checks.len(),
+            3,
+            "números de línea + auto_match + espacios: {checks:?}"
+        );
         assert!(
             checks.iter().any(|c| c.contains("Números")),
             "números de línea marcado"
@@ -612,6 +619,10 @@ mod tests {
         assert!(
             checks.iter().any(|c| c.contains("Auto-match")),
             "auto_match marcado"
+        );
+        assert!(
+            checks.iter().any(|c| c.contains("Espacios")),
+            "espacios y tabuladores marcado"
         );
     }
 

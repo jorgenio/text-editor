@@ -187,6 +187,12 @@ pub struct Editor {
     tab_width: usize,
     /// ¿Dibujar los números de línea? (`show_line_numbers` de preferencias).
     show_line_numbers: bool,
+    /// ¿Dibujar los espacios (`·`) y tabuladores (`→`) del código?
+    /// (`show_whitespace` de preferencias; dibujo, no toca el buffer).
+    show_whitespace: bool,
+    /// ¿Recortar espacios/tabuladores finales de cada línea al guardar?
+    /// (`trim_on_save` de preferencias; M29, por defecto apagado).
+    trim_on_save: bool,
     /// ¿Tabulador escribe espacios? (`translate_tabs_to_spaces` de prefs).
     translate_tabs_to_spaces: bool,
     /// ¿Auto-cerrar pares de paréntesis/comillas? (`auto_match` de prefs).
@@ -253,6 +259,8 @@ impl Default for Editor {
             left_inset: 0.0,
             tab_width: TAB_WIDTH,
             show_line_numbers: true,
+            show_whitespace: false,
+            trim_on_save: false,
             translate_tabs_to_spaces: false,
             auto_match: true,
             font_size: FONT_SIZE,
@@ -354,6 +362,7 @@ impl Editor {
             log::warn!("guardar sin ruta: usa save_as con el diálogo");
             return Ok(());
         };
+        self.prepare_save();
         self.buffer.save(&path)
     }
 
@@ -362,7 +371,45 @@ impl Editor {
     pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
         self.lang = SyntaxHighlighter::detect(&path);
         self.path = Some(path.clone());
+        self.prepare_save();
         self.buffer.save(&path)
+    }
+
+    /// Recortes comunes a guardar (`trim_on_save`, M29): se hacen EN EL
+    /// BUFFER antes de escribir, para que disco y editor queden idénticos,
+    /// el "●" se apague al terminar y la operación sea deshacible.
+    fn prepare_save(&mut self) {
+        if self.trim_on_save {
+            self.trim_trailing_whitespace();
+        }
+    }
+
+    /// Quita los espacios/tabuladores finales de cada línea. Los rangos se
+    /// aplican de atrás hacia delante (una sola transacción de undo) para
+    /// no desplazar los offsets aún por tocar. Devuelve cuántas líneas
+    /// recortó; 0 = nada que hacer y no se crea entrada de deshacer.
+    pub fn trim_trailing_whitespace(&mut self) -> usize {
+        let line_count = self.buffer.line_count();
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for line in 0..line_count {
+            let text = self.buffer.line_text(line);
+            let body = trim_line_ending(&text);
+            let trimmed = body.trim_end_matches([' ', '\t']);
+            if trimmed.len() < body.len() {
+                let base = self.buffer.line_to_char(line);
+                ranges.push(base + trimmed.chars().count()..base + body.chars().count());
+            }
+        }
+        if ranges.is_empty() {
+            return 0;
+        }
+        let count = ranges.len();
+        self.with_transaction(|editor| {
+            for range in ranges.iter().rev() {
+                editor.replace_match(range, "");
+            }
+        });
+        count
     }
 
     pub fn set_viewport(&mut self, w: f32, h: f32) {
@@ -387,6 +434,14 @@ impl Editor {
 
     pub fn set_show_line_numbers(&mut self, show: bool) {
         self.show_line_numbers = show;
+    }
+
+    pub fn set_show_whitespace(&mut self, on: bool) {
+        self.show_whitespace = on;
+    }
+
+    pub fn set_trim_on_save(&mut self, on: bool) {
+        self.trim_on_save = on;
     }
 
     pub fn set_translate_tabs_to_spaces(&mut self, translate: bool) {
@@ -2180,27 +2235,45 @@ impl Editor {
             if tokens.is_empty() {
                 scene
                     .texts
-                    .push(TextSpan::new(text, cx, y, font, self.theme.fg));
-                continue;
-            }
-            // Columnas de TODOS los tokens en un solo recorrido de la línea
-            // (antes: visual_column por token = O(tokens × columna) por frame).
-            let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
-            let columns = movement::visual_columns_at(&text, &starts, tab_width);
-            for (token, &cells) in tokens.iter().zip(&columns) {
-                let piece = text
-                    .get(token.start..token.end.min(text.len()))
-                    .unwrap_or("");
-                if piece.is_empty() || piece.chars().all(|c| c == '\n') {
-                    continue;
+                    .push(TextSpan::new(text.as_str(), cx, y, font, self.theme.fg));
+            } else {
+                // Columnas de TODOS los tokens en un solo recorrido de la línea
+                // (antes: visual_column por token = O(tokens × columna) por frame).
+                let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
+                let columns = movement::visual_columns_at(&text, &starts, tab_width);
+                for (token, &cells) in tokens.iter().zip(&columns) {
+                    let piece = text
+                        .get(token.start..token.end.min(text.len()))
+                        .unwrap_or("");
+                    if piece.is_empty() || piece.chars().all(|c| c == '\n') {
+                        continue;
+                    }
+                    scene.texts.push(TextSpan::new(
+                        piece,
+                        cx + cells as f32 * advance,
+                        y,
+                        font,
+                        token.color,
+                    ));
                 }
-                scene.texts.push(TextSpan::new(
-                    piece,
-                    cx + cells as f32 * advance,
-                    y,
-                    font,
-                    token.color,
-                ));
+            }
+            // Espacios y tabuladores dibujados (`show_whitespace`, M29):
+            // por ENCIMA de los glifos, en el tono apagado del tema.
+            if self.show_whitespace {
+                push_ws_marks(
+                    &mut scene,
+                    &text,
+                    WsCtx {
+                        base_x: cx,
+                        y,
+                        font,
+                        advance,
+                        from: 0,
+                        to: usize::MAX,
+                        tab_width,
+                        color: self.theme.dim,
+                    },
+                );
             }
         }
 
@@ -2409,31 +2482,50 @@ impl Editor {
                         .texts
                         .push(TextSpan::new(piece, cx, y, font, self.theme.fg));
                 }
-                continue;
+            } else {
+                // Columnas de todos los tokens de la línea en dos recorridos
+                // (uno de inicios, otro de fines) y recorte a la fila actual.
+                let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
+                let ends: Vec<usize> = tokens.iter().map(|token| token.end).collect();
+                let start_cells = movement::visual_columns_at(&text, &starts, tab_width);
+                let end_cells = movement::visual_columns_at(&text, &ends, tab_width);
+                for (token, (&start, &end)) in tokens.iter().zip(start_cells.iter().zip(&end_cells))
+                {
+                    let cell_from = start.max(cells_from);
+                    let cell_to = end.min(cells_to);
+                    if cell_from >= cell_to {
+                        continue;
+                    }
+                    let piece = row_slice(&text, cell_from, cell_to, tab_width);
+                    if piece.is_empty() || piece.chars().all(|c| c == '\n') {
+                        continue;
+                    }
+                    scene.texts.push(TextSpan::new(
+                        piece,
+                        cx + (cell_from - cells_from) as f32 * advance,
+                        y,
+                        font,
+                        token.color,
+                    ));
+                }
             }
-            // Columnas de todos los tokens de la línea en dos recorridos
-            // (uno de inicios, otro de fines) y recorte a la fila actual.
-            let starts: Vec<usize> = tokens.iter().map(|token| token.start).collect();
-            let ends: Vec<usize> = tokens.iter().map(|token| token.end).collect();
-            let start_cells = movement::visual_columns_at(&text, &starts, tab_width);
-            let end_cells = movement::visual_columns_at(&text, &ends, tab_width);
-            for (token, (&start, &end)) in tokens.iter().zip(start_cells.iter().zip(&end_cells)) {
-                let cell_from = start.max(cells_from);
-                let cell_to = end.min(cells_to);
-                if cell_from >= cell_to {
-                    continue;
-                }
-                let piece = row_slice(&text, cell_from, cell_to, tab_width);
-                if piece.is_empty() || piece.chars().all(|c| c == '\n') {
-                    continue;
-                }
-                scene.texts.push(TextSpan::new(
-                    piece,
-                    cx + (cell_from - cells_from) as f32 * advance,
-                    y,
-                    font,
-                    token.color,
-                ));
+            // Marcas de whitespace recortadas a la ventana de la fila
+            // (M29): un espacio partido por el corte sigue en su sitio.
+            if self.show_whitespace {
+                push_ws_marks(
+                    scene,
+                    &text,
+                    WsCtx {
+                        base_x: cx,
+                        y,
+                        font,
+                        advance,
+                        from: cells_from,
+                        to: cells_to,
+                        tab_width,
+                        color: self.theme.dim,
+                    },
+                );
             }
         }
 
@@ -2874,6 +2966,76 @@ fn row_slice(text: &str, from: usize, to: usize, tab_width: usize) -> &str {
     let start = movement::byte_at_char(text, movement::char_col_at_visual(text, from, tab_width));
     let end = movement::byte_at_char(text, movement::char_col_at_visual(text, to, tab_width));
     text.get(start..end).unwrap_or("")
+}
+
+/// Marcas de espacio (`·`) y tabulador (`→`) en las celdas visuales
+/// `[from, to)` de `text` (`show_whitespace`, M29). `base_x` es la x de la
+/// celda `from`: sin envoltura es la del código y `from`=0; con envoltura,
+/// la de la fila actual y `from`/`to` su ventana de celdas.
+///
+/// Los espacios contiguos van en UN span — la fuente es monoespaciada, su
+/// avance es idéntico al del espacio — y cada tabulador en el suyo (ocupa
+/// hasta la siguiente parada, nunca es contiguo a lo que le sigue).
+#[derive(Clone, Copy)]
+struct WsCtx {
+    base_x: f32,
+    y: f32,
+    font: f32,
+    advance: f32,
+    from: usize,
+    to: usize,
+    tab_width: usize,
+    color: (u8, u8, u8),
+}
+
+fn push_ws_marks(scene: &mut Scene, text: &str, ctx: WsCtx) {
+    let ws: Vec<usize> = text.match_indices([' ', '\t']).map(|(i, _)| i).collect();
+    if ws.is_empty() {
+        return;
+    }
+    // Columnas de todos los huecos en UN recorrido de grafemas de la línea.
+    let cells = movement::visual_columns_at(text, &ws, ctx.tab_width);
+    let window = ctx.from..ctx.to;
+    let mut i = 0;
+    while i < ws.len() {
+        let cell = cells[i];
+        if text.as_bytes()[ws[i]] == b'\t' {
+            if window.contains(&cell) {
+                scene.texts.push(TextSpan::new(
+                    "→",
+                    ctx.base_x + (cell - ctx.from) as f32 * ctx.advance,
+                    ctx.y,
+                    ctx.font,
+                    ctx.color,
+                ));
+            }
+            i += 1;
+            continue;
+        }
+        // Racha de espacios contiguos y visibles en esta ventana.
+        let start = cell;
+        let mut len = 0;
+        while i < ws.len()
+            && text.as_bytes()[ws[i]] == b' '
+            && cells[i] == start + len
+            && window.contains(&cells[i])
+        {
+            len += 1;
+            i += 1;
+        }
+        if len > 0 {
+            scene.texts.push(TextSpan::new(
+                "·".repeat(len),
+                ctx.base_x + (start - ctx.from) as f32 * ctx.advance,
+                ctx.y,
+                ctx.font,
+                ctx.color,
+            ));
+        } else {
+            // Espacio fuera de la ventana (otra fila): se salta sin bucle.
+            i += 1;
+        }
+    }
 }
 
 /// Intersección de las líneas `first..=last` con el rango visible
@@ -4379,6 +4541,94 @@ mod tests {
         // Sin ruta, el título usa el nombre genérico.
         let blank = Editor::default();
         assert_eq!(blank.tab_label(), "sin título");
+    }
+
+    #[test]
+    fn trim_on_save_cuts_trailing_ws_as_one_undo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.txt");
+        let mut editor = Editor::from_cli(path.clone());
+        editor.insert_text("hola  \n\tmango\t \nsin");
+        editor.set_trim_on_save(true);
+        editor.save().expect("guarda");
+
+        let on_disk = std::fs::read_to_string(&path).expect("disco");
+        assert_eq!(on_disk, "hola\n\tmango\nsin", "sin espacios finales");
+        assert_eq!(editor.text(), on_disk, "buffer y disco idénticos");
+        assert!(!editor.dirty(), "guardar limpia la marca");
+
+        // UNA transacción: un solo deshacer restaura todos los blancos.
+        assert!(editor.undo(), "deshace el recorte");
+        assert_eq!(editor.text(), "hola  \n\tmango\t \nsin");
+        assert!(editor.dirty(), "deshacer vuelve a marcar cambios");
+    }
+
+    #[test]
+    fn trim_is_a_noop_when_there_is_nothing_to_cut() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("limpio.txt");
+        let mut editor = Editor::default();
+        editor.insert_text("limpio\n\tsangría\n");
+        editor.save_as(path).expect("guarda");
+        assert!(!editor.dirty(), "recién guardado");
+
+        assert_eq!(editor.trim_trailing_whitespace(), 0, "nada que recortar");
+        assert!(!editor.dirty(), "sin cambios no se marca sucio");
+    }
+
+    #[test]
+    fn show_whitespace_draws_marks_in_both_layouts() {
+        let mut editor = Editor::default();
+        editor.insert_text("a \tb");
+        editor.scroll_y = 0.0;
+
+        let plain = editor.build_scene((600.0, 200.0), 1.0);
+        assert!(
+            !plain
+                .texts
+                .iter()
+                .any(|s| s.text.starts_with('·') || s.text == "→"),
+            "apagado no dibuja marcas"
+        );
+
+        editor.set_show_whitespace(true);
+        let shown = editor.build_scene((600.0, 200.0), 1.0);
+        let dot = shown
+            .texts
+            .iter()
+            .find(|s| s.text == "·")
+            .expect("marca del espacio");
+        assert_eq!(dot.x, CODE_X + FONT_SIZE, "el espacio está en la celda 1");
+        assert_eq!(dot.color, Theme::dark().dim, "tono apagado del tema");
+        let arrow = shown
+            .texts
+            .iter()
+            .find(|s| s.text == "→")
+            .expect("marca del tabulador");
+        assert_eq!(
+            arrow.x,
+            CODE_X + 2.0 * FONT_SIZE,
+            "el tabulador empieza en la celda 2"
+        );
+
+        // Con envoltura las marcas se recortan a SU fila: ninguna llega
+        // más allá del ancho visible (una celda de la 2ª fila vale como
+        // la 1ª de la 1ª). El ancho de fila sale del viewport, no del
+        // parámetro del frame.
+        editor.set_viewport(600.0, 200.0);
+        editor.set_word_wrap(true);
+        editor.insert_text(&format!("\n{}", "x ".repeat(60)));
+        let wrapped = editor.build_scene((600.0, 200.0), 1.0);
+        let max_dot_x = wrapped
+            .texts
+            .iter()
+            .filter(|s| s.text.starts_with('·'))
+            .map(|s| s.x)
+            .fold(0.0, f32::max);
+        assert!(
+            max_dot_x > 0.0 && max_dot_x < CODE_X + 40.0 * FONT_SIZE,
+            "las marcas viven dentro de su fila: {max_dot_x}"
+        );
     }
 
     /// Bench manual: `cargo test bench_build_scene -- --ignored --nocapture`.

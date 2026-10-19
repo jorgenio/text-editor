@@ -490,6 +490,8 @@ impl Tabs {
             for editor in &mut group.list {
                 editor.set_tab_width(prefs.tab_width);
                 editor.set_show_line_numbers(prefs.show_line_numbers);
+                editor.set_show_whitespace(prefs.show_whitespace);
+                editor.set_trim_on_save(prefs.trim_on_save);
                 editor.set_font_size(prefs.font_size);
                 editor.set_translate_tabs_to_spaces(prefs.translate_tabs_to_spaces);
                 editor.set_auto_match(prefs.auto_match);

@@ -189,6 +189,7 @@ fn field_value(settings: &settings::Settings, field: &str) -> bool {
         "translate_tabs_to_spaces" => settings.translate_tabs_to_spaces,
         "auto_match" => settings.auto_match,
         "minimap" => settings.minimap,
+        "show_whitespace" => settings.show_whitespace,
         _ => false,
     }
 }
@@ -361,6 +362,7 @@ fn apply_menu_action(
                 }
                 "auto_match" => settings.auto_match = !settings.auto_match,
                 "minimap" => settings.minimap = !settings.minimap,
+                "show_whitespace" => settings.show_whitespace = !settings.show_whitespace,
                 _ => return false,
             }
             tabs.apply_prefs(settings);

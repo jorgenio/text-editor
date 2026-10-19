@@ -48,6 +48,8 @@ pub static KEYMAP: &[Binding] = &[
     bind("x", true, false, false, "edit.cut"),
     bind("v", true, false, false, "edit.paste"),
     bind("a", true, false, false, "edit.select_all"),
+    // Ctrl+Shift+A: expandir la selección al par de corchetes (M30).
+    bind("a", true, true, false, "edit.expand_bracket"),
     bind("d", true, false, false, "edit.select_next_occurrence"),
     bind("k", true, true, false, "edit.delete_line"),
     bind("d", true, true, false, "edit.duplicate_line"),
@@ -151,6 +153,11 @@ pub static COMMANDS: &[Command] = &[
     Command {
         id: "edit.select_all",
         name: "Seleccionar todo",
+        category: "Selección",
+    },
+    Command {
+        id: "edit.expand_bracket",
+        name: "Expandir selección al par de corchetes",
         category: "Selección",
     },
     Command {
@@ -443,6 +450,24 @@ mod tests {
             command_for(mods(true, false, false), &key('n')),
             Some("file.new"),
             "Ctrl+N sigue mapeado (sanidad)"
+        );
+    }
+
+    #[test]
+    fn bracket_expansion_binds_ctrl_shift_a() {
+        assert_eq!(
+            keys_for("edit.expand_bracket").as_deref(),
+            Some("Ctrl+Shift+A")
+        );
+        assert_eq!(
+            command_for(mods(true, true, false), &key('a')),
+            Some("edit.expand_bracket"),
+            "Ctrl+Shift+A expande al par (M30)"
+        );
+        assert_eq!(
+            command_for(mods(true, false, false), &key('a')),
+            Some("edit.select_all"),
+            "Ctrl+A sigue seleccionando todo"
         );
     }
 

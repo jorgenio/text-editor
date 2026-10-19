@@ -77,6 +77,10 @@ const MENUS: &[(&str, &[MenuItem])] = &[
                 "Siguiente coincidencia",
                 Action::Command("edit.select_next_occurrence"),
             ),
+            item(
+                "Expandir selección al par",
+                Action::Command("edit.expand_bracket"),
+            ),
             item("", Action::Separator),
             item("Borrar línea", Action::Command("edit.delete_line")),
             item("Duplicar línea", Action::Command("edit.duplicate_line")),

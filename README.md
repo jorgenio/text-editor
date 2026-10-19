@@ -143,6 +143,7 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | Palabra izquierda / derecha | Ctrl+← / Ctrl+→ |
 | Borrar palabra | Ctrl+Backspace / Ctrl+Delete |
 | Expandir selección a la línea | Ctrl+L |
+| Expandir selección al par | Ctrl+Shift+A |
 | Unir con la línea siguiente | Ctrl+J |
 | Mover línea arriba / abajo | Ctrl+Shift+↑ / Ctrl+Shift+↓ |
 | Borrar línea | Ctrl+Shift+K |
@@ -160,6 +161,9 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 
 **Selección múltiple**: Alt+click añade un cursor; Ctrl+Alt+↑/↓ añade
 cursores arriba/abajo; doble click selecciona la palabra y triple la línea.
+Ctrl+Shift+A crece la selección al par de corchetes `()[]{}` que la
+envuelve (vacío → su contenido, contenido → englobando los corchetes, y
+así sucesivamente hacia fuera; con varios cursores cada uno crece solo).
 
 **Dentro de la barra de buscar/reemplazar**: Enter o F3 van a la siguiente
 coincidencia (con Shift, a la anterior), ↑/↓ también navegan, Tab salta de

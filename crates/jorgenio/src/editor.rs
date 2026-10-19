@@ -1156,6 +1156,43 @@ impl Editor {
         self.scroll_into_view();
     }
 
+    /// Ctrl+Shift+A: crece la selección hasta el par de corchetes que la
+    /// envuelve —vacía → su contenido, contenido → englobando los
+    /// corchetes, ya englobados → contenido del par exterior—. Con varios
+    /// cursores cada uno crece por su cuenta (como Ctrl+L). `true` = hubo
+    /// cambio (repintar).
+    pub fn expand_to_bracket(&mut self) -> bool {
+        let mut changed = false;
+        let mut cursors = Vec::with_capacity(self.cursors.len());
+        for cursor in &self.cursors {
+            let range = cursor.range();
+            let mut anchor = range.start;
+            let mut caret = range.end;
+            if let Some((open, close)) = enclosing_pair(&self.buffer, range.start, range.end) {
+                if (range.start, range.end) == (open + 1, close) {
+                    // Ya el contenido: ahora engloba los corchetes.
+                    anchor = open;
+                    caret = close + 1;
+                } else {
+                    // Vacía, arbitraria o ya englobada: el contenido del
+                    // par que la envuelve (crece hacia fuera).
+                    anchor = open + 1;
+                    caret = close;
+                }
+            }
+            changed |= anchor != cursor.anchor || caret != cursor.caret;
+            cursors.push(Cursor { anchor, caret });
+        }
+        if !changed {
+            return false;
+        }
+        self.cursors = cursors;
+        self.sort_and_merge();
+        self.reset_caret_blink();
+        self.scroll_into_view();
+        true
+    }
+
     /// Ctrl+J: une la línea actual con la siguiente (quita el `\n` y el
     /// sangrado de la siguiente; pone un espacio si ambas tienen texto).
     pub fn join_lines(&mut self) {
@@ -2956,6 +2993,53 @@ fn wrap_vertical_move(
     buffer.line_to_char(target_line) + char_col
 }
 
+/// Tope de escaneo en cada dirección al buscar el par que envuelve (M30):
+/// con un buffer desequilibrado el recorrido no se hunde en el archivo.
+const BRACKET_SCAN_LIMIT: usize = 64 * 1024;
+
+/// Índices `(apertura, cierre)` de los corchetes `()[]{}` que envuelven
+/// `start..end` (M30). Hacia atrás se saltan los pares ya cerrados antes
+/// de la selección; hacia delante, el primer cierre con la pila vacía es
+/// el suyo. No es un parser: tolera anidamientos malformados y cadenas o
+/// comentarios con corchetes sueltos pueden confundirlo.
+fn enclosing_pair(buffer: &Buffer, start: usize, end: usize) -> Option<(usize, usize)> {
+    let len = buffer.len_chars();
+    let from = start.saturating_sub(BRACKET_SCAN_LIMIT);
+    let mut depth = 0usize;
+    let mut open = None;
+    let mut pos = start;
+    for ch in buffer.text_range(from..start).chars().rev() {
+        pos -= 1;
+        match ch {
+            ')' | ']' | '}' => depth += 1,
+            '(' | '[' | '{' => {
+                if depth == 0 {
+                    open = Some(pos);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let to = end.saturating_add(BRACKET_SCAN_LIMIT).min(len);
+    let mut depth = 0usize;
+    for (i, ch) in buffer.text_range(end..to).chars().enumerate() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth == 0 {
+                    return Some((open, end + i));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Subcadena de `text` que ocupa las celdas visuales `[from, to)` de la
 /// línea, recortada a ellas (nunca parte un glifo: si el límite cae en
 /// medio, la media celda decide). Vacía si el tramo no tiene texto.
@@ -3389,6 +3473,40 @@ mod tests {
         assert_eq!(editor.primary().range(), 0..12, "y a la última (sin \\n)");
         editor.expand_to_line();
         assert_eq!(editor.primary().range(), 0..12, "en el final no crece");
+    }
+
+    #[test]
+    fn expand_to_bracket_grows_inner_then_brackets_then_outward() {
+        let mut editor = Editor::default();
+        editor.insert_text("fn main() { if x { y(1) } }");
+        editor.cursors = vec![Cursor::new(21)]; // sobre el '1' de y(1)
+        assert!(editor.expand_to_bracket(), "hay par que envuelve");
+        assert_eq!(editor.primary().range(), 21..22, "contenido de y(1)");
+        assert!(editor.expand_to_bracket());
+        assert_eq!(editor.primary().range(), 20..23, "engloba los paréntesis");
+        assert!(editor.expand_to_bracket());
+        assert_eq!(editor.primary().range(), 18..24, "contenido de las llaves");
+        assert!(editor.expand_to_bracket());
+        assert_eq!(editor.primary().range(), 17..25, "engloba las llaves");
+        assert!(editor.expand_to_bracket());
+        assert_eq!(
+            editor.primary().range(),
+            11..26,
+            "contenido del par de llaves mayor"
+        );
+        assert!(editor.expand_to_bracket());
+        assert_eq!(editor.primary().range(), 10..27, "y engloba ese par");
+        assert!(!editor.expand_to_bracket(), "en el tope no crece más");
+        assert_eq!(editor.primary().range(), 10..27, "se queda donde estaba");
+    }
+
+    #[test]
+    fn expand_to_bracket_needs_an_enclosing_pair() {
+        let mut editor = Editor::default();
+        editor.insert_text("sin paréntesis aquí");
+        editor.cursors = vec![Cursor::new(5)];
+        assert!(!editor.expand_to_bracket(), "no hay pares: no-op");
+        assert_eq!(editor.primary().range(), 5..5, "la selección no se mueve");
     }
 
     #[test]

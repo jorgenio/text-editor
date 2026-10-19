@@ -657,6 +657,7 @@ fn run_command(
             tabs.active_mut().expand_to_line();
             true
         }
+        "edit.expand_bracket" => tabs.active_mut().expand_to_bracket(),
         "edit.join_lines" => {
             tabs.active_mut().join_lines();
             true

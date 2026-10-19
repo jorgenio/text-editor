@@ -1,0 +1,84 @@
+name: Release
+
+# Compila los binarios de Windows y Linux en release y los adjunta a la
+# release de GitHub del tag (v*). Si la release no existe aún, la crea con
+# notas generadas; si ya existe (p. ej. creada con `gh release create`),
+# solo sube los assets (idempotente: --clobber las reemplaza). También se
+# puede lanzar a mano sobre un tag ya publicado (backfill de binarios):
+#   gh workflow run release.yml --ref vX.Y.Z
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache de cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compilar (release)
+        run: cargo build --release --locked
+
+      - name: Empaquetar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "jorgenio-${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/jorgenio.exe $dir/
+          Copy-Item README.md $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Empaquetar (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir="jorgenio-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "$dir"
+          cp target/release/jorgenio "$dir/"
+          cp README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+
+      - name: Subir artefactos
+        uses: actions/upload-artifact@v4
+        with:
+          name: binarios-${{ matrix.os }}
+          path: |
+            *.zip
+            *.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar binarios
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Crear release (si falta) y adjuntar binarios
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            dist/* --clobber

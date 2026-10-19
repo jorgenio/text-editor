@@ -301,6 +301,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Cada tag `v*` dispara el workflow **Release**, que compila en release para
+**Windows** (`jorgenio.exe` en un `.zip`) y **Linux** (binario en un
+`.tar.gz`) y los adjunta a la release de GitHub del mismo nombre; si la
+release no existe, la crea con notas generadas.
+
 La CI (`.github/workflows/ci.yml`) ejecuta esos tres pasos en `push` a
 `main` y en pull requests.
 

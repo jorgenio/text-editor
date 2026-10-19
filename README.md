@@ -14,7 +14,9 @@ Linux (la CI compueba ambos).
 - Pestañas y **división de paneles** (Ctrl+\\): el menú «Ver» cambia el
   reparto (una columna, dos columnas, dos filas o **rejilla 2×2**) y sus
   **divisores arrastrables** reparten el alto y el ancho a medida
-  (mínimo 80 px por panel y 62 px por fila); foco por panel con el ratón.
+  (mínimo 80 px por panel y 62 px por fila); foco por panel con el ratón
+  y **× de cierre** en cada pestaña (visible en la activa o bajo el
+  ratón, con el cursor en forma de mano sobre ella).
 - Selección múltiple: Alt+click, Ctrl+D (siguiente coincidencia) y
   Ctrl+Alt+↑/↓ (cursores en columna).
 - Buscar/reemplazar con resaltado incremental (Enter/F3 navegan; Ctrl+Enter
@@ -50,12 +52,18 @@ Linux (la CI compueba ambos).
 - **Hot exit**: al cerrar la ventana, los buffers sin guardar se guardan en
   `session.json` (máx. 20 pestañas y 1 MiB por buffer) y se restauran en el
   próximo arranque como sucios, antes que los archivos pasados por la CLI.
-- Tema claro/oscuro con Ctrl+T (sesión) o persistente desde preferencias.
+- Tema claro/oscuro con Ctrl+T (sesión) o persistente desde preferencias:
+  una paleta **inspirada en Navicat** (acento `#5B8DEF`/`#2F6FED`) cubre
+  toda la interfaz —editor, barras, pestañas, paletas y avisos—, la
+  pestaña activa se funde con el editor y se apaga cuando su panel pierde
+  el foco; la sintaxis conserva sus paletas Monokai/InspiredGitHub.
 - **Barra de título propia con menú embebido** (sin marco del sistema):
   menús Archivo/Editar/Ver/Preferencias (Alt los abre, Escape los cierra),
   arrastre de la ventana con doble clic para maximizar, botones
   minimizar/maximizar/cerrar y bordes redimensionables en los 4 lados y
-  las esquinas.
+  las esquinas; mientras un menú está desplegado, las etiquetas de
+  pestaña que quedan debajo no se dibujan (sus textos van por encima de
+  todos los fondos).
 - **Buscar en archivos** (Ctrl+Shift+F): panel de resultados al pie con
   `ruta:línea: texto`, smart-case (mayúsculas activan distinguir
   mayúsculas), hasta 1000 coincidencias y límites para no colgar en

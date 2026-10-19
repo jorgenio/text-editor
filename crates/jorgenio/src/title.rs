@@ -23,12 +23,6 @@ const ITEM_H: f32 = 26.0;
 const ITEM_PAD_X: f32 = 12.0;
 /// Grosor del borde de resize alrededor de la ventana.
 const EDGE: f32 = 6.0;
-/// Colores del desplegable (mismos que la paleta/avisos: siempre oscuros).
-const DROP_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
-const DROP_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
-const DROP_FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
-const DROP_DIM: (u8, u8, u8) = (0x96, 0x95, 0x8A);
-const DROP_HOVER: (u8, u8, u8, u8) = (0x33, 0x32, 0x2B, 0xFF);
 
 /// Qué hace un item del menú al pulsarlo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +206,28 @@ impl TitleBar {
         });
     }
 
+    /// `(x, y, w, h)` del desplegado del menú abierto (o `None` si no hay
+    /// menú o aún no se conoce su raíz, antes del primer render). Cálculo
+    /// puro y barato: `main.rs` lo llama ANTES de `Tabs::render` para que
+    /// las etiquetas de pestaña que quedan debajo no se dibujen (los texts
+    /// de la escena van por encima de TODOS los quads, M26).
+    pub fn drop_geometry(
+        &self,
+        advance: f32,
+        settings: &Settings,
+        layout: (usize, usize),
+    ) -> Option<(f32, f32, f32, f32)> {
+        let menu = self.open?;
+        let (rx, _) = *self.roots.get(menu)?;
+        let items = MENUS[menu].1;
+        Some((
+            rx,
+            TITLE_H,
+            drop_width(items, advance, settings, layout),
+            items.len() as f32 * ITEM_H + 8.0,
+        ))
+    }
+
     /// Dibuja la barra completa (fondo, menús, título, botones y, si está
     /// abierto, el desplegado). Guarda el layout para [`TitleBar::click`].
     #[allow(clippy::too_many_arguments)]
@@ -301,34 +317,22 @@ impl TitleBar {
             ));
         }
 
-        // Desplegado del menú abierto.
+        // Desplegado del menú abierto (sus colores siguen el tema, M26).
         self.rows.clear();
         self.drop_w = 0.0;
         self.drop_rect = None;
-        if let Some(menu) = self.open {
+        if let Some(menu) = self.open
+            && let Some((rx, dy, drop_w, dh)) = self.drop_geometry(advance, settings, layout)
+        {
             let items = MENUS[menu].1;
-            // Ancho: la etiqueta más larga (con "✓ " en toggles activos).
-            let mut drop_w: f32 = 0.0;
-            for it in items {
-                if it.action == Action::Separator {
-                    continue;
-                }
-                let mut label = it.label.to_string();
-                if item_checked(it.action, settings, layout) {
-                    label = format!("\u{2713} {label}");
-                }
-                drop_w = drop_w.max(label.chars().count() as f32 * advance + 2.0 * ITEM_PAD_X);
-            }
             self.drop_w = drop_w;
-            let (rx, _) = self.roots[menu];
-            let n = items.len();
-            let dh = n as f32 * ITEM_H + 8.0;
-            let dy = TITLE_H;
             self.drop_rect = Some((rx, dy, drop_w, dh));
-            scene.top_quads.push(Quad::new(rx, dy, drop_w, dh, DROP_BG));
             scene
                 .top_quads
-                .push(Quad::new(rx, dy, drop_w, 1.0, DROP_EDGE));
+                .push(Quad::new(rx, dy, drop_w, dh, theme.panel_bg));
+            scene
+                .top_quads
+                .push(Quad::new(rx, dy, drop_w, 1.0, theme.panel_edge));
             for (i, it) in items.iter().enumerate() {
                 let iy = dy + 4.0 + i as f32 * ITEM_H;
                 if it.action == Action::Separator {
@@ -337,24 +341,28 @@ impl TitleBar {
                         iy + (ITEM_H - 1.0) / 2.0,
                         drop_w - 8.0,
                         1.0,
-                        DROP_EDGE,
+                        theme.panel_edge,
                     ));
                     self.rows.push(None);
                     continue;
                 }
                 if self.hover == Some(i) {
-                    scene
-                        .top_quads
-                        .push(Quad::new(rx + 1.0, iy, drop_w - 2.0, ITEM_H, DROP_HOVER));
+                    scene.top_quads.push(Quad::new(
+                        rx + 1.0,
+                        iy,
+                        drop_w - 2.0,
+                        ITEM_H,
+                        theme.button_bg,
+                    ));
                 }
                 let mut label = it.label.to_string();
-                let mut color = DROP_FG;
+                let mut color = theme.fg;
                 match it.action {
                     Action::Toggle(field) => {
                         if toggle_on(settings, field) {
                             label = format!("\u{2713} {label}");
                         } else {
-                            color = DROP_DIM;
+                            color = theme.dim;
                         }
                     }
                     Action::Layout(c, r) if layout == (c, r) => {
@@ -438,6 +446,29 @@ fn item_checked(action: Action, settings: &Settings, layout: (usize, usize)) -> 
         Action::Layout(c, r) => layout == (c, r),
         _ => false,
     }
+}
+
+/// Ancho del desplegado: la etiqueta más larga (con "✓ " cuando el item
+/// aparece marcado). Compartido por `render` y [`TitleBar::drop_geometry`],
+/// que es quien lo llama ANTES de dibujar las pestañas.
+fn drop_width(
+    items: &[MenuItem],
+    advance: f32,
+    settings: &Settings,
+    layout: (usize, usize),
+) -> f32 {
+    let mut drop_w: f32 = 0.0;
+    for it in items {
+        if it.action == Action::Separator {
+            continue;
+        }
+        let mut label = it.label.to_string();
+        if item_checked(it.action, settings, layout) {
+            label = format!("\u{2713} {label}");
+        }
+        drop_w = drop_w.max(label.chars().count() as f32 * advance + 2.0 * ITEM_PAD_X);
+    }
+    drop_w
 }
 
 /// ¿`(x, y)` cae en el borde exterior de una ventana `w`×`h` (para el
@@ -595,6 +626,41 @@ mod tests {
         assert_eq!(
             b.click(rx + 5.0, ry + 2.0, 800.0, 600.0),
             Click::Action(Action::Layout(2, 2))
+        );
+    }
+
+    #[test]
+    fn drop_geometry_matches_the_rect_render_draws() {
+        let mut b = bar();
+        // Sin render previo no se conocen las raíces: sin rect (y sin panics).
+        b.open = Some(0);
+        assert_eq!(
+            b.drop_geometry(8.0, &Settings::default(), (1, 1)),
+            None,
+            "raíces desconocidas"
+        );
+        b.close();
+
+        let mut s = scene();
+        render_into(&mut b, &mut s, &Settings::default());
+        assert_eq!(
+            b.drop_geometry(8.0, &Settings::default(), (1, 1)),
+            None,
+            "menú cerrado"
+        );
+
+        b.open = Some(0); // Archivo
+        let rect = b
+            .drop_geometry(8.0, &Settings::default(), (1, 1))
+            .expect("rect del menú abierto");
+        let mut s = scene();
+        render_into(&mut b, &mut s, &Settings::default());
+        assert_eq!(b.drop_rect, Some(rect), "el helper == el rect dibujado");
+        assert!(
+            s.top_quads
+                .iter()
+                .any(|q| (q.x, q.y, q.w, q.h) == rect && q.color == Theme::dark().panel_bg),
+            "el fondo del desplegado ocupa ese rect con el color del tema"
         );
     }
 

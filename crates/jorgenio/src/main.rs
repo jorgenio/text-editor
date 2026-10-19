@@ -21,7 +21,7 @@ use jorgenio_ui::gpu::GpuContext;
 use jorgenio_ui::scene::{Quad, Scene, TextSpan};
 use palette::Palette;
 use search::SearchBar;
-use tabs::{Divider, TAB_BAR_H, Tabs};
+use tabs::{Divider, TAB_BAR_H, TabHit, Tabs};
 use theme::Theme;
 use title::TitleBar;
 use winit::dpi::LogicalPosition;
@@ -40,9 +40,6 @@ const DRAG_SLOP2: f32 = 16.0;
 const NOTICE_TTL: Duration = Duration::from_secs(3);
 /// Altura de la barra de estado inferior (px lógicos).
 const STATUS_H: f32 = 24.0;
-const NOTICE_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
-const NOTICE_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
-const NOTICE_FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
 /// Tope de archivos recogidos por el Ctrl+P (un monorepo no debe colgar).
 const QUICK_OPEN_MAX: usize = 20_000;
 /// Directorios ignorados al recorrer el árbol del Ctrl+P.
@@ -834,6 +831,14 @@ impl winit::application::ApplicationHandler for Application {
                 self.tabs.active_mut().set_focused(focused);
                 gpu.request_redraw();
             }
+            WindowEvent::CursorLeft { .. } => {
+                // El ratón sale de la ventana: sin hover (la × se apaga).
+                let before = self.tabs.tab_at_pointer();
+                self.tabs.set_pointer(-1.0, -1.0);
+                if before != self.tabs.tab_at_pointer() {
+                    gpu.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let frame = Instant::now();
                 let viewport = gpu.logical_size();
@@ -862,14 +867,21 @@ impl winit::application::ApplicationHandler for Application {
                     }
                 }
                 let mut scene = scene.expect("siempre hay al menos un grupo");
+                // Tema del frame, calculado UNA vez y compartido por la barra
+                // de estado, los avisos, el menú de título y la paleta (M26).
+                let theme = Theme::from_name(&self.settings.theme);
+                let advance_title = self.settings.font_size as f32 * advance;
+                // Puntero para el hover de la barra (× de cierre) y rect del
+                // menú abierto: sus etiquetas NO se dibujan debajo (los texts
+                // van por encima de todos los quads).
+                self.tabs.set_pointer(self.cursor.x, self.cursor.y);
+                let occluded =
+                    self.titlebar
+                        .drop_geometry(advance_title, &self.settings, self.tabs.layout());
+                self.tabs.set_occluded(occluded);
                 // Barras de pestañas y divisores entre celdas (M24).
-                self.tabs.render(
-                    &mut scene,
-                    viewport,
-                    self.settings.font_size as f32 * advance,
-                    content_top,
-                    content_h,
-                );
+                self.tabs
+                    .render(&mut scene, viewport, advance_title, content_top, content_h);
                 // Barra de estado inferior: Ln/Col, selección, tabulado,
                 // lenguaje y archivo; se pinta PRIMERO para que la barra de
                 // búsqueda y el panel de resultados floten sobre ella.
@@ -878,19 +890,18 @@ impl winit::application::ApplicationHandler for Application {
                     let char_w = editor::FONT_SIZE * advance;
                     let text_w = status.chars().count() as f32 * char_w;
                     let y = viewport.1 - STATUS_H;
-                    let edge = Theme::from_name(&self.settings.theme).tab_edge;
                     scene
                         .top_quads
-                        .push(Quad::new(0.0, y, viewport.0, STATUS_H, NOTICE_BG));
+                        .push(Quad::new(0.0, y, viewport.0, STATUS_H, theme.bar_bg));
                     scene
                         .top_quads
-                        .push(Quad::new(0.0, y, viewport.0, 1.0, edge));
+                        .push(Quad::new(0.0, y, viewport.0, 1.0, theme.tab_edge));
                     scene.top_texts.push(TextSpan::new(
                         status,
                         (viewport.0 - text_w - 12.0).max(8.0),
                         y + (STATUS_H - editor::FONT_SIZE) / 2.0,
                         editor::FONT_SIZE,
-                        NOTICE_FG,
+                        theme.dim,
                     ));
                 }
                 self.search.render(
@@ -905,7 +916,7 @@ impl winit::application::ApplicationHandler for Application {
                     viewport,
                     editor::FONT_SIZE * advance,
                     STATUS_H,
-                    &Theme::from_name(&self.settings.theme),
+                    &theme,
                 );
                 // Aviso efímero en la esquina superior derecha (los de
                 // paleta se pintan después: mandan sobre él).
@@ -925,24 +936,22 @@ impl winit::application::ApplicationHandler for Application {
                     let y = title::TITLE_H + TAB_BAR_H + 8.0;
                     scene
                         .top_quads
-                        .push(Quad::new(x, y, width, height, NOTICE_BG));
+                        .push(Quad::new(x, y, width, height, theme.field_bg));
                     scene
                         .top_quads
-                        .push(Quad::new(x, y, width, 1.0, NOTICE_EDGE));
+                        .push(Quad::new(x, y, width, 1.0, theme.panel_edge));
                     scene.top_texts.push(TextSpan::new(
                         text,
                         x + 12.0,
                         y + (height - editor::FONT_SIZE) / 2.0,
                         editor::FONT_SIZE,
-                        NOTICE_FG,
+                        theme.fg,
                     ));
                 }
                 // Barra de título con menú (capa superior, debajo de la
                 // paleta: su desplegado se pinta antes).
                 {
-                    let theme = Theme::from_name(&self.settings.theme);
                     let title = self.tabs.active().title();
-                    let advance_title = self.settings.font_size as f32 * advance;
                     self.titlebar.render(
                         &mut scene,
                         viewport,
@@ -954,7 +963,7 @@ impl winit::application::ApplicationHandler for Application {
                     );
                 }
                 self.palette
-                    .render(&mut scene, viewport, editor::FONT_SIZE * advance);
+                    .render(&mut scene, viewport, editor::FONT_SIZE * advance, &theme);
                 let built = frame.elapsed();
                 gpu.render(&scene);
                 // Diagnóstico de rendimiento: el primer frame incluye la
@@ -1112,6 +1121,13 @@ impl winit::application::ApplicationHandler for Application {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = gpu.scale_factor();
                 self.cursor = position.to_logical::<f32>(scale);
+                // Hover de la barra de pestañas (× de cierre): repintar SOLO
+                // al entrar o salir de una pestaña, no en cada movimiento.
+                let hover_before = self.tabs.tab_at_pointer();
+                self.tabs.set_pointer(self.cursor.x, self.cursor.y);
+                if hover_before != self.tabs.tab_at_pointer() && !self.mouse_down {
+                    gpu.request_redraw();
+                }
                 let width = gpu.logical_size().0;
                 let height = gpu.logical_size().1;
                 if let Some((axis, last)) = self.divider_drag {
@@ -1149,6 +1165,14 @@ impl winit::application::ApplicationHandler for Application {
                             Divider::Vertical => CursorIcon::EwResize,
                             Divider::Horizontal => CursorIcon::NsResize,
                         }
+                    } else if !self.titlebar.is_open()
+                        && matches!(
+                            self.tabs.hit(self.cursor.x, self.cursor.y),
+                            Some(TabHit::Close(..))
+                        )
+                    {
+                        // Sobre la × de cierre de una pestaña (M26).
+                        CursorIcon::Pointer
                     } else {
                         CursorIcon::Default
                     };
@@ -1357,12 +1381,23 @@ impl winit::application::ApplicationHandler for Application {
                     gpu.request_redraw();
                     return;
                 }
-                // Barra de pestañas: cambiar de pestaña o de grupo (el click
-                // resuelve grupo+tab). Sin arrastre ni caret: termina aquí.
-                if let Some((group, tab)) = self.tabs.click(self.cursor.x, self.cursor.y) {
-                    focus_tab(&mut self.tabs, group, tab);
-                    gpu.request_redraw();
-                    return;
+                // Barra de pestañas: seleccionar, o cerrar con su × (M26).
+                // Sin arrastre ni caret: el click termina aquí.
+                match self.tabs.hit(self.cursor.x, self.cursor.y) {
+                    Some(TabHit::Select(group, tab)) => {
+                        focus_tab(&mut self.tabs, group, tab);
+                        gpu.request_redraw();
+                        return;
+                    }
+                    Some(TabHit::Close(group, tab)) => {
+                        // Se enfoca primero (mueve el grupo activo) y luego
+                        // cierra: reutiliza "la última pestaña no se cierra".
+                        focus_tab(&mut self.tabs, group, tab);
+                        self.tabs.close(None);
+                        gpu.request_redraw();
+                        return;
+                    }
+                    None => {}
                 }
                 // Click en otro panel: ese grupo toma el foco (como Sublime)
                 // y su editor activo coloca el caret.

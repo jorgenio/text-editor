@@ -15,6 +15,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::commands::{self, COMMANDS};
 use crate::editor::FONT_SIZE;
+use crate::theme::Theme;
 
 /// Altura de fila de resultados (px lógicos).
 const ROW_H: f32 = 22.0;
@@ -30,14 +31,6 @@ const MAX_ROWS: usize = 10;
 const MAX_W: f32 = 560.0;
 /// Ancho mínimo del panel (px lógicos).
 const MIN_W: f32 = 200.0;
-
-const PANEL_BG: (u8, u8, u8, u8) = (0x1E, 0x1F, 0x1C, 0xFF);
-const PANEL_EDGE: (u8, u8, u8, u8) = (0x3E, 0x3D, 0x32, 0xFF);
-const HIGHLIGHT: (u8, u8, u8, u8) = (0x49, 0x48, 0x3E, 0xFF);
-const FG: (u8, u8, u8) = (0xF8, 0xF8, 0xF2);
-const DIM: (u8, u8, u8) = (0x75, 0x71, 0x5E);
-/// Caret del prompt (mismo blanco que FG, pero con alfa para los quads).
-const CARET: (u8, u8, u8, u8) = (0xF8, 0xF8, 0xF2, 0xFF);
 
 /// Qué debe hacer `main.rs` tras [`Palette::on_key`].
 #[derive(Debug, PartialEq, Eq)]
@@ -299,8 +292,9 @@ impl Palette {
     }
 
     /// Dibuja el panel en la capa superior (si está abierta). `advance` es el
-    /// ancho de celda (px lógicos), igual que en el editor.
-    pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32) {
+    /// ancho de celda (px lógicos), igual que en el editor; los colores
+    /// salen de `theme` (M26: la paleta sigue el tema claro/oscuro).
+    pub fn render(&mut self, scene: &mut Scene, viewport: (f32, f32), advance: f32, theme: &Theme) {
         if !self.open {
             return;
         }
@@ -327,16 +321,20 @@ impl Palette {
 
         scene
             .top_quads
-            .push(Quad::new(x, TOP, width, height, PANEL_BG));
+            .push(Quad::new(x, TOP, width, height, theme.panel_bg));
         scene
             .top_quads
-            .push(Quad::new(x, TOP, width, 1.0, PANEL_EDGE));
+            .push(Quad::new(x, TOP, width, 1.0, theme.panel_edge));
+        scene.top_quads.push(Quad::new(
+            x,
+            TOP + height - 1.0,
+            width,
+            1.0,
+            theme.panel_edge,
+        ));
         scene
             .top_quads
-            .push(Quad::new(x, TOP + height - 1.0, width, 1.0, PANEL_EDGE));
-        scene
-            .top_quads
-            .push(Quad::new(x, TOP + PROMPT_H, width, 1.0, PANEL_EDGE));
+            .push(Quad::new(x, TOP + PROMPT_H, width, 1.0, theme.panel_edge));
 
         // Prompt "> query" + caret fijo (2 px, siempre visible).
         let prompt_x = x + 8.0;
@@ -345,12 +343,16 @@ impl Palette {
             prompt_x,
             TOP + (PROMPT_H - FONT_SIZE) / 2.0,
             FONT_SIZE,
-            FG,
+            theme.fg,
         ));
         let caret_x = prompt_x + (2 + self.query.chars().count()) as f32 * advance;
-        scene
-            .top_quads
-            .push(Quad::new(caret_x, TOP + 7.0, 2.0, PROMPT_H - 14.0, CARET));
+        scene.top_quads.push(Quad::new(
+            caret_x,
+            TOP + 7.0,
+            2.0,
+            PROMPT_H - 14.0,
+            theme.caret,
+        ));
 
         if self.matches.is_empty() {
             scene.top_texts.push(TextSpan::new(
@@ -358,7 +360,7 @@ impl Palette {
                 prompt_x,
                 TOP + PROMPT_H + 1.0 + (ROW_H - FONT_SIZE) / 2.0,
                 FONT_SIZE,
-                DIM,
+                theme.dim,
             ));
             return;
         }
@@ -368,16 +370,20 @@ impl Palette {
         let highlight_y = TOP + PROMPT_H + 1.0 + highlight_row as f32 * ROW_H;
         scene
             .top_quads
-            .push(Quad::new(x, highlight_y, width, ROW_H, HIGHLIGHT));
+            .push(Quad::new(x, highlight_y, width, ROW_H, theme.selection));
 
         for (visible, &index) in self.matches.iter().skip(self.scroll).take(rows).enumerate() {
             let y = TOP + PROMPT_H + 1.0 + visible as f32 * ROW_H + (ROW_H - FONT_SIZE) / 2.0;
             match self.mode {
                 Mode::Commands => {
                     let command = &COMMANDS[index];
-                    scene
-                        .top_texts
-                        .push(TextSpan::new(command.name, x + 8.0, y, FONT_SIZE, FG));
+                    scene.top_texts.push(TextSpan::new(
+                        command.name,
+                        x + 8.0,
+                        y,
+                        FONT_SIZE,
+                        theme.fg,
+                    ));
                     // Categoría + atajo, alineados a la derecha; se omiten si pisan
                     // el nombre (viewport muy estrecho).
                     let right = match commands::keys_for(command.id) {
@@ -388,7 +394,7 @@ impl Palette {
                     if right_x > x + 8.0 + command.name.chars().count() as f32 * advance + 4.0 {
                         scene
                             .top_texts
-                            .push(TextSpan::new(right, right_x, y, FONT_SIZE, DIM));
+                            .push(TextSpan::new(right, right_x, y, FONT_SIZE, theme.dim));
                     }
                 }
                 Mode::Files => {
@@ -404,7 +410,7 @@ impl Palette {
                     };
                     scene
                         .top_texts
-                        .push(TextSpan::new(label, x + 8.0, y, FONT_SIZE, FG));
+                        .push(TextSpan::new(label, x + 8.0, y, FONT_SIZE, theme.fg));
                 }
             }
         }
@@ -546,18 +552,18 @@ mod tests {
     fn render_pushes_top_layer_only_when_open() {
         let mut palette = Palette::default();
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         assert!(scene.top_quads.is_empty() && scene.top_texts.is_empty());
 
         palette.open();
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         assert!(!scene.top_quads.is_empty(), "fondo + bordes + caret");
         assert!(!scene.top_texts.is_empty(), "prompt + filas");
         // prompt + hasta 10 filas con nombre y etiqueta a la derecha.
         assert!(scene.top_texts.len() <= 1 + 2 * MAX_ROWS);
 
         palette.push_text("xyz");
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         let empty_texts: Vec<_> = scene
             .top_texts
             .iter()
@@ -571,9 +577,34 @@ mod tests {
         let mut palette = Palette::default();
         palette.open();
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        palette.render(&mut scene, (120.0, 800.0), 8.4);
+        palette.render(&mut scene, (120.0, 800.0), 8.4, &Theme::dark());
         assert!(!scene.top_quads.is_empty());
         assert!(!scene.top_texts.is_empty());
+    }
+
+    #[test]
+    fn render_follows_the_theme() {
+        let mut palette = Palette::default();
+        palette.open();
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::light());
+        assert_eq!(
+            scene.top_quads[0].color,
+            Theme::light().panel_bg,
+            "el panel se pinta con el tema claro"
+        );
+        assert!(
+            scene
+                .top_quads
+                .iter()
+                .any(|q| q.color == Theme::light().selection),
+            "la fila resaltada usa la selección del tema"
+        );
+        assert!(scene.top_texts.iter().any(|t| t.color == Theme::light().fg));
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
+        assert_eq!(scene.top_quads[0].color, Theme::dark().panel_bg);
     }
 
     #[test]
@@ -587,7 +618,7 @@ mod tests {
 
         palette.open();
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         let panel = palette.panel.expect("render guarda el panel");
 
         // Filas 0 y 1 del orden por defecto (= orden de COMMANDS).
@@ -606,7 +637,7 @@ mod tests {
 
         // Con query filtrada, el índice de fila mapea por matches, no por COMMANDS.
         palette.push_text("línea");
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         let expected = COMMANDS[palette.matches[0]].id;
         assert_eq!(
             palette.click(panel.x + 10.0, panel.rows_y + 5.0),
@@ -658,7 +689,7 @@ mod tests {
             vec![std::path::PathBuf::from("D:\\p\\a.rs")],
         );
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         let panel = palette.panel.expect("render guarda el panel");
         assert_eq!(
             palette.click(panel.x + 10.0, panel.rows_y + 5.0),
@@ -674,7 +705,7 @@ mod tests {
         palette.open_files(std::path::PathBuf::from("D:\\p"), Vec::new());
         assert!(palette.matches.is_empty());
         let mut scene = Scene::new(wgpu::Color::BLACK);
-        palette.render(&mut scene, (1200.0, 800.0), 8.4);
+        palette.render(&mut scene, (1200.0, 800.0), 8.4, &Theme::dark());
         assert!(
             scene
                 .top_texts

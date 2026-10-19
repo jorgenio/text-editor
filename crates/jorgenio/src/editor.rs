@@ -4015,7 +4015,7 @@ mod tests {
         }];
 
         let dark = editor.build_scene((600.0, 200.0), 1.0);
-        assert_eq!(dark.clear, srgb(0x27, 0x28, 0x22), "fondo Monokai");
+        assert_eq!(dark.clear, srgb(0x1C, 0x20, 0x26), "fondo oscuro (Navicat)");
         assert_eq!(dark.quads[0].color, Theme::dark().selection);
 
         editor.set_theme(Theme::light());

@@ -18,6 +18,9 @@ const TAB_MIN_W: f32 = 96.0;
 const TAB_MAX_W: f32 = 220.0;
 /// Margen horizontal del texto dentro de la pestaña.
 const TAB_PAD: f32 = 14.0;
+/// Zona de la × de cierre, SIEMPRE reservada en el ancho de cada pestaña
+/// (así el hover no recoloca nada) y en la capacidad de su etiqueta.
+const TAB_CLOSE_W: f32 = 16.0;
 /// Ancho mínimo de cada panel al arrastrar el divisor (px lógicos).
 const MIN_PANEL_W: f32 = 80.0;
 /// Margen de agarre del divisor alrededor de su eje (px lógicos).
@@ -70,6 +73,20 @@ pub enum Divider {
     Horizontal,
 }
 
+/// Qué tocó el ratón dentro de una barra de pestañas (M26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHit {
+    /// Cambiar a esa pestaña: `(grupo, pestaña)`.
+    Select(usize, usize),
+    /// Pulsar su × de cierre: `(grupo, pestaña)`.
+    Close(usize, usize),
+}
+
+/// ¿El rect `(x, y, w, h)` intersecta con `occluded`?
+fn covered(occluded: Option<(f32, f32, f32, f32)>, x: f32, y: f32, w: f32, h: f32) -> bool {
+    occluded.is_some_and(|(ox, oy, ow, oh)| x < ox + ow && x + w > ox && y < oy + oh && y + h > oy)
+}
+
 /// Un grupo (columna del split) con sus pestañas y su activa.
 struct Group {
     list: Vec<Editor>,
@@ -106,6 +123,12 @@ pub struct Tabs {
     /// Rutas de las últimas pestañas cerradas (la más reciente al final),
     /// para Ctrl+Shift+T. Solo paths: el contenido no se conserva.
     closed: Vec<std::path::PathBuf>,
+    /// Puntero del ratón en lógicas (hover de la barra: × y resaltado).
+    pointer: (f32, f32),
+    /// Rect del menú desplegado de la barra de título que tapa etiquetas:
+    /// los textos van por encima de TODOS los quads, así que no se dibujan
+    /// (M26; `main.rs` lo pasa con `set_occluded` antes de `render`).
+    occluded: Option<(f32, f32, f32, f32)>,
 }
 
 /// Tope de pestañas cerradas que se recuerdan (como Sublime).
@@ -127,6 +150,8 @@ impl Tabs {
             split_ratio: 0.5,
             v_ratio: 0.5,
             closed: Vec::new(),
+            pointer: (-1.0, -1.0),
+            occluded: None,
         }
     }
 
@@ -146,6 +171,8 @@ impl Tabs {
             split_ratio: 0.5,
             v_ratio: 0.5,
             closed: Vec::new(),
+            pointer: (-1.0, -1.0),
+            occluded: None,
         }
     }
 
@@ -345,6 +372,20 @@ impl Tabs {
         editor.set_viewport(w, (h - TAB_BAR_H).max(50.0));
     }
 
+    /// Puntero del ratón para el hover de la barra (× y resaltado); lo
+    /// llama `main.rs` en cada `CursorMoved` (y fuera de la ventana con
+    /// `(-1, -1)`, para que la × desaparezca).
+    pub fn set_pointer(&mut self, x: f32, y: f32) {
+        self.pointer = (x, y);
+    }
+
+    /// Rect `(x, y, w, h)` del menú desplegado de la barra de título: sus
+    /// etiquetas de pestaña NO se dibujan este frame (`main.rs` lo pasa
+    /// antes de `render`, porque los textos van por encima de todo).
+    pub fn set_occluded(&mut self, rect: Option<(f32, f32, f32, f32)>) {
+        self.occluded = rect;
+    }
+
     /// Celdas `(x, y, w, h)` de cada grupo para una ventana de `width` y un
     /// área de contenido `(content_top, content_h)` (barra de título arriba,
     /// barra de estado abajo). Las celdas INCLUYEN la barra de pestañas.
@@ -480,6 +521,7 @@ impl Tabs {
         if index >= self.groups[gi].list.len() {
             return false;
         }
+        let was_focused = self.groups[gi].list[index].focused();
         let closed_path = self.groups[gi].list[index].path().map(|p| p.to_path_buf());
         if self.groups[gi].list.len() == 1 {
             if self.groups.len() == 1 {
@@ -514,6 +556,11 @@ impl Tabs {
         } else if index < group.active {
             group.active -= 1;
         }
+        // Si se cerró el editor que tenía el foco, la nueva activa lo
+        // hereda: la ventana no debe quedarse sin caret (M26).
+        if was_focused {
+            group.list[group.active].set_focused(true);
+        }
         self.remember_closed(closed_path);
         true
     }
@@ -536,8 +583,11 @@ impl Tabs {
     }
 
     /// Barras de pestañas (una por celda) en la capa superior, más los
-    /// divisores entre celdas; guarda el layout para [`Tabs::click`]. Las que
-    /// no caben no se dibujan ni se clican.
+    /// divisores entre celdas; guarda el layout para [`Tabs::hit`]. Las que
+    /// no caben no se dibujan ni se clican. Solo la pestaña activa del grupo
+    /// CON FOCO se pinta como activa (M26); la × se muestra en ella y en la
+    /// que está bajo el ratón, y la etiqueta de cada pestaña se omite si la
+    /// tapa el menú de la barra de título (`set_occluded`).
     pub fn render(
         &mut self,
         scene: &mut Scene,
@@ -547,12 +597,18 @@ impl Tabs {
         content_h: f32,
     ) {
         let cells = self.group_geometry(viewport.0, content_top, content_h);
+        // El hover se resuelve con el layout del render ANTERIOR: este
+        // frame lo rellena más abajo (limpiarlo antes lo dejaría en None).
+        let hovered = self.tab_at_pointer();
         self.layout.clear();
 
         for (gi, group) in self.groups.iter().enumerate() {
             let (gx, gy, gw, _gh) = cells[gi];
             let bar_right = gx + gw;
             let top = gy;
+            // El grupo pierde el "aspecto enfocado" si su editor activo no
+            // tiene foco de ventana (pestaña activa → como una inactiva).
+            let group_focused = group.list[group.active].focused();
             scene
                 .top_quads
                 .push(Quad::new(gx, top, gw, TAB_BAR_H, self.theme.bar_bg));
@@ -579,23 +635,25 @@ impl Tabs {
                 if tab.dirty() {
                     label = format!("\u{25cf} {label}");
                 }
-                let w = (label.chars().count() as f32 * advance + 2.0 * TAB_PAD)
+                // La × de cierre se resta SIEMPRE del hueco de la etiqueta
+                // (nada se recoloca al hacer hover).
+                let w = (label.chars().count() as f32 * advance + 2.0 * TAB_PAD + TAB_CLOSE_W)
                     .clamp(TAB_MIN_W, TAB_MAX_W)
                     .min(bar_right - x);
                 let is_active = index == group.active;
-                scene.top_quads.push(Quad::new(
-                    x,
-                    top,
-                    w,
-                    TAB_BAR_H,
-                    if is_active {
-                        self.theme.tab_active_bg
-                    } else {
-                        self.theme.tab_bg
-                    },
-                ));
-                // Sin borde inferior en la activa: se funde con su editor.
-                if !is_active {
+                let is_focused = is_active && group_focused;
+                let is_hovered = hovered == Some((gi, index));
+                let bg = if is_focused {
+                    self.theme.tab_active_bg
+                } else if is_hovered {
+                    self.theme.tab_hover_bg
+                } else {
+                    self.theme.tab_bg
+                };
+                scene.top_quads.push(Quad::new(x, top, w, TAB_BAR_H, bg));
+                // Sin borde inferior en la activa enfocada: se funde con su
+                // editor; las demás (incluida la activa sin foco) lo llevan.
+                if !is_focused {
                     scene.top_quads.push(Quad::new(
                         x,
                         top + TAB_BAR_H - 1.0,
@@ -619,22 +677,50 @@ impl Tabs {
                 // de 32 px; el advance se reescala para truncar con exactitud.
                 let font = self.font_size.min(24.0);
                 let label_advance = advance * font / self.font_size;
-                let capacity = ((w - 2.0 * TAB_PAD) / label_advance).floor().max(1.0) as usize;
+                let capacity = ((w - 2.0 * TAB_PAD - TAB_CLOSE_W) / label_advance)
+                    .floor()
+                    .max(1.0) as usize;
                 if label.chars().count() > capacity {
                     let head: String = label.chars().take(capacity.saturating_sub(1)).collect();
                     label = format!("{head}\u{2026}");
                 }
-                scene.top_texts.push(TextSpan::new(
-                    label,
-                    x + TAB_PAD,
-                    top + (TAB_BAR_H - font) / 2.0,
-                    font,
-                    if is_active {
-                        self.theme.fg
-                    } else {
-                        self.theme.dim
-                    },
-                ));
+                // Etiqueta y × NO se dibujan si las tapa el menú desplegado
+                // de la barra de título: los textos van por encima de TODOS
+                // los quads, así que la única solución es omitirlas (M26).
+                let label_x = x + TAB_PAD;
+                let label_y = top + (TAB_BAR_H - font) / 2.0;
+                let label_w = label.chars().count() as f32 * label_advance;
+                if !covered(self.occluded, label_x, label_y, label_w, font) {
+                    scene.top_texts.push(TextSpan::new(
+                        label,
+                        label_x,
+                        label_y,
+                        font,
+                        if is_focused {
+                            self.theme.accent
+                        } else {
+                            self.theme.dim
+                        },
+                    ));
+                }
+                // × de cierre: en la activa enfocada y en la bajo el ratón
+                // (la ZONA de click existe aunque no se dibuje).
+                if (is_focused || is_hovered) && w >= TAB_CLOSE_W {
+                    let close_x = x + w - TAB_CLOSE_W;
+                    if !covered(self.occluded, close_x, label_y, TAB_CLOSE_W, font) {
+                        scene.top_texts.push(TextSpan::new(
+                            "\u{d7}".to_string(),
+                            close_x + (TAB_CLOSE_W - label_advance) / 2.0,
+                            label_y,
+                            font,
+                            if is_focused {
+                                self.theme.accent
+                            } else {
+                                self.theme.fg
+                            },
+                        ));
+                    }
+                }
 
                 gl.tabs.push((x, w));
                 x += w;
@@ -669,9 +755,10 @@ impl Tabs {
         }
     }
 
-    /// Click en alguna barra: grupo y pestaña tocadas, o `None` si no fue
+    /// Zona de la barra bajo `(x, y)`: la × de cierre si cae en su franja
+    /// derecha (`TAB_CLOSE_W`), si no la propia pestaña. `None` si no fue
     /// dentro de la barra de SU celda o de una pestaña dibujada.
-    pub fn click(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+    pub fn hit(&self, x: f32, y: f32) -> Option<TabHit> {
         let group = self
             .layout
             .iter()
@@ -680,7 +767,21 @@ impl Tabs {
             .tabs
             .iter()
             .position(|&(tx, w)| x >= tx && x < tx + w)?;
-        Some((group, tab))
+        let (tx, w) = self.layout[group].tabs[tab];
+        if w >= TAB_CLOSE_W && x >= tx + w - TAB_CLOSE_W {
+            Some(TabHit::Close(group, tab))
+        } else {
+            Some(TabHit::Select(group, tab))
+        }
+    }
+
+    /// (grupo, pestaña) bajo el puntero de [`Tabs::set_pointer`]: al
+    /// variar, `main.rs` repinta para mostrar u ocultar la ×.
+    pub fn tab_at_pointer(&self) -> Option<(usize, usize)> {
+        self.hit(self.pointer.0, self.pointer.1)
+            .map(|hit| match hit {
+                TabHit::Select(group, tab) | TabHit::Close(group, tab) => (group, tab),
+            })
     }
 }
 
@@ -775,20 +876,30 @@ mod tests {
             "fondo + tabs: {}",
             scene.top_quads.len()
         );
-        assert_eq!(scene.top_texts.len(), 2, "una etiqueta por pestaña");
+        // Dos etiquetas + la × de la pestaña activa (M26).
+        assert_eq!(scene.top_texts.len(), 3, "etiquetas + × de cierre");
+        assert_eq!(
+            scene
+                .top_texts
+                .iter()
+                .filter(|t| t.text == "\u{d7}")
+                .count(),
+            1,
+            "solo la activa lleva ×"
+        );
 
         let tab0 = tabs.layout[0].tabs[0];
         let tab1 = tabs.layout[0].tabs[1];
         assert_eq!(
-            tabs.click(tab0.0 + tab0.1 / 2.0, TAB_BAR_H / 2.0),
-            Some((0, 0))
+            tabs.hit(tab0.0 + tab0.1 / 2.0, TAB_BAR_H / 2.0),
+            Some(TabHit::Select(0, 0))
         );
         assert_eq!(
-            tabs.click(tab1.0 + tab1.1 / 2.0, TAB_BAR_H / 2.0),
-            Some((0, 1))
+            tabs.hit(tab1.0 + tab1.1 / 2.0, TAB_BAR_H / 2.0),
+            Some(TabHit::Select(0, 1))
         );
-        assert_eq!(tabs.click(0.0, TAB_BAR_H + 1.0), None, "bajo la barra");
-        assert_eq!(tabs.click(799.0, 5.0), None, "pestaña que no cabe dibujada");
+        assert_eq!(tabs.hit(0.0, TAB_BAR_H + 1.0), None, "bajo la barra");
+        assert_eq!(tabs.hit(799.0, 5.0), None, "pestaña que no cabe dibujada");
 
         // Muchas pestañas: no se dibuja ni se clica lo que no cabe.
         for i in 0..40 {
@@ -798,6 +909,159 @@ mod tests {
         tabs.render(&mut scene, (300.0, 600.0), 8.0, 0.0, 600.0);
         assert!(tabs.layout[0].tabs.len() < 40, "solo caben unas pocas");
         assert!(tabs.layout[0].tabs.iter().all(|&(x, w)| x + w <= 300.0));
+    }
+
+    #[test]
+    fn close_button_zone_is_always_reserved_and_reports_close() {
+        let mut tabs = Tabs::new(tab_with("archivo_muy_largo"));
+        tabs.add(tab_with("otro.rs"));
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
+        let (tx, w) = tabs.layout[0].tabs[0];
+        // La franja derecha (16 px) es la × aunque NO se dibuje en inactivas.
+        assert_eq!(
+            tabs.hit(tx + w - 4.0, TAB_BAR_H / 2.0),
+            Some(TabHit::Close(0, 0)),
+            "últimos 16 px = cerrar"
+        );
+        assert_eq!(
+            tabs.hit(tx + 4.0, TAB_BAR_H / 2.0),
+            Some(TabHit::Select(0, 0)),
+            "el resto = seleccionar"
+        );
+        // La × de la activa se dibuja siempre; la de la otra, con hover.
+        let x_marks = |scene: &Scene| {
+            scene
+                .top_texts
+                .iter()
+                .filter(|t| t.text == "\u{d7}")
+                .count()
+        };
+        assert_eq!(x_marks(&scene), 1, "solo la activa sin hover");
+
+        let (hx, hw) = tabs.layout[0].tabs[0];
+        tabs.set_pointer(hx + hw / 2.0, TAB_BAR_H / 2.0);
+        assert_eq!(tabs.tab_at_pointer(), Some((0, 0)), "hover de la inactiva");
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
+        assert_eq!(x_marks(&scene), 2, "hover muestra su ×");
+
+        // Fuera de la barra no hay hover (y la × de la otra desaparece).
+        tabs.set_pointer(-1.0, -1.0);
+        assert_eq!(tabs.tab_at_pointer(), None);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
+        assert_eq!(x_marks(&scene), 1, "sin puntero solo la activa");
+    }
+
+    #[test]
+    fn active_tab_of_an_unfocused_group_looks_inactive() {
+        let mut tabs = Tabs::new(tab_with("uno"));
+        tabs.split(); // grupo 1 activo y con foco; el 0 queda apagado
+        assert!(!tabs.group_active_mut(0).focused(), "grupo 0 sin foco");
+
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
+        // Grupo 0: barra, filete, pestaña activa (bg inactivo + su filete).
+        assert_eq!(scene.top_quads[2].color, Theme::dark().tab_bg);
+        assert_eq!(scene.top_quads[3].color, Theme::dark().tab_edge);
+        // El grupo 1 (con foco) sí funde su pestaña activa con el editor.
+        assert!(
+            scene
+                .top_quads
+                .iter()
+                .any(|q| q.color == Theme::dark().tab_active_bg),
+            "la activa enfocada se funde"
+        );
+        // Etiquetas: la del grupo apagado va en `dim`, la enfocada en acento.
+        assert_eq!(scene.top_texts[0].color, Theme::dark().dim);
+        assert_eq!(scene.top_texts[1].color, Theme::dark().accent);
+        // Y solo la enfocada lleva ×.
+        assert_eq!(
+            scene
+                .top_texts
+                .iter()
+                .filter(|t| t.text == "\u{d7}")
+                .count(),
+            1
+        );
+
+        // Devolverle el foco al grupo 0 reactiva su pestaña activa.
+        tabs.set_active_group(0);
+        tabs.active_mut().set_focused(true);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, 0.0, 600.0);
+        assert_eq!(scene.top_quads[2].color, Theme::dark().tab_active_bg);
+    }
+
+    #[test]
+    fn labels_under_the_open_menu_rect_are_not_drawn() {
+        let mut tabs = Tabs::new(tab_named("uno.rs"));
+        tabs.add(tab_named("dos.rs"));
+        // Como en la app: la barra empieza bajo la barra de título (y=30).
+        let (ct, ch) = (30.0, 570.0);
+
+        // Menú que tapa la barra entera: no se dibuja NINGUNA etiqueta.
+        tabs.set_occluded(Some((0.0, 30.0, 800.0, 242.0)));
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, ct, ch);
+        assert!(
+            scene.top_texts.is_empty(),
+            "las etiquetas no asoman sobre el menú: {:?}",
+            scene
+                .top_texts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+        );
+        // Los quads sí se dibujan (el fondo del menú los tapa después).
+        assert!(scene.top_quads.len() >= 6, "los quads siguen ahí");
+
+        // Un menú estrecho a la izquierda tapa solo la primera etiqueta.
+        tabs.set_occluded(Some((0.0, 30.0, 60.0, 190.0)));
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, ct, ch);
+        let labels: Vec<&str> = scene
+            .top_texts
+            .iter()
+            .filter(|t| t.text != "\u{d7}")
+            .map(|t| t.text.as_str())
+            .collect();
+        assert_eq!(labels, vec!["dos.rs"], "la primera está tapada");
+
+        // Sin menú se dibuja todo (regresión del default).
+        tabs.set_occluded(None);
+        let mut scene = Scene::new(wgpu::Color::BLACK);
+        tabs.render(&mut scene, (800.0, 600.0), 8.0, ct, ch);
+        assert_eq!(
+            scene
+                .top_texts
+                .iter()
+                .filter(|t| t.text != "\u{d7}")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn closing_the_focused_tab_hands_focus_to_the_new_active() {
+        let mut tabs = Tabs::new(tab_named("a.rs"));
+        tabs.add(tab_named("b.rs"));
+        // Solo la activa (b) tiene foco, como tras perder/recuperar la
+        // ventana con dos pestañas abiertas.
+        tabs.set_active(0);
+        tabs.active_mut().set_focused(false);
+        tabs.set_active(1);
+        tabs.active_mut().set_focused(true);
+        assert!(tabs.iter().nth(1).is_some_and(|e| e.focused()));
+
+        assert!(tabs.close(None), "cierra b, la enfocada");
+        assert_eq!(tabs.len(), 1);
+        assert!(
+            tabs.active().focused(),
+            "la nueva activa hereda el foco (sin caret no hay editor)"
+        );
     }
 
     #[test]
@@ -843,7 +1107,8 @@ mod tests {
         assert_eq!(tabs.layout.len(), 2, "una franja por grupo");
         assert_eq!(tabs.layout[0].x, 0.0);
         assert_eq!(tabs.layout[1].x, 500.0, "la segunda columna empieza a 500");
-        assert_eq!(scene.top_texts.len(), 2, "una pestaña por grupo");
+        // Etiqueta de cada grupo + × de la activa del grupo con foco (M26).
+        assert_eq!(scene.top_texts.len(), 3, "una etiqueta por grupo + ×");
         assert!(
             scene.top_quads.iter().any(|q| q.h == 600.0 && q.w == 1.0),
             "separador vertical a altura completa"
@@ -851,10 +1116,10 @@ mod tests {
 
         // El click resuelve (grupo, pestaña) por la x dentro de cada barra;
         // el hueco vacío de la barra no es clicable.
-        assert_eq!(tabs.click(50.0, TAB_BAR_H / 2.0), Some((0, 0)));
-        assert_eq!(tabs.click(550.0, TAB_BAR_H / 2.0), Some((1, 0)));
-        assert_eq!(tabs.click(700.0, TAB_BAR_H / 2.0), None, "hueco vacío");
-        assert_eq!(tabs.click(700.0, TAB_BAR_H + 1.0), None, "bajo la barra");
+        assert_eq!(tabs.hit(50.0, TAB_BAR_H / 2.0), Some(TabHit::Select(0, 0)));
+        assert_eq!(tabs.hit(550.0, TAB_BAR_H / 2.0), Some(TabHit::Select(1, 0)));
+        assert_eq!(tabs.hit(700.0, TAB_BAR_H / 2.0), None, "hueco vacío");
+        assert_eq!(tabs.hit(700.0, TAB_BAR_H + 1.0), None, "bajo la barra");
 
         // El cambio cruzado de grupo lo resuelve el shell (focus_tab) con
         // set_active_group + set_active.

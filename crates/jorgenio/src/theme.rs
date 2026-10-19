@@ -24,6 +24,8 @@ pub struct Theme {
     pub fg: (u8, u8, u8),
     /// Texto apagado (contadores, pestañas inactivas).
     pub dim: (u8, u8, u8),
+    /// Texto de error (líneas de stderr en el panel de build, M28).
+    pub error: (u8, u8, u8),
     /// Azul de acento (Navicat `primary`): etiqueta de la pestaña activa,
     /// número de línea actual y base de caret/coincidencias.
     pub accent: (u8, u8, u8),
@@ -56,6 +58,7 @@ impl Theme {
             editor_bg: (0x1C, 0x20, 0x26),
             fg: (0xD8, 0xDC, 0xE3),
             dim: (0x7D, 0x85, 0x92),
+            error: (0xE5, 0x63, 0x63),
             accent: (0x5B, 0x8D, 0xEF),
             gutter_fg: (0x7D, 0x85, 0x92),
             gutter_current: (0x5B, 0x8D, 0xEF),
@@ -82,6 +85,7 @@ impl Theme {
             editor_bg: (0xFF, 0xFF, 0xFF),
             fg: (0x2E, 0x32, 0x38),
             dim: (0x8B, 0x91, 0x9C),
+            error: (0xC0, 0x39, 0x2B),
             accent: (0x2F, 0x6F, 0xED),
             gutter_fg: (0x8B, 0x91, 0x9C),
             gutter_current: (0x2F, 0x6F, 0xED),
@@ -132,6 +136,7 @@ mod tests {
         assert_eq!(dark.editor_bg, (0x1C, 0x20, 0x26));
         assert_eq!(dark.fg, (0xD8, 0xDC, 0xE3));
         assert_eq!(dark.dim, (0x7D, 0x85, 0x92));
+        assert_eq!(dark.error, (0xE5, 0x63, 0x63), "rojo de stderr");
         assert_eq!(dark.accent, (0x5B, 0x8D, 0xEF));
         assert_eq!(dark.gutter_fg, (0x7D, 0x85, 0x92));
         assert_eq!(dark.gutter_current, (0x5B, 0x8D, 0xEF));

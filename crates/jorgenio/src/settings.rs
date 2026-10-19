@@ -38,6 +38,39 @@ pub struct Settings {
     /// ¿Mostrar la franja de vista previa lateral (minimap, M27)? Se
     /// alterna también desde «Ver → Minimap» y la paleta (Ctrl+M).
     pub minimap: bool,
+    /// Tareas de build (M28, Ctrl+B): la primera cuya `ext` encaje con el
+    /// archivo activo (o la primera comodín, sin `ext`) se lanza en un
+    /// shell con su salida en el panel inferior.
+    pub builds: Vec<BuildTask>,
+}
+
+/// Tarea de compilación/ejecución definida en `settings.json`: `cmd` corre
+/// en un shell (`cmd /C` en Windows, `sh -c` en Linux) con `working_dir`
+/// como directorio de trabajo.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct BuildTask {
+    /// Nombre mostrado en el panel de salida.
+    pub name: String,
+    /// Extensiones que activan esta tarea, en minúsculas; vacío = comodín
+    /// (sirve para cualquier archivo; se usa si ninguna otra encaja).
+    pub ext: Vec<String>,
+    /// Comando completo del shell (argumentos incluidos).
+    pub cmd: String,
+    /// Directorio de trabajo; vacío = el del archivo activo (o el de la
+    /// aplicación si el archivo no está guardado).
+    pub working_dir: String,
+}
+
+impl Default for BuildTask {
+    fn default() -> Self {
+        Self {
+            name: "build".to_owned(),
+            ext: Vec::new(),
+            cmd: String::new(),
+            working_dir: String::new(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -52,7 +85,27 @@ impl Default for Settings {
             theme: "dark".to_owned(),
             word_wrap: false,
             minimap: true,
+            builds: Vec::new(),
         }
+    }
+}
+
+impl Settings {
+    /// Tarea de build para el archivo `path` (M28): la primera cuya `ext`
+    /// contenga la extensión del archivo (sin distinguir mayúsculas); si
+    /// ninguna encaja, la primera comodín (`ext` vacío). Sin candidatas →
+    /// `None` (Ctrl+B avisa en vez de fallar en silencio).
+    pub fn build_for(&self, path: Option<&Path>) -> Option<&BuildTask> {
+        let ext = path
+            .and_then(|path| path.extension())
+            .and_then(|ext| ext.to_str())
+            .map(str::to_lowercase);
+        if let Some(ext) = ext
+            && let Some(task) = self.builds.iter().find(|task| task.ext.contains(&ext))
+        {
+            return Some(task);
+        }
+        self.builds.iter().find(|task| task.ext.is_empty())
     }
 }
 
@@ -195,6 +248,21 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     if settings.theme != "light" {
         settings.theme = "dark".to_owned();
     }
+    // Tareas de build: sin comando no se lanza nada y las extensiones se
+    // normalizan a minúsculas (la comparación no distingue mayúsculas).
+    settings.builds.retain(|task| !task.cmd.trim().is_empty());
+    for task in &mut settings.builds {
+        task.name = task.name.trim().to_owned();
+        if task.name.is_empty() {
+            task.name = "build".to_owned();
+        }
+        task.cmd = task.cmd.trim().to_owned();
+        task.working_dir = task.working_dir.trim().to_owned();
+        for ext in &mut task.ext {
+            *ext = ext.trim().trim_start_matches('.').to_lowercase();
+        }
+        task.ext.retain(|ext| !ext.is_empty());
+    }
     Ok(settings)
 }
 
@@ -251,6 +319,16 @@ pub fn default_template() -> &'static str {
 
     // ¿Mostrar la franja de vista previa lateral (minimap)?
     "minimap": true,
+
+    // Tareas de build (Ctrl+B): se lanzan en un shell (cmd /C o sh -c) con
+    // «working_dir» como directorio de trabajo (vacío = el del archivo
+    // activo). «ext» empareja con la extensión del archivo abierto (vacío
+    // = comodín); gana la primera que encaje.
+    // "builds": [
+    //     { "name": "cargo check", "ext": ["rs"],
+    //       "cmd": "cargo check", "working_dir": "" }
+    // ],
+    "builds": []
 }
 "#
 }
@@ -383,6 +461,73 @@ mod tests {
             "se puede apagar"
         );
         assert!(parse("{\"minimap\": true}").unwrap().minimap, "y encender");
+    }
+
+    #[test]
+    fn builds_default_empty_and_template_keeps_it() {
+        assert!(
+            Settings::default().builds.is_empty(),
+            "sin tareas: Ctrl+B avisa"
+        );
+        assert!(
+            parse(default_template())
+                .expect("plantilla")
+                .builds
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn build_for_matches_extension_then_wildcard_then_none() {
+        let settings = parse(
+            r#"{"builds": [
+                {"name": "rust", "ext": ["RS"], "cmd": "cargo check"},
+                {"name": "todo", "ext": [], "cmd": "make"}
+            ]}"#,
+        )
+        .expect("json");
+        assert_eq!(
+            settings
+                .build_for(Some(Path::new("a.rs")))
+                .map(|t| t.name.as_str()),
+            Some("rust"),
+            "la extensión encaja sin distinguir mayúsculas"
+        );
+        assert_eq!(
+            settings
+                .build_for(Some(Path::new("a.py")))
+                .map(|t| t.name.as_str()),
+            Some("todo"),
+            "ninguna encaja → comodín"
+        );
+        assert_eq!(
+            settings.build_for(None).map(|t| t.name.as_str()),
+            Some("todo"),
+            "archivo sin guardar → comodín"
+        );
+        assert!(
+            parse("{}")
+                .unwrap()
+                .build_for(Some(Path::new("a.rs")))
+                .is_none(),
+            "sin tareas → None"
+        );
+    }
+
+    #[test]
+    fn build_tasks_without_cmd_are_dropped_and_exts_normalized() {
+        let settings = parse(
+            r#"{"builds": [
+                {"name": "  ", "ext": [], "cmd": "   "},
+                {"name": "", "ext": [".RS", " Py "], "cmd": " run "}
+            ]}"#,
+        )
+        .expect("json");
+        assert_eq!(settings.builds.len(), 1, "las tareas sin comando se van");
+        let task = &settings.builds[0];
+        assert_eq!(task.name, "build", "nombre vacío → «build»");
+        assert_eq!(task.cmd, "run", "comando recortado");
+        assert_eq!(task.ext, vec!["rs", "py"], "exts en minúsculas y limpias");
     }
 
     #[test]

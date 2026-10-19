@@ -49,6 +49,12 @@ Linux (la CI compueba ambos).
   robar el foco, como la rueda). Se alterna con Ctrl+M o con «Ver →
   Minimap»; los paneles estrechos (menos de 280 px) se quedan sin franja
   para no tapar código.
+- **Builds** (Ctrl+B o «Herramientas → Ejecutar build»): la tarea definida
+  para la extensión del archivo actual en `builds` de `settings.json` corre
+  en un hilo aparte (la ventana no se congela) y su salida aparece en un
+  panel al pie —stderr en rojo, rueda para recorrer, Esc lo cierra—; las
+  filas con `ruta:línea` se pulsan para abrir el archivo en esa línea. Sin
+  tareas definidas avisa en vez de fallar en silencio.
 - Barra de estado inferior con Ln/Col (columna visual), selección,
   tabulado, lenguaje y nombre del archivo; zoom de fuente con
   Ctrl+= / Ctrl+- / Ctrl+0 (solo sesión); Ctrl+Shift+T reabre la última
@@ -65,7 +71,8 @@ Linux (la CI compueba ambos).
   pestaña activa se funde con el editor y se apaga cuando su panel pierde
   el foco; la sintaxis conserva sus paletas Monokai/InspiredGitHub.
 - **Barra de título propia con menú embebido** (sin marco del sistema):
-  menús Archivo/Editar/Ver/Preferencias (Alt los abre, Escape los cierra),
+  menús Archivo/Editar/Ver/Preferencias/Herramientas (Alt los abre,
+  Escape los cierra),
   arrastre de la ventana con doble clic para maximizar, botones
   minimizar/maximizar/cerrar y bordes redimensionables en los 4 lados y
   las esquinas; mientras un menú está desplegado, las etiquetas de
@@ -142,6 +149,7 @@ Todos los atajos usan **Ctrl** (en macOS: Cmd). AltGr no dispara comandos.
 | Cambiar tema claro/oscuro | Ctrl+T |
 | Zoom de fuente (+ / − / normal) | Ctrl+= / Ctrl+- / Ctrl+0 |
 | Alternar minimap | Ctrl+M |
+| Ejecutar build | Ctrl+B |
 | Abrir preferencias | Ctrl+, |
 
 **Selección múltiple**: Alt+click añade un cursor; Ctrl+Alt+↑/↓ añade
@@ -161,6 +169,13 @@ hecha, abre la coincidencia seleccionada), ↑/↓ recorren los resultados y
 Esc cierra. Click en una fila abre el archivo en esa línea; click fuera
 del panel lo cierra y sigue su curso hasta el editor. Buscar (Ctrl+F) y
 Buscar en archivos se excluyen mutuamente.
+
+**Dentro del panel de build**: la rueda lo recorre, Esc lo cierra sin robar
+el resto de las teclas al editor, click en una fila con `ruta:línea` abre
+el archivo en esa línea y click en la cabecera también lo cierra. El panel
+de build y el de buscar en archivos compiten por el mismo pie (lanzar uno
+cierra el otro), mientras que la barra de buscar/reemplazar flota por
+encima y recibe los clicks primero.
 
 **Movimiento**: flechas, Home/End (Home alterna columna 0 ↔ primer
 no-blanco), PageUp/PageDown, Ctrl+←/→ por palabras, Backspace/Delete,
@@ -202,7 +217,17 @@ los fuera de rango se recortan.
     "word_wrap": false,
 
     // ¿Mostrar la franja de vista previa lateral (minimap)?
-    "minimap": true
+    "minimap": true,
+
+    // Tareas de build (Ctrl+B): se lanzan en un shell (cmd /C o sh -c) con
+    // «working_dir» como directorio de trabajo (vacío = el del archivo
+    // activo). «ext» empareja con la extensión del archivo abierto (vacío
+    // = comodín); gana la primera que encaje.
+    // "builds": [
+    //     { "name": "cargo check", "ext": ["rs"],
+    //       "cmd": "cargo check", "working_dir": "" }
+    // ],
+    "builds": []
 }
 ```
 

@@ -120,6 +120,10 @@ const MENUS: &[(&str, &[MenuItem])] = &[
             item("Auto-match de pares", Action::Toggle("auto_match")),
         ],
     ),
+    (
+        "Herramientas",
+        &[item("Ejecutar build", Action::Command("build.run"))],
+    ),
 ];
 
 /// Qué tocó el ratón en la barra de título.
@@ -535,10 +539,14 @@ mod tests {
         let mut b = bar();
         let mut s = scene();
         render_into(&mut b, &mut s, &Settings::default());
-        assert_eq!(b.roots.len(), 4, "cuatro menús raíz");
+        assert_eq!(b.roots.len(), 5, "cinco menús raíz");
         assert!(
             s.top_texts.iter().any(|t| t.text == "Archivo"),
             "dibuja las raíces"
+        );
+        assert!(
+            s.top_texts.iter().any(|t| t.text == "Herramientas"),
+            "la última raíz es Herramientas (M28)"
         );
         let (rx, rw) = b.roots[0];
         assert_eq!(b.click(rx + rw / 2.0, 10.0, 800.0, 600.0), Click::Root(0));

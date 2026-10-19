@@ -1,5 +1,6 @@
 //! Jorgenio Text — binario principal: ventana + event loop + orquestación.
 
+mod build;
 mod commands;
 mod editor;
 mod findfiles;
@@ -16,6 +17,7 @@ mod title;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use build::BuildPanel;
 use editor::Editor;
 use findfiles::FindFiles;
 use jorgenio_ui::gpu::GpuContext;
@@ -75,6 +77,8 @@ struct Application {
     search: SearchBar,
     /// Buscar en archivos (Ctrl+Shift+F) con panel de resultados.
     findfiles: FindFiles,
+    /// Panel de salida del build (Ctrl+B, M28).
+    build: BuildPanel,
     /// Preferencias cargadas de `settings.json` (M11).
     settings: settings::Settings,
     /// Sesión del arranque (tamaño de ventana; los buffers ya se
@@ -118,6 +122,7 @@ impl Application {
             palette: Palette::default(),
             search,
             findfiles: FindFiles::default(),
+            build: BuildPanel::default(),
             settings,
             session,
             gpu: None,
@@ -339,13 +344,14 @@ fn apply_menu_action(
     palette: &mut Palette,
     search: &mut SearchBar,
     findfiles: &mut FindFiles,
+    build: &mut BuildPanel,
     settings: &mut settings::Settings,
     notice: &mut Option<(String, Instant)>,
     action: title::Action,
 ) -> bool {
     match action {
         title::Action::Command(id) => run_command(
-            tabs, clipboard, palette, search, findfiles, settings, notice, id,
+            tabs, clipboard, palette, search, findfiles, build, settings, notice, id,
         ),
         title::Action::Toggle(field) => {
             match field {
@@ -458,6 +464,7 @@ fn run_command(
     palette: &mut Palette,
     search: &mut SearchBar,
     findfiles: &mut FindFiles,
+    build: &mut BuildPanel,
     settings: &mut settings::Settings,
     notice: &mut Option<(String, Instant)>,
     id: &str,
@@ -481,6 +488,7 @@ fn run_command(
         }
         "find_in_files.show" => {
             search.close();
+            build.close();
             let prefill = tabs.active().single_line_selection();
             let root = std::env::current_dir().unwrap_or_default();
             let files = collect_files(&root, QUICK_OPEN_MAX);
@@ -733,6 +741,37 @@ fn run_command(
             );
             true
         }
+        "build.run" => {
+            if build.is_running() {
+                notify(notice, "Build en curso…".to_owned());
+                return true;
+            }
+            // Panel de resultados y build ocupan el mismo pie: solo uno.
+            findfiles.close();
+            let Some(task) = settings.build_for(tabs.active().path()) else {
+                notify(
+                    notice,
+                    "Sin tarea de build: define «builds» en settings.json".to_owned(),
+                );
+                return true;
+            };
+            // cwd: el del archivo activo, salvo que la tarea fije otro.
+            let cwd = if task.working_dir.is_empty() {
+                tabs.active()
+                    .path()
+                    .and_then(|path| path.parent())
+                    .map(|dir| dir.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            } else {
+                std::path::PathBuf::from(&task.working_dir)
+            };
+            let name = task.name.clone();
+            match build.start(task, cwd) {
+                Ok(()) => notify(notice, format!("Build: {name}…")),
+                Err(err) => notify(notice, format!("Build falló: {err}")),
+            }
+            true
+        }
         other => {
             log::warn!("comando desconocido: {other}");
             false
@@ -788,6 +827,18 @@ impl winit::application::ApplicationHandler for Application {
             } else {
                 wake = Some(deadline);
             }
+        }
+        // Salida del build (M28): drena el canal sin bloquear; mientras
+        // corre, el mpsc no despierta solo al event loop, así que pide un
+        // wakeup corto para ir sondeando.
+        if self.build.poll()
+            && let Some(gpu) = &self.gpu
+        {
+            gpu.request_redraw();
+        }
+        if self.build.is_running() {
+            let due = Instant::now() + Duration::from_millis(build::POLL_MS);
+            wake = Some(wake.map_or(due, |w| w.min(due)));
         }
         if self.tabs.active().focused() {
             let now = Instant::now();
@@ -928,6 +979,15 @@ impl winit::application::ApplicationHandler for Application {
                         theme.dim,
                     ));
                 }
+                // Salida del build (M28): se pinta ANTES que la barra de
+                // búsqueda (esta flota encima, como sobre el resto).
+                self.build.render(
+                    &mut scene,
+                    viewport,
+                    editor::FONT_SIZE * advance,
+                    STATUS_H,
+                    &theme,
+                );
                 self.search.render(
                     &mut scene,
                     viewport,
@@ -1055,6 +1115,7 @@ impl winit::application::ApplicationHandler for Application {
                         &mut self.palette,
                         &mut self.search,
                         &mut self.findfiles,
+                        &mut self.build,
                         &mut self.settings,
                         &mut self.notice,
                         id,
@@ -1074,6 +1135,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.palette,
                                 &mut self.search,
                                 &mut self.findfiles,
+                                &mut self.build,
                                 &mut self.settings,
                                 &mut self.notice,
                                 id,
@@ -1111,6 +1173,16 @@ impl winit::application::ApplicationHandler for Application {
                         }
                         gpu.request_redraw();
                     }
+                    return;
+                }
+                // Panel de salida del build: solo Esc lo cierra (el resto
+                // de teclas sigue yendo al editor, como Sublime).
+                if self.build.is_open()
+                    && key_event.state == ElementState::Pressed
+                    && matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
+                {
+                    self.build.close();
+                    gpu.request_redraw();
                     return;
                 }
                 // Ctrl+Tab / Ctrl+Shift+Tab: ciclar pestañas. Es una tecla
@@ -1272,6 +1344,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.palette,
                                 &mut self.search,
                                 &mut self.findfiles,
+                                &mut self.build,
                                 &mut self.settings,
                                 &mut self.notice,
                                 id,
@@ -1328,6 +1401,23 @@ impl winit::application::ApplicationHandler for Application {
                         findfiles::Click::Miss => self.findfiles.close(),
                     }
                 }
+                // Panel de salida del build: fila → abrir ubicación; dentro
+                // se traga; fuera el click sigue (el panel se queda abierto).
+                if self.build.is_open() {
+                    match self.build.click(self.cursor.x, self.cursor.y) {
+                        build::Click::Row(path, line) => {
+                            open_path(&mut self.tabs, &mut self.settings, path);
+                            self.tabs.active_mut().goto_line(line);
+                            gpu.request_redraw();
+                            return;
+                        }
+                        build::Click::Panel => {
+                            gpu.request_redraw();
+                            return;
+                        }
+                        build::Click::Miss => {}
+                    }
+                }
                 // Barra de título y desplegado del menú (por encima del
                 // divisor y de las pestañas: ocupa la fila superior y su
                 // menú se despliega sobre el contenido).
@@ -1345,6 +1435,7 @@ impl winit::application::ApplicationHandler for Application {
                                 &mut self.palette,
                                 &mut self.search,
                                 &mut self.findfiles,
+                                &mut self.build,
                                 &mut self.settings,
                                 &mut self.notice,
                                 action,
@@ -1510,12 +1601,21 @@ impl winit::application::ApplicationHandler for Application {
                 self.drag_origin = None;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => {
-                        y * editor::line_height_for(self.settings.font_size as f32) * 3.0
-                    }
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                let (dy, notches) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (
+                        y * editor::line_height_for(self.settings.font_size as f32) * 3.0,
+                        y,
+                    ),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y as f32, pos.y as f32 / 60.0),
                 };
+                // Rueda sobre el panel de salida: lo desplaza por líneas (sin
+                // robar foco); si no lo pilla, sigue el panel bajo el cursor.
+                if self.build.is_open()
+                    && self.build.on_wheel(self.cursor.x, self.cursor.y, notches)
+                {
+                    gpu.request_redraw();
+                    return;
+                }
                 // Rueda sobre el panel bajo el cursor (sin robar el foco, como
                 // Sublime); si el cursor aún no se movió → grupo 0.
                 let (vw, vh) = gpu.logical_size();
@@ -1547,6 +1647,7 @@ mod tests {
         boot_tabs, collect_files, collect_hot_buffers, default_save_name, focus_group, focus_tab,
         open_path, parse_goto_line, run_command,
     };
+    use crate::build::BuildPanel;
     use crate::editor::Editor;
     use crate::findfiles::FindFiles;
     use crate::palette::Palette;
@@ -1638,6 +1739,7 @@ mod tests {
         let mut palette = Palette::default();
         let mut search = SearchBar::default();
         let mut findfiles = FindFiles::default();
+        let mut build = BuildPanel::default();
         let mut settings = settings::Settings::default();
         let mut notice: Option<(String, Instant)> = None;
 
@@ -1648,6 +1750,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "file.save",
@@ -1667,6 +1770,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "file.save",
@@ -1682,6 +1786,7 @@ mod tests {
         let mut palette = Palette::default();
         let mut search = SearchBar::default();
         let mut findfiles = FindFiles::default();
+        let mut build = BuildPanel::default();
         let mut settings = settings::Settings::default();
         let mut notice: Option<(String, Instant)> = None;
 
@@ -1692,6 +1797,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "minimap.toggle",
@@ -1707,6 +1813,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "minimap.toggle",
@@ -1719,12 +1826,99 @@ mod tests {
     }
 
     #[test]
+    fn build_run_without_tasks_notifies_and_closes_results_panel() {
+        let mut tabs = Tabs::new(Editor::default());
+        let mut clipboard = None;
+        let mut palette = Palette::default();
+        let mut search = SearchBar::default();
+        let mut findfiles = FindFiles::default();
+        let mut build = BuildPanel::default();
+        let mut settings = settings::Settings::default();
+        let mut notice: Option<(String, Instant)> = None;
+        // El panel de resultados ocupa el mismo pie: se cierra al construir.
+        findfiles.open(
+            None,
+            std::env::current_dir().unwrap_or_default(),
+            Vec::new(),
+        );
+
+        let redraw = run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut findfiles,
+            &mut build,
+            &mut settings,
+            &mut notice,
+            "build.run",
+        );
+        assert!(redraw, "pide repintar el aviso");
+        let (text, _) = notice.take().expect("aviso");
+        assert!(text.contains("Sin tarea de build"), "{text}");
+        assert!(!build.is_open(), "sin tareas no se abre el panel");
+        assert!(!findfiles.is_open(), "el panel de resultados se cierra");
+    }
+
+    #[test]
+    fn build_run_spawns_task_and_panel_collects_output() {
+        let mut tabs = Tabs::new(Editor::default());
+        let mut clipboard = None;
+        let mut palette = Palette::default();
+        let mut search = SearchBar::default();
+        let mut findfiles = FindFiles::default();
+        let mut build = BuildPanel::default();
+        let mut settings = settings::Settings::default();
+        let mut notice: Option<(String, Instant)> = None;
+        settings.builds.push(settings::BuildTask {
+            name: "saludo".to_owned(),
+            ext: Vec::new(),
+            cmd: "echo hola build".to_owned(),
+            working_dir: String::new(),
+        });
+
+        let redraw = run_command(
+            &mut tabs,
+            &mut clipboard,
+            &mut palette,
+            &mut search,
+            &mut findfiles,
+            &mut build,
+            &mut settings,
+            &mut notice,
+            "build.run",
+        );
+        assert!(redraw, "pide repintar");
+        assert!(build.is_open(), "el panel se abre al lanzar");
+        assert!(build.is_running(), "corre en su hilo: la app no bloquea");
+        let (text, _) = notice.take().expect("aviso de arranque");
+        assert_eq!(text, "Build: saludo…");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while build.is_running() && Instant::now() < deadline {
+            build.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!build.is_running(), "termina solo");
+        // El waiter puede terminar antes de que el lector suelte la última
+        // línea: se drena un poco más antes de mirar.
+        for _ in 0..25 {
+            if !build.poll() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(build.output().contains("hola build"), "{}", build.output());
+    }
+
+    #[test]
     fn theme_toggle_flips_editor_bar_and_search() {
         let mut tabs = Tabs::new(Editor::default());
         let mut clipboard = None;
         let mut palette = Palette::default();
         let mut search = SearchBar::default();
         let mut findfiles = FindFiles::default();
+        let mut build = BuildPanel::default();
         let mut settings = settings::Settings::default();
         let mut notice: Option<(String, Instant)> = None;
         assert_eq!(tabs.active().theme(), Theme::dark(), "arranca oscuro");
@@ -1735,6 +1929,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "theme.toggle",
@@ -1751,6 +1946,7 @@ mod tests {
             &mut palette,
             &mut search,
             &mut findfiles,
+            &mut build,
             &mut settings,
             &mut notice,
             "theme.toggle",
